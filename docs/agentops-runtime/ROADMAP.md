@@ -2,24 +2,292 @@
 
 ## North star
 
-Make Hermes a distributed, multi-tenant business runtime without losing what makes Hermes useful: the same agent loop, same memory tool, same skills semantics, same cron/autonomous jobs, same tool-calling ergonomics, and same ability to run fully local.
+Make Hermes a distributed, multi-tenant business runtime without losing what makes Hermes useful: the same agent loop, same native `memory` tool, same skills semantics, same cron/autonomous jobs, same tool-calling ergonomics, and same ability to run fully local.
 
 The MVP proves one thing:
 
-> A Slack/user/thread-scoped Hermes turn can run on a disposable worker while native Hermes memory, skills, cron/session state, credentials, artifacts, and audit are backed by scoped remote services through cloud/database/secret-store-agnostic interfaces — with local backends remaining the default fallback.
+> Multiple scoped Hermes runs can execute concurrently across a local process, Docker Compose worker fleet, or cloud-managed worker fleet while native Hermes memory, skills, sessions, cron jobs, credentials, artifacts, audit, and delivery routes are selected by `RuntimeContext` and backed by cloud/database/secret-store-agnostic adapters.
+
+This is not a wrapper that injects memory around Hermes. The native Hermes surfaces remain the interface. The backing stores become pluggable and context-scoped.
 
 ## Architecture principles
 
 1. **Backend contracts before cloud code.** Define Python interfaces/protocols first; AWS/GCP/local implementations come behind those contracts.
 2. **Local remains first-class.** Existing local behavior is not legacy; it is the reference implementation and dev mode.
-3. **Native tools, remote backing.** Do not build sidecar memory/skills/cron that bypass Hermes. The native Hermes surfaces call pluggable backends.
-4. **Runtime context is load-bearing.** Every backend decision is scoped by `RuntimeContext`: org, workspace, user, conversation/thread, project, agent profile, and execution mode.
-5. **Cloud agnostic.** AWS is likely the first production adapter, but no core interface should name ECS, SQS, DynamoDB, Secrets Manager, etc.
-6. **DB agnostic.** Initial SQL/Postgres adapters are okay, but contracts should not assume one database engine.
-7. **Secret-store agnostic.** Local env files, AWS Secrets Manager, GCP Secret Manager, Vault, and future stores are implementations of a credential/secret resolver contract.
-8. **Remote cron is mandatory.** Cron/autonomous jobs are part of Hermes’s identity; they need remote storage, leases, delivery targeting, and worker execution.
-9. **Tenant isolation beats convenience.** Cross-user/org/project memory or credential leakage is an MVP blocker.
-10. **Small fork deltas.** Prefer modular seams that could be upstreamed or maintained as a small patch stack.
+3. **Local is not single-process.** Local mode must still support multiple concurrent Hermes runs with scoped memory/sessions/skills/cron and safe locking.
+4. **Native tools, remote backing.** Do not build sidecar memory/skills/cron that bypass Hermes. Native Hermes surfaces call pluggable backends.
+5. **Runtime context is load-bearing.** Every backend decision is scoped by `RuntimeContext`: org, workspace, user, conversation/thread, project, agent profile, run, and execution mode.
+6. **Cloud agnostic.** AWS is likely the first production adapter, but no core interface should name ECS, SQS, DynamoDB, Secrets Manager, etc.
+7. **DB agnostic at the contract level, optimized at the adapter level.** Do not force lowest-common-denominator data modeling; Postgres, SQLite, DynamoDB, etc. can implement the same contracts differently.
+8. **Secret-store agnostic.** Local env files, encrypted local stores, AWS Secrets Manager, GCP Secret Manager, Vault, and future stores are implementations of a credential/secret resolver contract.
+9. **Remote cron is mandatory.** Cron/autonomous jobs are part of Hermes’s identity; they need remote storage, leases, delivery targeting, worker execution, and local fallback.
+10. **Tenant isolation beats convenience.** Cross-user/org/project/thread memory, skill, credential, cron, or session leakage is an MVP blocker.
+11. **Warm workers are an optimization, remote state is authoritative.** Conversation runs may stay warm until idle timeout, but all durable state must survive worker death.
+12. **Small fork deltas.** Prefer modular seams that could be upstreamed or maintained as a small patch stack.
+
+## Required deployment profiles
+
+AgentOps Hermes Runtime must support these as first-class profiles over the same backend contracts.
+
+### Profile A: local-multi
+
+A developer or solo operator runs multiple scoped Hermes runs on one machine.
+
+Typical shape:
+
+```text
+Hermes worker/supervisor process(es)
+→ local RuntimeContext registry
+→ local SQLite WAL or file-backed state
+→ local filesystem skills/memory/artifacts where selected
+→ local cron scheduler/backend
+→ local env/profile credentials
+```
+
+Acceptance invariants:
+
+- More than one Hermes run can execute concurrently.
+- Local state is still context-scoped by user/org/profile/project/thread.
+- Local backends implement the same contracts as remote backends.
+- Existing single-user Hermes behavior remains available as the default compatibility path.
+
+### Profile B: compose-self-hosted
+
+A small team or development environment runs the distributed stack locally or on one VM via Docker Compose.
+
+Typical shape:
+
+```text
+agentops-api/control-plane
+agentops-worker --max-concurrent-runs=N
+agentops-scheduler
+postgres
+redis/nats or equivalent queue
+minio or filesystem object store
+local encrypted secret store
+slack-adapter / webhook ingress
+```
+
+Acceptance invariants:
+
+- Workers can be scaled horizontally with `docker compose --scale worker=N`.
+- Each worker can run zero to N concurrent Hermes runs.
+- Shared database/queue/object-store backends coordinate leases, sessions, cron, artifacts, and delivery.
+- This profile is the main distributed testbed before cloud adapters.
+
+### Profile C: aws-managed
+
+A customer deploys into AWS with managed services.
+
+Initial preferred AWS shape:
+
+```text
+ECS/Fargate worker service with autoscaling
+RDS Postgres first; DynamoDB later where useful
+SQS or EventBridge/SQS for queues and cron triggers
+S3 artifact backend
+AWS Secrets Manager credential backend
+CloudWatch logs/metrics
+Slack/GitHub/Linear ingress via API service/Lambda/ECS
+```
+
+Acceptance invariants:
+
+- ECS task count can scale up/down during the day based on expected load or queue metrics.
+- Each ECS task can host zero to N concurrent Hermes runs, e.g. 0–8 active slots.
+- Draining tasks stop accepting new runs and gracefully finish/checkpoint active runs before shutdown.
+- AWS-specific code lives in adapter packages, not core runtime contracts.
+
+### Profile D: gcp-managed
+
+A later cloud-managed profile with GCP services.
+
+Candidate shape:
+
+```text
+Cloud Run worker service
+Cloud SQL Postgres or Firestore adapter
+Pub/Sub or Cloud Tasks
+GCS artifact backend
+GCP Secret Manager credential backend
+Cloud Logging/Monitoring
+```
+
+Acceptance invariants:
+
+- Same runtime contracts and worker lifecycle as AWS.
+- GCP-specific code lives in adapter packages.
+
+### Profile E: hybrid
+
+Mixed deployments are allowed: for example, local/compose workers with remote RDS, or ECS workers with external Postgres/Vault.
+
+Acceptance invariant:
+
+- Backend choices are configured independently per capability: memory, sessions, skills, cron, queue, credentials, artifacts, audit, delivery.
+
+## Core runtime concepts
+
+### RuntimeContext
+
+Every run/turn/job has a context that selects memory, skills, credentials, sessions, cron ownership, artifacts, audit, and delivery routes.
+
+Minimum fields:
+
+- `mode`: `local | agentops`
+- `org_id`
+- `workspace_id`
+- `workspace_type`: `slack | telegram | discord | cli | api | cron | github | linear | other`
+- `user_id`
+- `conversation_id`
+- `external_channel_id`
+- `external_thread_id`
+- `agent_profile_id`
+- `project_id`
+- `run_id`
+- `run_type`: `conversation | event | cron | delegation | manual`
+- `job_id`
+- `parent_session_id`
+- `permissions_ref`
+- `backend_profile`
+- `delivery_ref`
+
+### Worker task / worker container
+
+An ECS task, Cloud Run instance, Docker container, or local process that can host zero to N Hermes runs.
+
+### Worker slot
+
+A bounded concurrent execution slot inside a worker task.
+
+Example:
+
+```text
+worker-17 slot 0
+worker-17 slot 1
+...
+worker-17 slot 7
+```
+
+### Agent run
+
+A live Hermes runtime instance handling one conversation, event, cron job, delegated task, or manual request.
+
+### Conversation session
+
+A durable logical session, often mapped from Slack workspace/channel/thread/user, that may have an active warm run while users are interacting and then go dormant after idle timeout.
+
+### Warm conversation run
+
+Conversation runs may remain active for a configurable idle window so multi-turn chats are fast:
+
+```text
+message arrives
+→ start/resume run
+→ process turns sequentially
+→ remain warm while messages keep arriving
+→ idle timeout expires
+→ flush/release durable state
+→ exit
+```
+
+Remote state remains authoritative; warm process memory is only a cache/optimization.
+
+### Event/cron run
+
+GitHub comments, Linear tickets, webhooks, cron jobs, and one-shot events are run-to-completion:
+
+```text
+event/job arrives
+→ claim lease
+→ start Hermes run
+→ work until done/fail/cancel/max runtime
+→ write session/audit/artifacts
+→ exit
+```
+
+## Required backend contracts
+
+### Backend registry
+
+Selects concrete implementations by config + RuntimeContext.
+
+Minimum contracts:
+
+- `MemoryBackend`
+- `SkillBackend`
+- `SessionBackend`
+- `CronBackend`
+- `CredentialResolver`
+- `SecretStore`
+- `QueueBackend`
+- `RunLeaseBackend`
+- `ConversationRouter`
+- `WorkerRegistry`
+- `ArtifactBackend`
+- `AuditBackend`
+- `DeliveryBackend`
+
+### QueueBackend
+
+For pending turns, events, cron firings, and jobs.
+
+Required semantics:
+
+- enqueue with idempotency key
+- claim by worker/capability
+- ack/nack/retry
+- visibility timeout or lease expiry
+- priority or run-type partitioning eventually
+
+### RunLeaseBackend
+
+For one active owner per run/job/conversation turn.
+
+Required semantics:
+
+- claim run/job/conversation lease
+- renew lease/heartbeat
+- release/complete/fail/cancel
+- expire stale leases
+- support worker draining
+
+### ConversationRouter
+
+Maps external messaging events to conversations and active runs.
+
+Required semantics:
+
+- resolve/create conversation from external event
+- find active warm run if any
+- route turn to active run inbox or enqueue resume/start request
+- preserve per-conversation sequential turn processing
+- handle stale active-run leases
+
+### WorkerRegistry
+
+Tracks fleet capacity and lifecycle.
+
+Required semantics:
+
+- register worker with capacity/capabilities
+- heartbeat active slots and health
+- mark draining
+- stop new claims for draining workers
+- recover expired workers/runs
+
+### RunSupervisor
+
+A local component inside each worker task.
+
+Required semantics:
+
+- manage bounded slots, e.g. `max_concurrent_runs=8`
+- start one Hermes run per slot, initially preferably as a subprocess for isolation
+- send follow-up turns to warm conversation runs
+- cancel/interrupt runs
+- drain gracefully on shutdown
+- report lifecycle/audit events
 
 ## MVP slice list
 
@@ -42,29 +310,13 @@ The MVP proves one thing:
 
 **Goal:** Introduce a first-class context object that can be passed through Hermes without changing local behavior.
 
-**RuntimeContext fields, minimum:**
-
-- `mode`: `local | agentops`
-- `org_id`
-- `workspace_id`
-- `workspace_type`: `slack | telegram | discord | cli | api | cron | other`
-- `user_id`
-- `conversation_id`
-- `external_channel_id`
-- `external_thread_id`
-- `agent_profile_id`
-- `project_id`
-- `run_id`
-- `parent_session_id`
-- `permissions_ref`
-- `backend_profile`
-
 **Acceptance criteria:**
 
 - Local mode creates a RuntimeContext from existing profile/session/platform data.
-- AgentOps mode can load RuntimeContext from env var or JSON payload.
-- Context is available to memory, skills, session state, cron, credential resolution, logging/audit, and tool execution paths.
+- AgentOps mode can load RuntimeContext from env var, JSON payload, config, or queued work item.
+- Context is available to memory, skills, session state, cron, credential resolution, logging/audit, delivery, and tool execution paths.
 - Tests prove absent AgentOps context preserves current behavior.
+- Tests prove two different RuntimeContexts can coexist in the same process test without sharing mutable context state.
 
 ### M2. Backend registry/contracts
 
@@ -72,25 +324,29 @@ The MVP proves one thing:
 
 **Goal:** Add generic backend contracts and a runtime backend registry without implementing cloud-specific behavior yet.
 
-**Contracts, minimum:**
-
-- `MemoryBackend`
-- `SkillBackend`
-- `SessionBackend`
-- `CronBackend`
-- `CredentialResolver`
-- `ArtifactBackend`
-- `AuditBackend`
-- `DeliveryBackend` / route resolver
-
 **Acceptance criteria:**
 
 - Local implementations wrap existing behavior.
 - Backend selection is driven by config + RuntimeContext.
-- No AWS/GCP/Postgres-specific names leak into core interfaces.
-- Tests instantiate local backends through the registry.
+- `QueueBackend`, `RunLeaseBackend`, `ConversationRouter`, and `WorkerRegistry` are included alongside memory/session/skill/cron/credential/artifact/audit contracts.
+- No AWS/GCP/Postgres/DynamoDB-specific names leak into core interfaces.
+- Tests instantiate local/fake backends through the registry.
 
-### M3. Native memory tool backend abstraction
+### M3. Local multi-run concurrency baseline
+
+**Status:** Pending
+
+**Goal:** Prove that local mode can run multiple scoped Hermes runs concurrently before remote adapters are added.
+
+**Acceptance criteria:**
+
+- A local worker/supervisor can run at least two concurrent Hermes runs with different RuntimeContexts.
+- Local sessions/memory/artifacts/locks are isolated by context.
+- Local SQLite/file backends use safe locking/WAL/idempotency where applicable.
+- One run crashing does not corrupt another run’s local state.
+- Existing single-user local Hermes behavior remains unchanged when distributed mode is not enabled.
+
+### M4. Native memory tool backend abstraction
 
 **Status:** Pending
 
@@ -103,14 +359,15 @@ The MVP proves one thing:
 - AgentOps/remote backend can be stubbed/faked in tests and receives RuntimeContext.
 - Tests prove writes for two users/conversations route to separate backend scopes.
 - Threat scanning, char limits, drift protection semantics are preserved or explicitly mapped.
+- No sidecar context injection replaces the native memory tool path.
 
-### M4. Remote memory adapter MVP
+### M5. Remote memory adapter MVP
 
 **Status:** Pending
 
-**Goal:** Implement the first real remote memory adapter against a cloud/db-agnostic HTTP or SQL contract.
+**Goal:** Implement the first real remote memory adapter against a cloud/db-agnostic contract.
 
-**Initial implementation preference:** HTTP adapter to an AgentOps control-plane API, with an in-memory/local test server and optional Postgres-backed server later.
+**Initial implementation preference:** HTTP adapter to an AgentOps control-plane API with fake/in-memory test server; Postgres-backed implementation can be the first durable distributed backend.
 
 **Acceptance criteria:**
 
@@ -118,8 +375,9 @@ The MVP proves one thing:
 - Same native memory tool is used by the model.
 - No raw memory from another user/org/thread appears in prompt or tool output.
 - Local fallback remains available.
+- Same memory contract works in local-multi and compose-self-hosted profiles.
 
-### M5. Session/conversation backend abstraction
+### M6. Session/conversation backend abstraction
 
 **Status:** Pending
 
@@ -131,8 +389,9 @@ The MVP proves one thing:
 - Remote session backend contract supports append/read/search/resume lineage.
 - Worker can process a turn and write transcript/tool events to remote session backend.
 - Concurrent turn lock/lease semantics are specified and tested.
+- Conversation/session state survives worker restart and resumes in a different worker.
 
-### M6. Skills backend abstraction
+### M7. Skills backend abstraction
 
 **Status:** Pending
 
@@ -152,8 +411,9 @@ The MVP proves one thing:
 - Remote skill backend can list/load skill content by RuntimeContext.
 - Skill mutation permissions are represented: user-private allowed, shared org/project skills require policy/approval flag.
 - Tests prove user A cannot load user B private skill and org skills can be shared.
+- Skill precedence is deterministic across local and remote sources.
 
-### M7. Cron/autonomous jobs backend abstraction
+### M8. Cron/autonomous jobs backend abstraction
 
 **Status:** Pending
 
@@ -164,11 +424,12 @@ The MVP proves one thing:
 - Existing cron behavior remains as `LocalCronBackend`.
 - Remote cron contract supports create/update/pause/resume/remove/list/run history.
 - Jobs include RuntimeContext and delivery target bindings.
-- Worker-safe leases prevent duplicate execution across multiple cloud tasks.
+- Worker-safe leases prevent duplicate execution across multiple worker tasks/schedulers.
 - Empty-output/silent semantics and error-alert semantics are preserved.
-- Tests cover recurring, one-shot, paused, lease timeout, and delivery routing cases.
+- Tests cover recurring, one-shot, paused, lease timeout, scheduler restart, worker drain, and delivery routing cases.
+- Cron jobs can run locally, in Compose, or via cloud scheduler/queue adapters using the same logical job model.
 
-### M8. Credential/secret resolver abstraction
+### M9. Credential/secret resolver abstraction
 
 **Status:** Pending
 
@@ -177,6 +438,7 @@ The MVP proves one thing:
 **Backends:**
 
 - local env/profile files
+- local encrypted store
 - AgentOps remote broker
 - AWS Secrets Manager adapter
 - GCP Secret Manager adapter
@@ -188,8 +450,9 @@ The MVP proves one thing:
 - RuntimeContext determines which credentials are available.
 - Resolved secrets are available only to the tool/provider process path that needs them.
 - Audit stores refs and usage metadata, never secret values.
+- Credential resolution works for local, compose, AWS, and future GCP profiles without changing tool code.
 
-### M9. Artifact and audit backends
+### M10. Artifact and audit backends
 
 **Status:** Pending
 
@@ -199,25 +462,41 @@ The MVP proves one thing:
 
 - Local artifacts remain available.
 - Remote artifact backend stores tool outputs/files by scoped refs.
-- Audit backend receives memory writes, skill loads/mutations, credential resolutions, cron runs, session events, and tool calls.
+- Audit backend receives memory writes, skill loads/mutations, credential resolutions, cron runs, session events, worker lifecycle events, queue/lease events, delivery events, and tool calls.
 - Tests prove sensitive local paths/secrets are not surfaced in audit payloads.
 
-### M10. Stateless worker turn runner
+### M11. Worker fleet and run lifecycle
 
 **Status:** Pending
 
-**Goal:** Allow a disposable worker process/container to run one scoped Hermes turn using remote backends.
+**Goal:** Support Derek’s production-style model: scale worker tasks up/down, each task hosting zero to N concurrent Hermes runs, with warm conversations and run-to-completion jobs.
 
 **Acceptance criteria:**
 
-- Worker accepts RuntimeContext + message payload.
-- Worker claims a session/turn lease.
-- Worker loads memory/skills/session through selected backends.
-- Worker resolves credentials through selected resolver.
-- Worker writes transcript/audit/artifacts back remotely.
-- Worker exits cleanly without relying on persistent local disk except cache/temp.
+- Worker registers with capacity, capabilities, and `max_concurrent_runs`.
+- Worker can run 0–N concurrent Hermes runs, initially preferably subprocess-per-run for isolation.
+- Conversation run starts on incoming message and stays warm until configurable idle timeout.
+- Event/GitHub/Linear/cron/manual run works until done/fail/cancel/max runtime, then exits.
+- Per-conversation turns are processed sequentially or explicitly queued while a run is busy.
+- Worker drain prevents new claims and gracefully finishes, checkpoints, or releases active runs before shutdown.
+- Expired leases allow recovery after worker death.
+- Same lifecycle works in local-multi, compose-self-hosted, and AWS adapter profiles.
 
-### M11. Slack multi-user/thread MVP
+### M12. Compose self-hosted distributed MVP
+
+**Status:** Pending
+
+**Goal:** Prove distributed semantics without cloud lock-in.
+
+**Acceptance criteria:**
+
+- `docker compose up` starts API/control-plane, worker(s), scheduler, database, queue, object store, and local secret backend.
+- Workers can be scaled horizontally and each worker can host multiple concurrent runs.
+- Two users/threads get isolated memory/sessions while shared org/project skills can be loaded in both.
+- Remote cron/leases prevent duplicate job execution with multiple schedulers/workers.
+- Worker restart between turns resumes from durable state.
+
+### M13. Slack multi-user/thread MVP
 
 **Status:** Pending
 
@@ -229,9 +508,10 @@ The MVP proves one thing:
 - Two Slack users in different threads get isolated user/thread memory.
 - Shared org/project skill can be loaded in both threads.
 - Hermes replies in the correct Slack thread.
+- Active conversation routing sends follow-up messages to the warm run when one exists.
 - Worker can be restarted between turns and still resume state remotely.
 
-### M12. Cloud adapter spike: AWS first, GCP later
+### M14. Cloud adapter spike: AWS first, GCP later
 
 **Status:** Pending
 
@@ -239,11 +519,12 @@ The MVP proves one thing:
 
 **AWS candidate adapters:**
 
-- ECS/Fargate or Lambda/container runner for workers
+- ECS/Fargate worker service with autoscaling
 - SQS/EventBridge for queued turns/cron triggers
-- Postgres/RDS or DynamoDB adapter depending contract fit
+- RDS Postgres as first durable DB adapter; DynamoDB later where useful
 - S3 artifact backend
 - Secrets Manager credential backend
+- CloudWatch logs/metrics adapter
 
 **GCP candidate adapters:**
 
@@ -256,22 +537,69 @@ The MVP proves one thing:
 **Acceptance criteria:**
 
 - Cloud-specific code lives in adapter packages/modules.
-- Local and fake adapters remain the default test path.
-- Same worker contract runs locally and in AWS adapter mode.
+- Local/fake/compose adapters remain the default test path.
+- Same worker lifecycle runs locally, in Compose, and in AWS adapter mode.
+- ECS desired task count can scale independently from per-task run concurrency.
 
 ## Initial implementation order
 
 1. M0 docs/repo hygiene.
 2. M1 RuntimeContext.
 3. M2 backend registry/contracts.
-4. M3 native memory backend abstraction.
-5. M4 fake/HTTP remote memory adapter.
-6. M7 cron backend abstraction early, because remote cron is not optional.
-7. M5 sessions and M6 skills.
-8. M8 credentials.
-9. M10 worker runner.
-10. M11 Slack smoke.
-11. M12 AWS adapter spike.
+4. M3 local multi-run concurrency baseline.
+5. M4 native memory backend abstraction.
+6. M5 fake/HTTP remote memory adapter.
+7. M8 cron backend abstraction early, because remote cron is not optional.
+8. M6 sessions and M7 skills.
+9. M9 credentials.
+10. M11 worker fleet/run lifecycle.
+11. M12 Compose self-hosted distributed MVP.
+12. M13 Slack smoke.
+13. M14 AWS adapter spike.
+
+## Reference MVP proof
+
+A strong early proof should demonstrate:
+
+```text
+Start 3 workers locally or in Docker Compose.
+
+Send message A:
+  org=acme, user=derek, thread=1
+
+Send message B:
+  org=acme, user=alex, thread=2
+
+Both run concurrently.
+
+Hermes native memory tool in A writes:
+  "Derek likes concise updates"
+
+Hermes native memory tool in B writes:
+  "Alex prefers detailed updates"
+
+Next turn:
+  A sees Derek memory only.
+  B sees Alex memory only.
+
+Create org skill:
+  "Use Acme engineering style"
+
+Both A and B can load org skill.
+
+Create user-private skill:
+  only Derek can load it.
+
+Schedule cron:
+  org=acme/project=x daily summary
+
+Two schedulers/workers are running, but only one claims the job.
+
+Restart a worker between turns:
+  conversation resumes from remote/local-durable state.
+```
+
+This proof must work first in local-multi and compose-self-hosted profiles before AWS-specific adapters are considered complete.
 
 ## Explicit non-goals for MVP
 
@@ -281,7 +609,8 @@ The MVP proves one thing:
 - Deep billing/metering.
 - Rewriting Hermes agent loop.
 - Removing local mode.
-- Locking architecture to AWS, GCP, Postgres, DynamoDB, or any one secret store.
+- Locking architecture to AWS, GCP, Postgres, DynamoDB, RDS, SQS, Secrets Manager, Cloud Run, or any one provider/service.
+- Treating remote memory as prompt injection around Hermes instead of native `memory` tool storage.
 
 ## Open questions
 
@@ -290,3 +619,5 @@ The MVP proves one thing:
 - How much of RuntimeContext should be visible to the model versus internal only?
 - Should shared skill mutations be impossible from an agent by default, or allowed with approval gates?
 - What is the smallest safe credential grant model that still supports useful tools?
+- Should the first durable distributed backend be Postgres everywhere, or should AWS-native DynamoDB be developed early as a separate adapter?
+- Should warm conversation runs be subprocesses for isolation from the start, or can some local profiles safely run multiple agents in-process?
