@@ -61,6 +61,52 @@ def _bind_agentops_skill_backend(agent: Any, config: Dict[str, Any]) -> None:
     set_active_skill_backend(skill_backend, context=skill_runtime_context)
 
 
+class _UnavailableCronBackend:
+    """Fail-closed sentinel for misconfigured AgentOps cron routing."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+
+    def __getattr__(self, name: str):
+        def _raise(*_args: Any, **_kwargs: Any):
+            raise RuntimeError(f"AgentOps cron backend is unavailable: {self.reason}")
+
+        return _raise
+
+
+def _bind_agentops_cron_backend(agent: Any, config: Dict[str, Any]) -> None:
+    """Bind the native cron tool to the configured AgentOps cron backend."""
+
+    cron_runtime_context = getattr(agent, "runtime_context", None)
+    if getattr(cron_runtime_context, "mode", None) != "agentops":
+        return
+
+    from agent.runtime_backends import BackendCapability, RuntimeBackendRegistry
+    from agent.runtime_cron import set_active_cron_backend
+
+    set_active_cron_backend(None, context=cron_runtime_context)
+    cron_registry = RuntimeBackendRegistry(config)
+    cron_profile = cron_registry.resolve_profile(BackendCapability.CRON, cron_runtime_context)
+    cron_backend: Any
+    try:
+        if cron_profile in {"local", "local-multi"}:
+            from agent.runtime_backends import LocalCronBackend
+
+            cron_backend = LocalCronBackend()
+        else:
+            from agent.runtime_cron_http import register_http_cron_backend
+
+            register_http_cron_backend(cron_registry, profile=cron_profile)
+            cron_backend = cron_registry.get(BackendCapability.CRON, cron_runtime_context)
+    except Exception as exc:
+        logger.warning("Failed to resolve AgentOps cron backend; binding fail-closed backend: %s", exc)
+        unavailable_backend: Any = _UnavailableCronBackend(str(exc))
+        set_active_cron_backend(unavailable_backend, context=cron_runtime_context)
+        return
+
+    set_active_cron_backend(cron_backend, context=cron_runtime_context)
+
+
 from agent.memory_manager import StreamingContextScrubber
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
@@ -1200,6 +1246,15 @@ def init_agent(
         _bind_agentops_skill_backend(agent, _agent_cfg)
     except Exception as _skill_init_err:
         logger.warning("Failed to initialize AgentOps skill backend: %s", _skill_init_err)
+
+    # Cron backend selection (M8). AgentOps mode routes the native cronjob tool
+    # through the configured backend profile. Local profiles still use the
+    # compatibility backend; remote profiles register the provider-neutral HTTP
+    # adapter so Compose/cloud control planes can own durable scheduling.
+    try:
+        _bind_agentops_cron_backend(agent, _agent_cfg)
+    except Exception as _cron_init_err:
+        logger.warning("Failed to initialize AgentOps cron backend: %s", _cron_init_err)
 
 
     # Memory provider plugin (external — one at a time, alongside built-in)
