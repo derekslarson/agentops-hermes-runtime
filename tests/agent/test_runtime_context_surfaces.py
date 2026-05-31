@@ -66,6 +66,23 @@ def test_credential_resolution_observes_bound_runtime_context(monkeypatch):
     assert ("credential_resolution", ctx) in calls
 
 
+def test_native_memory_agent_init_wires_agentops_backend_and_context():
+    import inspect
+    from agent import agent_init
+
+    source = inspect.getsource(agent_init.init_agent)
+    memory_section = source[source.index("# Persistent memory") : source.index("# Memory provider plugin")]
+    assert "RuntimeBackendRegistry" in memory_section
+    assert "BackendCapability.MEMORY" in memory_section
+    assert "LocalFileMemoryBackend" in memory_section
+    assert 'getattr(runtime_context, "mode", None) == "agentops"' in memory_section
+    assert "resolve_profile(BackendCapability.MEMORY, runtime_context) == \"local\"" in memory_section
+    assert "LocalFileMemoryBackend(scope_by_context=True)" in memory_section
+    assert "backend=memory_backend" in memory_section
+    assert "context=memory_context" in memory_section
+
+
+
 def test_conversation_loop_exposes_runtime_context_to_logging_audit_surface():
     import inspect
     from agent import conversation_loop

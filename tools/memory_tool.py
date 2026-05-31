@@ -23,6 +23,7 @@ Design:
 - Frozen snapshot pattern: system prompt is stable, tool responses show live state
 """
 
+import base64
 import json
 import logging
 import os
@@ -31,7 +32,11 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from hermes_constants import get_hermes_home
-from typing import Dict, Any, List, Optional
+from typing import TYPE_CHECKING, Dict, Any, List, Optional
+
+if TYPE_CHECKING:
+    from agent.runtime_backends import MemoryBackend
+    from agent.runtime_context import RuntimeContext
 
 from utils import atomic_replace
 
@@ -121,13 +126,28 @@ class MemoryStore:
         Tool responses always reflect this live state.
     """
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
+    def __init__(
+        self,
+        memory_char_limit: int = 2200,
+        user_char_limit: int = 1375,
+        *,
+        backend: Optional["MemoryBackend"] = None,
+        context: Optional["RuntimeContext"] = None,
+    ):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
         self.user_char_limit = user_char_limit
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
+        # Optional backend abstraction (M4). When None, the store keeps the
+        # exact local file behavior (MEMORY.md / USER.md) including drift
+        # detection. When set, persistence is routed through the scoped
+        # MemoryBackend while MemoryStore keeps owning threat scanning, char
+        # limits, entry matching, parsing/rendering, and success responses.
+        self._backend = backend
+        self._context = context
+        self._pending_backend_action = "replace"
 
     def load_from_disk(self):
         """Load entries from MEMORY.md and USER.md, capture system prompt snapshot.
@@ -147,11 +167,16 @@ class MemoryStore:
         Scanning is deterministic from disk bytes, so the snapshot remains
         stable for the entire session (prefix-cache invariant holds).
         """
-        mem_dir = get_memory_dir()
-        mem_dir.mkdir(parents=True, exist_ok=True)
+        if self._backend is not None:
+            # Backend-backed mode never touches the local memory directory.
+            self.memory_entries = self._backend_read_entries("memory")
+            self.user_entries = self._backend_read_entries("user")
+        else:
+            mem_dir = get_memory_dir()
+            mem_dir.mkdir(parents=True, exist_ok=True)
 
-        self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
-        self.user_entries = self._read_file(mem_dir / "USER.md")
+            self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
+            self.user_entries = self._read_file(mem_dir / "USER.md")
 
         # Deduplicate entries (preserves order, keeps first occurrence)
         self.memory_entries = list(dict.fromkeys(self.memory_entries))
@@ -205,14 +230,22 @@ class MemoryStore:
                 sanitized.append(entry)
         return sanitized
 
-    @staticmethod
     @contextmanager
-    def _file_lock(path: Path):
+    def _file_lock(self, path: Path):
         """Acquire an exclusive file lock for read-modify-write safety.
 
         Uses a separate .lock file so the memory file itself can still be
         atomically replaced via os.replace().
+
+        Non-file backend implementations are responsible for their own
+        concurrency control, so those stores use a no-op lock. The
+        LocalFileMemoryBackend still uses the same lock/drift path as the
+        historical local file store.
         """
+        if self._backend is not None and not isinstance(self._backend, LocalFileMemoryBackend):
+            yield
+            return
+
         lock_path = path.with_suffix(path.suffix + ".lock")
         lock_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -242,8 +275,16 @@ class MemoryStore:
                     pass
             fd.close()
 
-    @staticmethod
-    def _path_for(target: str) -> Path:
+    def _path_for(self, target: str) -> Optional[Path]:
+        # Non-file backends have no local file path and must not resolve
+        # (or create) the local memory directory. LocalFileMemoryBackend is the
+        # contract-layer representation of the historical MEMORY.md/USER.md
+        # store, so it intentionally keeps exposing a concrete file path for
+        # locking and drift detection.
+        if isinstance(self._backend, LocalFileMemoryBackend):
+            return self._backend._path_for(target, self._context)
+        if self._backend is not None:
+            return None
         mem_dir = get_memory_dir()
         if target == "user":
             return mem_dir / "USER.md"
@@ -259,7 +300,16 @@ class MemoryStore:
         When drift is detected the caller must abort the mutation —
         flushing would discard the un-roundtrippable content.
         Returns None on clean reload.
+
+        Backend-backed mode normally has no on-disk file and therefore no file
+        drift: the latest entries are re-read from the backend and None is
+        returned. LocalFileMemoryBackend is the exception because it represents
+        the historical file store and must preserve drift protection.
         """
+        if self._backend is not None and not isinstance(self._backend, LocalFileMemoryBackend):
+            self._set_entries(target, list(dict.fromkeys(self._backend_read_entries(target))))
+            return None
+
         path = self._path_for(target)
         bak = self._detect_external_drift(target)
         fresh = self._read_file(path)
@@ -268,9 +318,39 @@ class MemoryStore:
         return bak
 
     def save_to_disk(self, target: str):
-        """Persist entries to the appropriate file. Called after every mutation."""
+        """Persist entries to the appropriate file (or backend)."""
+        if self._backend is not None:
+            self._backend_write_entries(target)
+            return
         get_memory_dir().mkdir(parents=True, exist_ok=True)
         self._write_file(self._path_for(target), self._entries_for(target))
+
+    def _backend_read_entries(self, target: str) -> List[str]:
+        """Parse the backend's raw §-delimited snapshot into an entry list."""
+        raw = self._backend.read(self._context, target=target)
+        if not raw:
+            return []
+        return [e.strip() for e in raw.split(ENTRY_DELIMITER) if e.strip()]
+
+    def _backend_write_entries(self, target: str):
+        """Serialize the current entries and persist them through the backend.
+
+        MemoryStore owns entry-level semantics, so the whole target snapshot is
+        written each time. The bound RuntimeContext and the action keyword are
+        passed through so the backend can route/scope/audit the write.
+        """
+        entries = self._entries_for(target)
+        raw = ENTRY_DELIMITER.join(entries) if entries else ""
+        backend = self._backend
+        if backend is None:
+            return
+        backend.write(
+            self._context,
+            raw,
+            target=target,
+            action=self._pending_backend_action,
+        )
+        self._pending_backend_action = "replace"
 
     def _entries_for(self, target: str) -> List[str]:
         if target == "user":
@@ -340,6 +420,7 @@ class MemoryStore:
 
             entries.append(content)
             self._set_entries(target, entries)
+            self._pending_backend_action = "add"
             self.save_to_disk(target)
 
         return self._success_response(target, "Entry added.")
@@ -400,6 +481,7 @@ class MemoryStore:
 
             entries[idx] = new_content
             self._set_entries(target, entries)
+            self._pending_backend_action = "replace"
             self.save_to_disk(target)
 
         return self._success_response(target, "Entry replaced.")
@@ -436,9 +518,25 @@ class MemoryStore:
             idx = matches[0][0]
             entries.pop(idx)
             self._set_entries(target, entries)
+            self._pending_backend_action = "remove"
             self.save_to_disk(target)
 
         return self._success_response(target, "Entry removed.")
+
+    def read(self, target: str) -> Dict[str, Any]:
+        """Return the live entries for ``target``, refreshed from the store.
+
+        Reading is non-mutating, so it never risks data loss and skips the
+        drift guard: it simply re-reads the backing store (file or backend) so
+        sister-session writes are reflected, then returns the standard success
+        response carrying the current entries and usage.
+        """
+        if self._backend is not None:
+            self._set_entries(target, list(dict.fromkeys(self._backend_read_entries(target))))
+        else:
+            fresh = list(dict.fromkeys(self._read_file(self._path_for(target))))
+            self._set_entries(target, fresh)
+        return self._success_response(target)
 
     def format_for_system_prompt(self, target: str) -> Optional[str]:
         """
@@ -599,6 +697,85 @@ class MemoryStore:
             raise RuntimeError(f"Failed to write memory file {path}: {e}")
 
 
+class LocalFileMemoryBackend:
+    """``MemoryBackend`` representing the current MEMORY.md / USER.md file store.
+
+    This is the local-file behavior expressed at the backend-contract layer
+    (M4). It persists and reads the raw §-delimited snapshot for a target using
+    the same atomic file primitives the local path has always used. Entry-level
+    semantics — threat scanning, char limits, drift detection, matching,
+    rendering — stay in :class:`MemoryStore`; this backend only stores bytes.
+
+    By default it is the single-user local store, so ``RuntimeContext`` does
+    not change where content lives; the context argument is accepted to satisfy
+    the contract and is intentionally unused. Drift protection is therefore
+    explicitly mapped to the local file path inside :class:`MemoryStore`, not to
+    this byte store.
+
+    If ``scope_by_context`` is true, files are stored under a stable directory
+    derived from ``RuntimeContext``. AgentOps local-multi mode uses that form to
+    preserve tenant/workspace/conversation isolation while retaining file-backed
+    local durability.
+    """
+
+    def __init__(self, base_dir: Optional[Path] = None, *, scope_by_context: bool = False):
+        self._base_dir = base_dir
+        self._scope_by_context = scope_by_context
+
+    def _dir(self, context: "RuntimeContext | None" = None) -> Path:
+        directory = self._base_dir if self._base_dir is not None else get_memory_dir()
+        if not self._scope_by_context:
+            return directory
+        parts = []
+        for attr in (
+            "org_id",
+            "workspace_id",
+            "project_id",
+            "external_channel_id",
+            "external_thread_id",
+            "conversation_id",
+            "user_id",
+        ):
+            value = getattr(context, attr, None) if context is not None else None
+            parts.append(self._safe_scope_part(value))
+        return directory / "runtime" / "agentops" / "memory" / "__".join(parts)
+
+    @staticmethod
+    def _safe_scope_part(value: str | None) -> str:
+        if value is None:
+            return "n"
+        raw = value.encode("utf-8")
+        encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+        return f"s-{encoded}"
+
+    def _path_for(self, target: str, context: "RuntimeContext | None" = None) -> Path:
+        directory = self._dir(context)
+        return directory / ("USER.md" if target == "user" else "MEMORY.md")
+
+    def read(self, context: "RuntimeContext | None", *, target: str = "memory") -> Optional[str]:
+        path = self._path_for(target, context)
+        if not path.exists():
+            return None
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except (OSError, IOError):
+            return None
+        return raw or None
+
+    def write(
+        self,
+        context: "RuntimeContext | None",
+        content: str,
+        *,
+        target: str = "memory",
+        action: str = "add",
+    ) -> None:
+        del action  # full snapshot is written; MemoryStore owns semantics
+        path = self._path_for(target, context)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        MemoryStore._write_file(path, [content] if content else [])
+
+
 def memory_tool(
     action: str,
     target: str = "memory",
@@ -637,8 +814,11 @@ def memory_tool(
             return tool_error("old_text is required for 'remove' action.", success=False)
         result = store.remove(target, old_text)
 
+    elif action == "read":
+        result = store.read(target)
+
     else:
-        return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
+        return tool_error(f"Unknown action '{action}'. Use: add, replace, remove, read", success=False)
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -674,7 +854,7 @@ MEMORY_SCHEMA = {
         "- 'user': who the user is -- name, role, preferences, communication style, pet peeves\n"
         "- 'memory': your notes -- environment facts, project conventions, tool quirks, lessons learned\n\n"
         "ACTIONS: add (new entry), replace (update existing -- old_text identifies it), "
-        "remove (delete -- old_text identifies it).\n\n"
+        "remove (delete -- old_text identifies it), read (return the live entries for a target).\n\n"
         "SKIP: trivial/obvious info, things easily re-discovered, raw data dumps, and temporary task state."
     ),
     "parameters": {
@@ -682,7 +862,7 @@ MEMORY_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["add", "replace", "remove"],
+                "enum": ["add", "replace", "remove", "read"],
                 "description": "The action to perform."
             },
             "target": {

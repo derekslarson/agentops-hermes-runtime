@@ -1128,14 +1128,35 @@ def init_agent(
             agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
             if agent._memory_enabled or agent._user_profile_enabled:
-                from tools.memory_tool import MemoryStore
+                from tools.memory_tool import LocalFileMemoryBackend, MemoryStore
+
+                memory_backend = None
+                memory_context = None
+                runtime_context = getattr(agent, "runtime_context", None)
+                if getattr(runtime_context, "mode", None) == "agentops":
+                    from agent.runtime_backends import BackendCapability, RuntimeBackendRegistry
+
+                    backend_registry = RuntimeBackendRegistry(_agent_cfg)
+                    if backend_registry.resolve_profile(BackendCapability.MEMORY, runtime_context) == "local":
+                        memory_backend = LocalFileMemoryBackend(scope_by_context=True)
+                    else:
+                        memory_backend = backend_registry.get(
+                            BackendCapability.MEMORY,
+                            runtime_context,
+                        )
+                    memory_context = runtime_context
+
                 agent._memory_store = MemoryStore(
                     memory_char_limit=mem_config.get("memory_char_limit", 2200),
                     user_char_limit=mem_config.get("user_char_limit", 1375),
+                    backend=memory_backend,
+                    context=memory_context,
                 )
                 agent._memory_store.load_from_disk()
-        except Exception:
-            pass  # Memory is optional -- don't break agent init
+        except Exception as _memory_init_err:
+            if getattr(getattr(agent, "runtime_context", None), "mode", None) == "agentops":
+                logger.warning("Failed to initialize AgentOps memory backend: %s", _memory_init_err)
+            # Memory is optional in local compatibility mode -- don't break agent init
     
 
 

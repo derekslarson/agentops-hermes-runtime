@@ -102,7 +102,14 @@ class BackendSelectionError(LookupError):
 
 @runtime_checkable
 class MemoryBackend(Protocol):
-    """Scoped store for the native memory tool."""
+    """Scoped store for the native memory tool.
+
+    Backends store the tool's complete §-delimited snapshot per target. Shared
+    implementations must make ``write`` linearizable for a given
+    RuntimeContext/target, or provide equivalent external coordination, because
+    MemoryStore performs read-modify-write mutations while preserving the native
+    tool's entry-level semantics.
+    """
 
     def read(self, context: RuntimeContext | None, *, target: str = "memory") -> str | None: ...
 
