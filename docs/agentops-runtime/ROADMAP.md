@@ -521,9 +521,11 @@ Required semantics:
 
 ### M7. Skills backend abstraction
 
-**Status:** Pending
+**Status:** Started
 
 **Goal:** Keep native Hermes skills while allowing remote scoped skill sources.
+
+**Start note (2026-05-31):** M6 is complete and pushed at `7854bd839`, so the next autonomous-builder target is M7. The implementation must preserve native `skills_list`, `skill_view`, and `skill_manage` semantics rather than adding a sidecar prompt-injection mechanism. Existing auto-loaded skill bindings from platform/channel/topic configuration are load-time selections only; they should resolve through the same scoped skill backend path and must not silently grant mutation rights or bypass policy.
 
 **Scope model:**
 
@@ -533,6 +535,15 @@ Required semantics:
 - user-private skills
 - runtime/ephemeral skills
 
+**Implementation notes:**
+
+- Wrap existing filesystem/profile skill discovery as `LocalSkillBackend`, including bundled/user/external skill directories, platform compatibility filtering, linked file access, readiness metadata, and existing validation/guard behavior.
+- Extend `SkillBackend` beyond raw `list_skills`/`load_skill` strings if needed so it can represent progressive disclosure metadata, linked files, categories, readiness/setup status, and mutation operations without losing current tool output shape.
+- Route native skill tools through the runtime backend registry when a `RuntimeContext` selects an AgentOps/local-multi profile; preserve the default single-user local path when no distributed mode is selected.
+- Model mutation authorization explicitly: user-private skill writes may be allowed by policy, while shared org/project skills require an approval or policy flag. Pinned/delete protections and `absorbed_into` semantics must be preserved.
+- Preserve deterministic skill precedence across bundled, org, project/team, user-private, external-dir, and runtime/ephemeral sources. Precedence must be testable and documented because auto-loaded channel/topic skills depend on stable resolution.
+- Include audit events for skill list/load/mutation attempts, but never leak private local paths, secret-looking setup values, or another tenant's skill content.
+
 **Acceptance criteria:**
 
 - Existing filesystem skill loading is `LocalSkillBackend`.
@@ -540,6 +551,8 @@ Required semantics:
 - Skill mutation permissions are represented: user-private allowed, shared org/project skills require policy/approval flag.
 - Tests prove user A cannot load user B private skill and org skills can be shared.
 - Skill precedence is deterministic across local and remote sources.
+- Auto-loaded channel/topic skills resolve through the scoped backend path without granting implicit mutation privileges.
+- Existing linked-file, readiness/setup metadata, platform compatibility, pinned-delete guard, and skill security scan behavior are preserved or explicitly mapped.
 
 ### M8. Cron/autonomous jobs backend abstraction
 
