@@ -521,11 +521,24 @@ Required semantics:
 
 ### M7. Skills backend abstraction
 
-**Status:** Pending
+**Status:** Done
 
 **Goal:** Keep native Hermes skills while allowing remote scoped skill sources.
 
 **Planning note (2026-05-31):** M6 is complete and pushed at `7854bd839`, so M7 is the next roadmap target when implementation resumes. The implementation must preserve native `skills_list`, `skill_view`, and `skill_manage` semantics rather than adding a sidecar prompt-injection mechanism. Existing auto-loaded skill bindings from platform/channel/topic configuration are load-time selections only; they should resolve through the same scoped skill backend path and must not silently grant mutation rights or bypass policy.
+
+**Completion note (2026-05-31):**
+
+- `SkillBackend` (agent/runtime_backends.py) extended beyond raw `list_skills`/`load_skill` strings to a native-shaped contract: metadata listing, full progressive-disclosure load (main content or linked file), and `manage_skill` mutation with scope/policy. Return shapes match the existing tool output.
+- `LocalSkillBackend` (agent/runtime_backends.py) reimplemented as a thin wrapper over the native filesystem discovery/loading: it delegates to `tools.skills_tool._skills_list_impl`/`_skill_view_impl` and `tools.skill_manager_tool._skill_manage_impl`, so linked files, readiness/setup metadata, platform compatibility, prompt-injection scanning, the pinned-delete guard, and `absorbed_into` semantics are preserved unchanged. It remains the registry default for the `skill` capability and the fallback when no remote skill backend is registered.
+- `ScopedSkillBackend` (agent/runtime_skills.py) is the in-memory, multi-tenant reference remote backend: visibility + deterministic precedence over `SCOPE_PRECEDENCE = (runtime, user, project, org, bundled)`, linked-file reads, readiness metadata, and mutation policy (user-private/runtime allowed; shared org/project require `RuntimeContext.metadata['skill_write_approved']` or `allow_shared_write=True`; bundled read-only; pinned-delete guard; `absorbed_into` target validation). Error/load payloads never echo another tenant's content or private paths. Registrable via `register_scoped_skill_backend(...)`.
+- Native surfaces route through the selected backend only when a `RuntimeContext` selects AgentOps mode and a backend is bound (`set_active_skill_backend`); otherwise the default single-user local filesystem read path is used unchanged. AgentOps mutations fail closed with `agentops_skill_backend_required` when no backend is bound, so a missing or misconfigured remote backend cannot silently write local filesystem skills. Routing lives inside the public `skills_list`/`skill_view`/`skill_manage` functions, so auto-loaded channel/topic/preload skills (which call `skill_view`) resolve through the scoped backend read-only without gaining mutation rights. agent/agent_init.py binds the active backend in AgentOps mode.
+
+**Test evidence (RED → GREEN):**
+
+- `tests/agent/test_runtime_skill_backend.py`, `tests/tools/test_skills_runtime_backend.py`, and `tests/tools/test_skill_manager_runtime_backend.py` — 34 tests covering contract/registry, AgentOps backend resolution fail-closed behavior, RuntimeContext-keyed backend isolation (sequential + concurrent), tenant isolation (user A cannot list/load user B private; org shared within org only; runtime records require full tenant/runtime identity), precedence, linked files, mutation policy (approval/fail-closed/bundled read-only/pinned/absorbed_into), no-leak payloads, native routing, autoload read-only, local default/read fallback, and `LocalSkillBackend` filesystem wrapping.
+- Regression: `tests/tools/test_skills_tool.py`, `tests/tools/test_skill_manager_tool.py`, and `tests/agent/test_runtime_backends.py` pass (188 passed).
+- Hygiene: `python -m ruff check agent/runtime_backends.py agent/runtime_skills.py tools/skills_tool.py tools/skill_manager_tool.py agent/agent_init.py tests/agent/test_runtime_skill_backend.py tests/tools/test_skills_runtime_backend.py tests/tools/test_skill_manager_runtime_backend.py` passes; `git diff --check` passes.
 
 **Scope model:**
 

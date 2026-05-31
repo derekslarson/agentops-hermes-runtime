@@ -824,15 +824,90 @@ def skill_manage(
     new_string: str = None,
     replace_all: bool = False,
     absorbed_into: str = None,
+    scope: str = None,
+    project_id: str = None,
+    allow_shared_write: bool = False,
+) -> str:
+    """Manage skills, routing through a scoped backend when one is selected.
+
+    In AgentOps mode the selected backend enforces mutation policy (user-private
+    writes allowed; shared org/project writes require approval) and fails closed
+    before any side effect. The default single-user local path is preserved when
+    no AgentOps profile is selected.
+    """
+    from tools.skills_tool import _route_skill_backend
+
+    context, backend = _route_skill_backend()
+    if backend is not None:
+        try:
+            result = backend.manage_skill(
+                context,
+                action=action,
+                name=name,
+                content=content,
+                category=category,
+                file_path=file_path,
+                file_content=file_content,
+                old_string=old_string,
+                new_string=new_string,
+                replace_all=replace_all,
+                absorbed_into=absorbed_into,
+                scope=scope,
+                project_id=project_id,
+                allow_shared_write=allow_shared_write,
+            )
+        except Exception as e:
+            return tool_error(str(e), success=False)
+        return json.dumps(result, ensure_ascii=False)
+
+    if getattr(context, "mode", None) == "agentops":
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    "AgentOps skill mutation requires an active skill backend; "
+                    "refusing to mutate local filesystem skills."
+                ),
+                "policy": "agentops_skill_backend_required",
+            },
+            ensure_ascii=False,
+        )
+
+    return _skill_manage_impl(
+        action=action,
+        name=name,
+        content=content,
+        category=category,
+        file_path=file_path,
+        file_content=file_content,
+        old_string=old_string,
+        new_string=new_string,
+        replace_all=replace_all,
+        absorbed_into=absorbed_into,
+    )
+
+
+def _skill_manage_impl(
+    action: str,
+    name: str,
+    content: str = None,
+    category: str = None,
+    file_path: str = None,
+    file_content: str = None,
+    old_string: str = None,
+    new_string: str = None,
+    replace_all: bool = False,
+    absorbed_into: str = None,
+    scope: str = None,
+    project_id: str = None,
+    allow_shared_write: bool = False,
 ) -> str:
     """
     Manage user-created skills. Dispatches to the appropriate action handler.
 
     Returns JSON string with results.
     """
-    from agent.runtime_context import get_runtime_context_for_surface
-    get_runtime_context_for_surface("skills")
-
+    del scope, project_id, allow_shared_write  # AgentOps-only backend parameters.
     if action == "create":
         if not content:
             return tool_error("content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).", success=False)
@@ -1009,6 +1084,19 @@ SKILL_MANAGE_SCHEMA = {
                     "rewriting) will have to guess at intent."
                 )
             },
+            "scope": {
+                "type": "string",
+                "enum": ["runtime", "user", "project", "org"],
+                "description": "AgentOps only: target skill scope. Shared org/project writes require approval.",
+            },
+            "project_id": {
+                "type": "string",
+                "description": "AgentOps only: project id when creating or editing a project-scoped skill.",
+            },
+            "allow_shared_write": {
+                "type": "boolean",
+                "description": "AgentOps only: explicit approval for org/project shared-scope writes.",
+            },
         },
         "required": ["action", "name"],
     },
@@ -1032,6 +1120,10 @@ registry.register(
         old_string=args.get("old_string"),
         new_string=args.get("new_string"),
         replace_all=args.get("replace_all", False),
-        absorbed_into=args.get("absorbed_into")),
+        absorbed_into=args.get("absorbed_into"),
+        scope=args.get("scope"),
+        project_id=args.get("project_id"),
+        allow_shared_write=args.get("allow_shared_write", False),
+    ),
     emoji="📝",
 )

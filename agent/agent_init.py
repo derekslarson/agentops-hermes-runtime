@@ -32,6 +32,35 @@ from urllib.parse import urlparse, parse_qs, urlunparse
 
 from agent.context_compressor import ContextCompressor
 from agent.iteration_budget import IterationBudget
+
+
+def _bind_agentops_skill_backend(agent: Any, config: Dict[str, Any]) -> None:
+    """Bind a configured AgentOps skill backend, failing closed for mutations.
+
+    If AgentOps selected a non-local skill backend but resolution fails, do not
+    install LocalSkillBackend as the active backend. Native reads can still fall
+    back to the local filesystem when no active backend is bound, but native
+    skill_manage must not silently mutate local files because a remote backend is
+    missing or misconfigured.
+    """
+    skill_runtime_context = getattr(agent, "runtime_context", None)
+    if getattr(skill_runtime_context, "mode", None) != "agentops":
+        return
+
+    from agent.runtime_backends import BackendCapability, RuntimeBackendRegistry
+    from agent.runtime_skills import set_active_skill_backend
+
+    skill_registry = RuntimeBackendRegistry(config)
+    try:
+        skill_backend = skill_registry.get(BackendCapability.SKILL, skill_runtime_context)
+    except Exception as exc:
+        logger.warning("Failed to resolve AgentOps skill backend; leaving no active backend: %s", exc)
+        set_active_skill_backend(None, context=skill_runtime_context)
+        return
+
+    set_active_skill_backend(skill_backend, context=skill_runtime_context)
+
+
 from agent.memory_manager import StreamingContextScrubber
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
@@ -1161,7 +1190,16 @@ def init_agent(
             if getattr(getattr(agent, "runtime_context", None), "mode", None) == "agentops":
                 logger.warning("Failed to initialize AgentOps memory backend: %s", _memory_init_err)
             # Memory is optional in local compatibility mode -- don't break agent init
-    
+
+    # Skills backend selection (M7). In AgentOps mode the native skill surfaces
+    # route through a scoped backend only when the configured backend resolves.
+    # If resolution fails, leave no active backend bound: reads may use the local
+    # filesystem fallback, but skill_manage must not mutate local files because a
+    # remote/configured backend failed open.
+    try:
+        _bind_agentops_skill_backend(agent, _agent_cfg)
+    except Exception as _skill_init_err:
+        logger.warning("Failed to initialize AgentOps skill backend: %s", _skill_init_err)
 
 
     # Memory provider plugin (external — one at a time, alongside built-in)

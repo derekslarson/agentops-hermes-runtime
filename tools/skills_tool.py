@@ -629,7 +629,55 @@ def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(skills, key=lambda s: (s.get("category") or "", s["name"]))
 
 
+def _route_skill_backend():
+    """Resolve whether native skill surfaces should route through a backend.
+
+    Returns ``(context, backend)``. ``backend`` is non-None only when the active
+    RuntimeContext selects an AgentOps profile *and* a scoped skill backend has
+    been bound for this process. Otherwise ``backend`` is None and callers use
+    the existing single-user local filesystem path, preserving default behavior.
+    """
+    from agent.runtime_context import get_runtime_context_for_surface
+
+    context = get_runtime_context_for_surface("skills")
+    if context is None or getattr(context, "mode", "local") != "agentops":
+        return context, None
+    from agent.runtime_skills import get_active_skill_backend
+
+    return context, get_active_skill_backend(context)
+
+
 def skills_list(category: str = None, task_id: str = None) -> str:
+    """List available skills, routing through a scoped backend when selected.
+
+    Preserves the native output shape and the default single-user local path.
+    """
+    context, backend = _route_skill_backend()
+    if backend is not None:
+        return _skills_list_via_backend(backend, context, category)
+    return _skills_list_impl(category=category, task_id=task_id)
+
+
+def _skills_list_via_backend(backend, context, category: str = None) -> str:
+    try:
+        skills = list(backend.list_skills(context, category=category))
+    except Exception as e:
+        return tool_error(str(e), success=False)
+    skills = _sort_skills(skills)
+    categories = sorted({s.get("category") for s in skills if s.get("category")})
+    return json.dumps(
+        {
+            "success": True,
+            "skills": skills,
+            "categories": categories,
+            "count": len(skills),
+            "hint": "Use skill_view(name) to see full content, tags, and linked files",
+        },
+        ensure_ascii=False,
+    )
+
+
+def _skills_list_impl(category: str = None, task_id: str = None) -> str:
     """
     List all available skills (progressive disclosure tier 1 - minimal metadata).
 
@@ -643,9 +691,6 @@ def skills_list(category: str = None, task_id: str = None) -> str:
     Returns:
         JSON string with minimal skill info: name, description, category
     """
-    from agent.runtime_context import get_runtime_context_for_surface
-    get_runtime_context_for_surface("skills")
-
     try:
         if not SKILLS_DIR.exists():
             SKILLS_DIR.mkdir(parents=True, exist_ok=True)
@@ -813,6 +858,35 @@ def skill_view(
     task_id: str = None,
     preprocess: bool = True,
 ) -> str:
+    """View a skill, routing through a scoped backend when one is selected.
+
+    Auto-loaded channel/topic/preload skills resolve through this same path, so
+    they go through the scoped backend (read-only) without any mutation rights.
+    The default single-user local path is preserved when no AgentOps profile is
+    selected.
+    """
+    context, backend = _route_skill_backend()
+    if backend is not None:
+        try:
+            payload = backend.load_skill(
+                context, name, file_path=file_path, preprocess=preprocess
+            )
+        except Exception as e:
+            return tool_error(str(e), success=False)
+        if payload is None:
+            payload = {"success": False, "error": f"Skill '{name}' not found."}
+        return json.dumps(payload, ensure_ascii=False)
+    return _skill_view_impl(
+        name, file_path=file_path, task_id=task_id, preprocess=preprocess
+    )
+
+
+def _skill_view_impl(
+    name: str,
+    file_path: str = None,
+    task_id: str = None,
+    preprocess: bool = True,
+) -> str:
     """
     View the content of a skill or a specific file within a skill directory.
 
@@ -828,9 +902,6 @@ def skill_view(
     Returns:
         JSON string with skill content or error message
     """
-    from agent.runtime_context import get_runtime_context_for_surface
-    get_runtime_context_for_surface("skills")
-
     try:
         local_category_name: str | None = None
         # ── Qualified name dispatch (plugin skills) ──────────────────

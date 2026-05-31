@@ -27,6 +27,7 @@ Design rules enforced here:
 from __future__ import annotations
 
 import copy
+import json
 import threading
 import time
 from enum import Enum
@@ -148,11 +149,51 @@ class MemoryBackend(Protocol):
 
 @runtime_checkable
 class SkillBackend(Protocol):
-    """Scoped source for listing and loading skill content."""
+    """Scoped source for listing, loading, and mutating skill content.
 
-    def list_skills(self, context: RuntimeContext | None) -> list[str]: ...
+    Extends the original raw ``list_skills``/``load_skill`` string contract so
+    the native skill surfaces (``skills_list``, ``skill_view``, ``skill_manage``)
+    can route through a backend without losing progressive-disclosure metadata,
+    linked-file access, readiness/setup status, platform compatibility filtering,
+    or mutation policy. Methods return native-shaped, JSON-ready dicts so the
+    tool layer keeps its existing output shape regardless of which backend is
+    selected.
 
-    def load_skill(self, context: RuntimeContext | None, name: str) -> str | None: ...
+    * ``list_skills`` returns one metadata mapping per visible skill
+      (``name``/``description``/``category`` plus optional ``scope``).
+    * ``load_skill`` returns the full ``skill_view`` payload mapping for the
+      main content, or a linked file when ``file_path`` is given. It returns a
+      ``{"success": False, ...}`` mapping (never another tenant's content) when
+      the skill is not visible/found.
+    * ``manage_skill`` performs a mutation and returns the result mapping.
+      Implementations enforce scope/policy and must fail closed before any side
+      effect for shared (org/project) scopes that lack approval.
+    """
+
+    def list_skills(
+        self,
+        context: RuntimeContext | None,
+        *,
+        category: str | None = None,
+    ) -> list[Mapping[str, Any]]: ...
+
+    def load_skill(
+        self,
+        context: RuntimeContext | None,
+        name: str,
+        *,
+        file_path: str | None = None,
+        preprocess: bool = True,
+    ) -> Mapping[str, Any] | None: ...
+
+    def manage_skill(
+        self,
+        context: RuntimeContext | None,
+        *,
+        action: str,
+        name: str,
+        **fields: Any,
+    ) -> Mapping[str, Any]: ...
 
 
 @runtime_checkable
@@ -355,17 +396,59 @@ class LocalMemoryBackend:
 
 
 class LocalSkillBackend:
-    def __init__(self) -> None:
-        self._skills: dict[tuple[Any, ...], dict[str, str]] = {}
-        self._lock = threading.RLock()
+    """Filesystem-backed skill source — the local compatibility backend.
 
-    def list_skills(self, context: RuntimeContext | None) -> list[str]:
-        with self._lock:
-            return sorted(self._skills.get(_runtime_scope_key(context), {}))
+    Wraps the existing ``~/.hermes/skills`` discovery/loading semantics in
+    :mod:`tools.skills_tool` / :mod:`tools.skill_manager_tool` instead of
+    reimplementing them, so linked files, readiness/setup metadata, platform
+    compatibility filtering, prompt-injection scanning, the pinned-delete guard,
+    and ``absorbed_into`` semantics are all preserved.
 
-    def load_skill(self, context: RuntimeContext | None, name: str) -> str | None:
-        with self._lock:
-            return self._skills.get(_runtime_scope_key(context), {}).get(name)
+    Tenant isolation in local mode comes from Hermes' existing per-profile
+    skills directories, so ``RuntimeContext`` is accepted for contract symmetry
+    and audit scoping but does not repartition the on-disk tree. Imports are kept
+    lazy so this core contract module stays lightweight at import time and free
+    of tool-layer import cycles.
+    """
+
+    def list_skills(
+        self,
+        context: RuntimeContext | None,
+        *,
+        category: str | None = None,
+    ) -> list[Mapping[str, Any]]:
+        from tools.skills_tool import _skills_list_impl
+
+        payload = json.loads(_skills_list_impl(category=category))
+        if not payload.get("success"):
+            return []
+        return list(payload.get("skills", []))
+
+    def load_skill(
+        self,
+        context: RuntimeContext | None,
+        name: str,
+        *,
+        file_path: str | None = None,
+        preprocess: bool = True,
+    ) -> Mapping[str, Any]:
+        from tools.skills_tool import _skill_view_impl
+
+        return json.loads(
+            _skill_view_impl(name, file_path=file_path, preprocess=preprocess)
+        )
+
+    def manage_skill(
+        self,
+        context: RuntimeContext | None,
+        *,
+        action: str,
+        name: str,
+        **fields: Any,
+    ) -> Mapping[str, Any]:
+        from tools.skill_manager_tool import _skill_manage_impl
+
+        return json.loads(_skill_manage_impl(action=action, name=name, **fields))
 
 
 class LocalSessionBackend:
