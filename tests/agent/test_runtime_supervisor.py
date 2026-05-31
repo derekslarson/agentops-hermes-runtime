@@ -205,7 +205,9 @@ def test_local_backend_reads_do_not_expose_mutable_internal_state():
     jobs = cron.list_jobs(context)
     jobs[0]["name"] = "mutated outside lock"
     jobs[0]["nested"]["value"] = "nested mutation outside lock"
-    assert cron.list_jobs(context) == [{"name": "original", "nested": {"value": "original"}, "paused": False}]
+    fresh = cron.list_jobs(context)
+    assert fresh[0]["name"] == "original"
+    assert fresh[0]["nested"] == {"value": "original"}
     assert cron.run_history(context, job_id) == []
 
 

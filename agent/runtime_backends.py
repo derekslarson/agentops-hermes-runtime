@@ -30,6 +30,7 @@ import copy
 import json
 import threading
 import time
+from datetime import datetime
 from enum import Enum
 from typing import Any, Callable, Mapping, Protocol, runtime_checkable
 
@@ -37,6 +38,43 @@ from agent.runtime_context import RuntimeContext
 
 _DEFAULT_PROFILE = "local"
 _SENSITIVE_EVENT_KEYS = ("secret", "token", "password", "api_key", "apikey", "credential")
+_CRON_SILENT_MARKERS = ("[SILENT]",)
+# Context fields safe to bind into a durable cron job record. Secret-bearing
+# refs (``permissions_ref``) and per-execution identifiers (``run_id``) are
+# intentionally excluded so the stored binding is a stable, non-secret scope.
+_CRON_BINDING_FIELDS = (
+    "mode",
+    "org_id",
+    "workspace_id",
+    "user_id",
+    "conversation_id",
+    "agent_profile_id",
+    "project_id",
+    "run_type",
+    "delivery_ref",
+)
+
+
+def _cron_job_binding(context: RuntimeContext | None) -> dict[str, Any]:
+    """Return the non-secret scope/delivery binding stored on a cron job.
+
+    Captures the RuntimeContext scope a future run must reconstruct (tenant,
+    user, project, conversation, profile) plus the delivery target reference,
+    while never copying secret-bearing refs into the durable job record.
+    """
+
+    if context is None:
+        return {}
+    return {field: getattr(context, field, None) for field in _CRON_BINDING_FIELDS}
+
+
+def _cron_output_is_silent(output: str | None) -> bool:
+    if output is None:
+        return True
+    text = output.strip()
+    if not text:
+        return True
+    return text in _CRON_SILENT_MARKERS
 
 
 def _runtime_scope_key(context: RuntimeContext | None) -> tuple[Any, ...]:
@@ -84,6 +122,19 @@ def _session_scope_key(context: RuntimeContext | None) -> tuple[Any, ...]:
     )
 
 
+def _cron_scope_key(context: RuntimeContext | None) -> tuple[Any, ...]:
+    """Return the durable cron job scope for a runtime context.
+
+    Cron jobs are scheduled durable objects, so visibility follows stable
+    tenant/user/project/conversation/profile identity and intentionally excludes
+    per-execution identifiers such as ``run_id`` and ``job_id``. A scheduler or
+    worker restarted with a new run id must still claim and complete the same
+    job, while another user/conversation remains isolated.
+    """
+
+    return _session_scope_key(context)
+
+
 def _redact_audit_value(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {
@@ -122,6 +173,16 @@ REQUIRED_CAPABILITIES: frozenset[BackendCapability] = frozenset(BackendCapabilit
 
 class BackendSelectionError(LookupError):
     """Raised when no backend is registered for a capability/profile pair."""
+
+
+class CronLeaseError(RuntimeError):
+    """Raised when a worker acts on a cron job it does not currently lease.
+
+    Worker-safe scheduling requires that only the live lease holder advances or
+    completes a run. A stale or duplicate worker attempting to complete/fail a
+    job whose lease has been reclaimed by another owner is rejected so a single
+    due firing cannot be delivered twice.
+    """
 
 
 @runtime_checkable
@@ -258,11 +319,22 @@ class SessionBackend(Protocol):
 
 @runtime_checkable
 class CronBackend(Protocol):
-    """Scheduled/autonomous job storage and run history."""
+    """Scheduled/autonomous job storage, worker-safe leasing, and run history.
+
+    The contract is cloud/provider-agnostic: a local file scheduler, a Compose
+    worker pool, or a cloud scheduler/queue adapter all implement the same
+    logical job model. Beyond CRUD it exposes a due-claim/lease surface so
+    several worker tasks or schedulers can poll the same job set without firing
+    a single due occurrence twice, and a run-recording surface that preserves
+    Hermes' empty-output/silent and error-alert semantics as metadata rather
+    than forcing a delivery.
+    """
 
     def create(self, context: RuntimeContext | None, job: Mapping[str, Any]) -> str: ...
 
     def update(self, context: RuntimeContext | None, job_id: str, job: Mapping[str, Any]) -> None: ...
+
+    def get_job(self, context: RuntimeContext | None, job_id: str) -> Mapping[str, Any] | None: ...
 
     def pause(self, context: RuntimeContext | None, job_id: str) -> None: ...
 
@@ -273,6 +345,52 @@ class CronBackend(Protocol):
     def list_jobs(self, context: RuntimeContext | None) -> list[Any]: ...
 
     def run_history(self, context: RuntimeContext | None, job_id: str) -> list[Any]: ...
+
+    def claim_due(
+        self,
+        context: RuntimeContext | None,
+        *,
+        owner: str,
+        now: float | None = None,
+        lease_seconds: float = 60.0,
+        draining: bool = False,
+        limit: int | None = None,
+    ) -> list[Mapping[str, Any]]: ...
+
+    def renew_lease(
+        self,
+        context: RuntimeContext | None,
+        job_id: str,
+        *,
+        owner: str,
+        now: float | None = None,
+        lease_seconds: float = 60.0,
+    ) -> bool: ...
+
+    def release_lease(self, context: RuntimeContext | None, job_id: str, *, owner: str) -> None: ...
+
+    def complete_run(
+        self,
+        context: RuntimeContext | None,
+        job_id: str,
+        *,
+        owner: str,
+        output: str | None = None,
+        delivery_error: str | None = None,
+        now: float | None = None,
+        next_run_at: float | None = None,
+    ) -> Mapping[str, Any]: ...
+
+    def fail_run(
+        self,
+        context: RuntimeContext | None,
+        job_id: str,
+        *,
+        owner: str,
+        error: str,
+        now: float | None = None,
+        next_run_at: float | None = None,
+    ) -> Mapping[str, Any]: ...
 
 
 @runtime_checkable
@@ -557,46 +675,295 @@ class LocalSessionBackend:
 
 
 class LocalCronBackend:
+    """In-process, RuntimeContext-scoped cron model and worker-safe scheduler.
+
+    This is the local compatibility/test backend: it keeps the M2 CRUD storage
+    contract while growing the native cron surface M8 requires — context/delivery
+    binding, due-claim leasing that survives worker death via timeout, and run
+    recording that preserves silent and error-alert semantics. State is held in
+    process and partitioned by the same RuntimeContext fields a durable backend
+    keys on, so two tenants never observe each other's jobs.
+
+    Recurring vs one-shot is driven by the job's ``repeat`` (an int count or a
+    ``{"times", "completed"}`` mapping): ``repeat=1`` is one-shot, ``None`` is
+    forever. ``next_run_at`` (a numeric clock value) gates due-ness; absent
+    means immediately due.
+    """
+
     def __init__(self) -> None:
         self._jobs: dict[tuple[Any, ...], dict[str, dict[str, Any]]] = {}
         self._history: dict[tuple[Any, ...], dict[str, list[Any]]] = {}
+        self._leases: dict[tuple[Any, ...], dict[str, tuple[str, float]]] = {}
         self._counter = 0
         self._lock = threading.RLock()
+
+    @staticmethod
+    def _normalize_repeat(job: Mapping[str, Any]) -> dict[str, Any]:
+        raw = job.get("repeat")
+        if isinstance(raw, Mapping):
+            times = raw.get("times")
+            completed = raw.get("completed", 0)
+        elif isinstance(raw, int):
+            times = raw if raw > 0 else None
+            completed = 0
+        elif job.get("one_shot"):
+            times, completed = 1, 0
+        else:
+            times, completed = None, 0
+        return {"times": times, "completed": int(completed or 0)}
+
+    @staticmethod
+    def _is_done(record: Mapping[str, Any]) -> bool:
+        repeat = record.get("repeat") or {}
+        times = repeat.get("times")
+        return times is not None and int(repeat.get("completed", 0)) >= int(times)
 
     def create(self, context: RuntimeContext | None, job: Mapping[str, Any]) -> str:
         with self._lock:
             self._counter += 1
             job_id = str(self._counter)
-            scope = _runtime_scope_key(context)
-            self._jobs.setdefault(scope, {})[job_id] = {**copy.deepcopy(dict(job)), "paused": False}
+            scope = _cron_scope_key(context)
+            record = {
+                **copy.deepcopy(dict(job)),
+                "id": job_id,
+                "paused": False,
+                "state": "scheduled",
+                "repeat": self._normalize_repeat(job),
+                "deliver": job.get("deliver", "local"),
+                "binding": _cron_job_binding(context),
+            }
+            self._jobs.setdefault(scope, {})[job_id] = record
             self._history.setdefault(scope, {})[job_id] = []
             return job_id
 
     def update(self, context: RuntimeContext | None, job_id: str, job: Mapping[str, Any]) -> None:
         with self._lock:
-            self._jobs.setdefault(_runtime_scope_key(context), {}).setdefault(job_id, {}).update(copy.deepcopy(dict(job)))
+            record = self._jobs.get(_cron_scope_key(context), {}).get(job_id)
+            if record is not None:
+                record.update(copy.deepcopy(dict(job)))
+
+    def get_job(self, context: RuntimeContext | None, job_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            record = self._jobs.get(_cron_scope_key(context), {}).get(job_id)
+            return copy.deepcopy(record) if record is not None else None
 
     def pause(self, context: RuntimeContext | None, job_id: str) -> None:
         with self._lock:
-            self._jobs.setdefault(_runtime_scope_key(context), {}).setdefault(job_id, {})["paused"] = True
+            record = self._jobs.get(_cron_scope_key(context), {}).get(job_id)
+            if record is None:
+                return
+            record["paused"] = True
+            record["state"] = "paused"
 
     def resume(self, context: RuntimeContext | None, job_id: str) -> None:
         with self._lock:
-            self._jobs.setdefault(_runtime_scope_key(context), {}).setdefault(job_id, {})["paused"] = False
+            record = self._jobs.get(_cron_scope_key(context), {}).get(job_id)
+            if record is None:
+                return
+            record["paused"] = False
+            if record.get("state") == "paused":
+                record["state"] = "scheduled"
 
     def remove(self, context: RuntimeContext | None, job_id: str) -> None:
         with self._lock:
-            scope = _runtime_scope_key(context)
+            scope = _cron_scope_key(context)
             self._jobs.get(scope, {}).pop(job_id, None)
             self._history.get(scope, {}).pop(job_id, None)
+            self._leases.get(scope, {}).pop(job_id, None)
 
     def list_jobs(self, context: RuntimeContext | None) -> list[Any]:
         with self._lock:
-            return copy.deepcopy(list(self._jobs.get(_runtime_scope_key(context), {}).values()))
+            return copy.deepcopy(list(self._jobs.get(_cron_scope_key(context), {}).values()))
 
     def run_history(self, context: RuntimeContext | None, job_id: str) -> list[Any]:
         with self._lock:
-            return copy.deepcopy(self._history.get(_runtime_scope_key(context), {}).get(job_id, []))
+            return copy.deepcopy(self._history.get(_cron_scope_key(context), {}).get(job_id, []))
+
+    def _lease_is_live(self, scope: tuple[Any, ...], job_id: str, now: float) -> tuple[str, float] | None:
+        lease = self._leases.get(scope, {}).get(job_id)
+        if lease is None:
+            return None
+        _owner, expires_at = lease
+        return lease if expires_at > now else None
+
+    @staticmethod
+    def _next_run_due_at(next_run_at: Any) -> float:
+        if isinstance(next_run_at, (int, float)):
+            return float(next_run_at)
+        if isinstance(next_run_at, str):
+            text = next_run_at.strip()
+            if not text:
+                return 0.0
+            try:
+                return float(text)
+            except ValueError:
+                return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+        return float(next_run_at)
+
+    def _is_due(self, record: Mapping[str, Any], now: float) -> bool:
+        if record.get("paused") or record.get("state") in {"paused", "completed", "needs_schedule"}:
+            return False
+        if self._is_done(record):
+            return False
+        next_run_at = record.get("next_run_at")
+        if next_run_at is None:
+            return True
+        try:
+            return self._next_run_due_at(next_run_at) <= now
+        except (TypeError, ValueError, OverflowError) as exc:
+            if isinstance(record, dict):
+                record["state"] = "needs_schedule"
+                record["next_run_at_error"] = str(exc)
+            return False
+
+    def claim_due(
+        self,
+        context: RuntimeContext | None,
+        *,
+        owner: str,
+        now: float | None = None,
+        lease_seconds: float = 60.0,
+        draining: bool = False,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        if draining:
+            return []
+        clock = time.time() if now is None else now
+        claimed: list[dict[str, Any]] = []
+        with self._lock:
+            scope = _cron_scope_key(context)
+            jobs = self._jobs.get(scope, {})
+            leases = self._leases.setdefault(scope, {})
+            for job_id, record in jobs.items():
+                if not self._is_due(record, clock):
+                    continue
+                if self._lease_is_live(scope, job_id, clock) is not None:
+                    continue
+                leases[job_id] = (owner, clock + lease_seconds)
+                record["state"] = "running"
+                claim = copy.deepcopy(record)
+                claim["owner"] = owner
+                claim["lease_expires_at"] = clock + lease_seconds
+                claimed.append(claim)
+                if limit is not None and len(claimed) >= limit:
+                    break
+        return claimed
+
+    def _require_lease(self, scope: tuple[Any, ...], job_id: str, owner: str, now: float) -> None:
+        lease = self._leases.get(scope, {}).get(job_id)
+        if lease is None or lease[0] != owner or lease[1] <= now:
+            raise CronLeaseError(
+                f"worker {owner!r} does not hold the lease for cron job {job_id!r}"
+            )
+
+    def renew_lease(
+        self,
+        context: RuntimeContext | None,
+        job_id: str,
+        *,
+        owner: str,
+        now: float | None = None,
+        lease_seconds: float = 60.0,
+    ) -> bool:
+        clock = time.time() if now is None else now
+        with self._lock:
+            scope = _cron_scope_key(context)
+            lease = self._leases.get(scope, {}).get(job_id)
+            if lease is None or lease[0] != owner or lease[1] <= clock:
+                return False
+            self._leases[scope][job_id] = (owner, clock + lease_seconds)
+            return True
+
+    def release_lease(self, context: RuntimeContext | None, job_id: str, *, owner: str) -> None:
+        with self._lock:
+            scope = _cron_scope_key(context)
+            lease = self._leases.get(scope, {}).get(job_id)
+            if lease is not None and lease[0] == owner:
+                self._leases[scope].pop(job_id, None)
+
+    def _finish_run(
+        self,
+        scope: tuple[Any, ...],
+        job_id: str,
+        owner: str,
+        entry: Mapping[str, Any],
+        next_run_at: float | None,
+        now: float,
+    ) -> dict[str, Any]:
+        self._require_lease(scope, job_id, owner, now)
+        record = self._jobs.get(scope, {}).get(job_id)
+        if record is not None:
+            repeat = record.setdefault("repeat", {"times": None, "completed": 0})
+            repeat["completed"] = int(repeat.get("completed", 0)) + 1
+            if next_run_at is not None:
+                record["next_run_at"] = next_run_at
+            if self._is_done(record):
+                record["state"] = "completed"
+            elif next_run_at is None:
+                # Scheduler adapters must advance recurring schedules before the
+                # next claim. Without that fail-closed state, an old due time can
+                # hot-loop immediately after successful completion.
+                record["state"] = "needs_schedule"
+            elif not record.get("paused"):
+                record["state"] = "scheduled"
+        stored = copy.deepcopy(dict(entry))
+        self._history.setdefault(scope, {}).setdefault(job_id, []).append(stored)
+        self._leases.get(scope, {}).pop(job_id, None)
+        return copy.deepcopy(stored)
+
+    def complete_run(
+        self,
+        context: RuntimeContext | None,
+        job_id: str,
+        *,
+        owner: str,
+        output: str | None = None,
+        delivery_error: str | None = None,
+        now: float | None = None,
+        next_run_at: float | None = None,
+    ) -> dict[str, Any]:
+        clock = time.time() if now is None else now
+        silent = _cron_output_is_silent(output)
+        if delivery_error:
+            status, delivery, error = "delivery_error", "error", delivery_error
+        elif silent:
+            status, delivery, error = "success", "skipped_silent", None
+        else:
+            status, delivery, error = "success", "delivered", None
+        entry = {
+            "status": status,
+            "owner": owner,
+            "output_empty": output is None or not str(output).strip(),
+            "silent": silent,
+            "delivery": delivery,
+            "error": error,
+            "at": clock,
+        }
+        with self._lock:
+            return self._finish_run(_cron_scope_key(context), job_id, owner, entry, next_run_at, clock)
+
+    def fail_run(
+        self,
+        context: RuntimeContext | None,
+        job_id: str,
+        *,
+        owner: str,
+        error: str,
+        now: float | None = None,
+        next_run_at: float | None = None,
+    ) -> dict[str, Any]:
+        clock = time.time() if now is None else now
+        entry = {
+            "status": "error",
+            "owner": owner,
+            "output_empty": True,
+            "silent": False,
+            "delivery": "error_alert",
+            "error": error,
+            "at": clock,
+        }
+        with self._lock:
+            return self._finish_run(_cron_scope_key(context), job_id, owner, entry, next_run_at, clock)
 
 
 class LocalCredentialResolver:

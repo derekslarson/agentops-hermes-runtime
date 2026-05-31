@@ -569,7 +569,9 @@ Required semantics:
 
 ### M8. Cron/autonomous jobs backend abstraction
 
-**Status:** Pending
+**Status:** Started
+
+**Progress note (2026-05-31):** Started with a local/native foundation slice: the `CronBackend` contract now covers native CRUD/list/history plus worker lease/run-recording semantics, `LocalCronBackend` records stable non-secret RuntimeContext/delivery bindings, uses durable cron scoping that survives new run/job IDs for the same conversation, rejects stale lease renewal/completion after expiry, and fails closed instead of hot-looping if a recurring run completes before the scheduler supplies the next due time. The native `cronjob` tool routes create/list/update/pause/resume/remove through a bound backend only in AgentOps mode while preserving the default local cron path; backend-routed create now uses native schedule parsing/next-run computation and preserves native job metadata such as model/provider/script/no-agent/toolsets/workdir/profile. Test evidence: `python -m pytest tests/agent/test_runtime_cron_backend.py tests/agent/test_runtime_backends.py tests/agent/test_runtime_supervisor.py -q` → 65 passed; `python -m ruff check agent/runtime_backends.py agent/runtime_cron.py tools/cronjob_tools.py tests/agent/test_runtime_cron_backend.py tests/agent/test_runtime_supervisor.py` → passed. M8 is not Done yet: remote/cloud scheduler/queue adapters, durable backend implementations beyond this local in-process contract adapter, and end-to-end Compose/cloud execution still remain.
 
 **Goal:** Move Hermes cron from local scheduler files/state to pluggable local/remote cron backends.
 

@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from cron.jobs import (
     AmbiguousJobReference,
+    compute_next_run,
     create_job,
     list_jobs,
     parse_schedule,
@@ -416,6 +417,205 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def _route_cron_backend():
+    """Resolve whether native cron surfaces should route through a backend.
+
+    Returns ``(context, backend)``. ``backend`` is non-None only when the active
+    RuntimeContext selects an AgentOps profile *and* a scoped cron backend has
+    been bound for this process. Otherwise ``backend`` is None and callers use
+    the existing local ``cron.jobs`` path unchanged.
+    """
+    from agent.runtime_context import get_runtime_context_for_surface
+
+    context = get_runtime_context_for_surface("cron")
+    if context is None or getattr(context, "mode", "local") != "agentops":
+        return context, None
+
+    from agent.runtime_cron import get_active_cron_backend
+
+    return context, get_active_cron_backend(context)
+
+
+def _cronjob_via_backend(
+    backend,
+    context,
+    *,
+    action: str,
+    job_id: Optional[str],
+    prompt: Optional[str],
+    schedule: Optional[str],
+    name: Optional[str],
+    repeat: Optional[int],
+    deliver: Optional[str],
+    skill: Optional[str],
+    skills: Optional[List[str]],
+    model: Optional[str],
+    provider: Optional[str],
+    base_url: Optional[str],
+    script: Optional[str],
+    context_from: Optional[Union[str, List[str]]],
+    enabled_toolsets: Optional[List[str]],
+    workdir: Optional[str],
+    profile: Optional[str],
+    no_agent: Optional[bool],
+) -> str:
+    """Route a native ``cronjob`` operation through a scoped CronBackend.
+
+    Preserves the user-facing JSON shape and the create-time prompt security
+    scan while delegating storage to the backend selected by RuntimeContext.
+    Execution/trigger remains scheduler-driven in AgentOps mode and is not part
+    of this routing seam.
+    """
+    normalized = (action or "").strip().lower()
+
+    if normalized == "create":
+        if not schedule:
+            return tool_error("schedule is required for create", success=False)
+        canonical_skills = _canonical_skills(skill, skills)
+        _no_agent = bool(no_agent)
+        if _no_agent:
+            if not script:
+                return tool_error(
+                    "create with no_agent=True requires a script — the script is the job.",
+                    success=False,
+                )
+        elif not prompt and not canonical_skills:
+            return tool_error("create requires either prompt or at least one skill", success=False)
+        if prompt:
+            scan_error = _scan_cron_prompt(prompt)
+            if scan_error:
+                return tool_error(scan_error, success=False)
+        if script:
+            script_error = _validate_cron_script_path(script)
+            if script_error:
+                return tool_error(script_error, success=False)
+        try:
+            parsed_schedule = parse_schedule(schedule)
+            next_run_at = compute_next_run(parsed_schedule)
+        except ValueError as exc:
+            return tool_error(str(exc), success=False)
+        if repeat is not None and repeat <= 0:
+            repeat = None
+        if parsed_schedule["kind"] == "once" and repeat is None:
+            repeat = 1
+        if isinstance(context_from, str):
+            normalized_context_from = [context_from.strip()] if context_from.strip() else None
+        elif isinstance(context_from, list):
+            normalized_context_from = [str(ref).strip() for ref in context_from if str(ref).strip()] or None
+        else:
+            normalized_context_from = None
+        resolved_name = name or (prompt[:50] if prompt else None) or (canonical_skills[0] if canonical_skills else None) or (script if _no_agent else "cron job")
+        job = {
+            "prompt": prompt or "",
+            "schedule": parsed_schedule,
+            "schedule_display": parsed_schedule.get("display", schedule),
+            "name": resolved_name,
+            "skill": canonical_skills[0] if canonical_skills else None,
+            "skills": canonical_skills,
+            "model": _normalize_optional_job_value(model),
+            "provider": _normalize_optional_job_value(provider),
+            "base_url": _normalize_optional_job_value(base_url, strip_trailing_slash=True),
+            "script": _normalize_optional_job_value(script),
+            "no_agent": _no_agent,
+            "context_from": normalized_context_from,
+            "enabled_toolsets": enabled_toolsets or None,
+            "workdir": _normalize_optional_job_value(workdir),
+            "profile": _normalize_optional_job_value(profile),
+            "deliver": _normalize_deliver_param(deliver) or "local",
+            "repeat": {"times": repeat, "completed": 0},
+            "origin": _origin_from_env(),
+            "enabled": True,
+            "next_run_at": next_run_at,
+            "last_run_at": None,
+            "last_status": None,
+            "last_error": None,
+            "last_delivery_error": None,
+        }
+        new_id = backend.create(context, job)
+        stored = backend.get_job(context, new_id) or job
+        return json.dumps(
+            {
+                "success": True,
+                "job_id": new_id,
+                "name": resolved_name,
+                "skill": job["skill"],
+                "skills": canonical_skills,
+                "schedule": job["schedule_display"],
+                "repeat": _repeat_display({**job, "id": new_id}),
+                "deliver": job["deliver"],
+                "next_run_at": next_run_at,
+                "job": _format_job({**stored, "id": new_id}),
+                "message": f"Cron job '{resolved_name}' created.",
+            },
+            indent=2,
+        )
+
+    if normalized == "list":
+        jobs = [_format_job(j) for j in backend.list_jobs(context)]
+        return json.dumps({"success": True, "count": len(jobs), "jobs": jobs}, indent=2)
+
+    if not job_id:
+        return tool_error(f"job_id is required for action '{normalized}'", success=False)
+    existing = backend.get_job(context, job_id)
+    if existing is None:
+        return json.dumps(
+            {"success": False, "error": f"Job with ID '{job_id}' not found. Use cronjob(action='list') to inspect jobs."},
+            indent=2,
+        )
+
+    if normalized == "remove":
+        backend.remove(context, job_id)
+        return json.dumps(
+            {
+                "success": True,
+                "message": f"Cron job '{existing.get('name', job_id)}' removed.",
+                "removed_job": {"id": job_id, "name": existing.get("name")},
+            },
+            indent=2,
+        )
+
+    if normalized == "pause":
+        backend.pause(context, job_id)
+        return json.dumps({"success": True, "job": _format_job({**backend.get_job(context, job_id), "id": job_id})}, indent=2)
+
+    if normalized == "resume":
+        backend.resume(context, job_id)
+        return json.dumps({"success": True, "job": _format_job({**backend.get_job(context, job_id), "id": job_id})}, indent=2)
+
+    if normalized == "update":
+        updates: Dict[str, Any] = {}
+        if prompt is not None:
+            scan_error = _scan_cron_prompt(prompt)
+            if scan_error:
+                return tool_error(scan_error, success=False)
+            updates["prompt"] = prompt
+        if name is not None:
+            updates["name"] = name
+        if deliver is not None:
+            updates["deliver"] = _normalize_deliver_param(deliver)
+        if skills is not None or skill is not None:
+            canonical_skills = _canonical_skills(skill, skills)
+            updates["skills"] = canonical_skills
+            updates["skill"] = canonical_skills[0] if canonical_skills else None
+        if schedule is not None:
+            try:
+                parsed_schedule = parse_schedule(schedule)
+                updates["next_run_at"] = compute_next_run(parsed_schedule)
+            except ValueError as exc:
+                return tool_error(str(exc), success=False)
+            updates["schedule"] = parsed_schedule
+            updates["schedule_display"] = parsed_schedule.get("display", schedule)
+        if not updates:
+            return tool_error("No updates provided.", success=False)
+        backend.update(context, job_id, updates)
+        return json.dumps({"success": True, "job": _format_job({**backend.get_job(context, job_id), "id": job_id})}, indent=2)
+
+    return tool_error(
+        f"action '{normalized}' is managed by the cron scheduler in AgentOps mode",
+        success=False,
+    )
+
+
 def cronjob(
     action: str,
     job_id: Optional[str] = None,
@@ -441,10 +641,33 @@ def cronjob(
 ) -> str:
     """Unified cron job management tool."""
     del task_id  # unused but kept for handler signature compatibility
-    from agent.runtime_context import get_runtime_context_for_surface
-    get_runtime_context_for_surface("cron")
 
     try:
+        cron_context, cron_backend = _route_cron_backend()
+        if cron_backend is not None:
+            return _cronjob_via_backend(
+                cron_backend,
+                cron_context,
+                action=action,
+                job_id=job_id,
+                prompt=prompt,
+                schedule=schedule,
+                name=name,
+                repeat=repeat,
+                deliver=deliver,
+                skill=skill,
+                skills=skills,
+                model=model,
+                provider=provider,
+                base_url=base_url,
+                script=script,
+                context_from=context_from,
+                enabled_toolsets=enabled_toolsets,
+                workdir=workdir,
+                profile=profile,
+                no_agent=no_agent,
+            )
+
         normalized = (action or "").strip().lower()
 
         if normalized == "create":
