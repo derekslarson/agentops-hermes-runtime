@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import copy
 import threading
+import time
 from enum import Enum
 from typing import Any, Callable, Mapping, Protocol, runtime_checkable
 
@@ -134,7 +135,56 @@ class SkillBackend(Protocol):
 
 @runtime_checkable
 class SessionBackend(Protocol):
-    """Durable conversation/session persistence."""
+    """Durable conversation/session persistence.
+
+    Backends support the legacy event-style append/read/search methods plus the
+    richer M6 transcript surface needed by workers: create session rows, append
+    native message dicts, read scoped transcripts, resolve resume lineage, and
+    acquire a per-conversation turn lock.
+    """
+
+    def create_session(
+        self,
+        context: RuntimeContext | None,
+        *,
+        session_id: str | None = None,
+        source: str | None = None,
+        parent_session_id: str | None = None,
+        model: str | None = None,
+        model_config: Mapping[str, Any] | None = None,
+        system_prompt: str | None = None,
+        user_id: str | None = None,
+    ) -> str: ...
+
+    def append_message(self, context: RuntimeContext | None, message: Mapping[str, Any]) -> Any: ...
+
+    def read_messages(
+        self,
+        context: RuntimeContext | None,
+        *,
+        session_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[Any]: ...
+
+    def resolve_resume_session_id(self, session_id: str) -> str: ...
+
+    def claim_turn_lock(
+        self,
+        context: RuntimeContext | None,
+        *,
+        owner: str,
+        ttl_seconds: float = 300.0,
+    ) -> bool: ...
+
+    def renew_turn_lock(
+        self,
+        context: RuntimeContext | None,
+        *,
+        owner: str,
+        ttl_seconds: float = 300.0,
+    ) -> bool: ...
+
+    def release_turn_lock(self, context: RuntimeContext | None, *, owner: str) -> None: ...
 
     def append(self, context: RuntimeContext | None, event: Mapping[str, Any]) -> None: ...
 
@@ -299,7 +349,88 @@ class LocalSkillBackend:
 class LocalSessionBackend:
     def __init__(self) -> None:
         self._events: dict[tuple[Any, ...], list[Mapping[str, Any]]] = {}
+        self._children: dict[str, str] = {}
+        self._locks: dict[tuple[Any, ...], dict[str, tuple[str, float]]] = {}
         self._lock = threading.RLock()
+
+    def create_session(
+        self,
+        context: RuntimeContext | None,
+        *,
+        session_id: str | None = None,
+        source: str | None = None,
+        parent_session_id: str | None = None,
+        model: str | None = None,
+        model_config: Mapping[str, Any] | None = None,
+        system_prompt: str | None = None,
+        user_id: str | None = None,
+    ) -> str:
+        resolved = session_id or (context.conversation_id if context and context.conversation_id else "local")
+        if parent_session_id:
+            with self._lock:
+                self._children[parent_session_id] = resolved
+        return resolved
+
+    def append_message(self, context: RuntimeContext | None, message: Mapping[str, Any]) -> None:
+        self.append(context, message)
+
+    def read_messages(
+        self,
+        context: RuntimeContext | None,
+        *,
+        session_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[Any]:
+        return self.read(context, limit=limit)
+
+    def resolve_resume_session_id(self, session_id: str) -> str:
+        with self._lock:
+            return self._children.get(session_id, session_id)
+
+    def claim_turn_lock(
+        self,
+        context: RuntimeContext | None,
+        *,
+        owner: str,
+        ttl_seconds: float = 300.0,
+    ) -> bool:
+        key = context.conversation_id if context and context.conversation_id else "local"
+        with self._lock:
+            locks = self._locks.setdefault(_runtime_scope_key(context), {})
+            now = time.time()
+            current = locks.get(key)
+            if current is not None:
+                current_owner, expires_at = current
+                if expires_at >= now and current_owner != owner:
+                    return False
+            locks[key] = (owner, now + ttl_seconds)
+            return True
+
+    def renew_turn_lock(
+        self,
+        context: RuntimeContext | None,
+        *,
+        owner: str,
+        ttl_seconds: float = 300.0,
+    ) -> bool:
+        key = context.conversation_id if context and context.conversation_id else "local"
+        with self._lock:
+            current = self._locks.get(_runtime_scope_key(context), {}).get(key)
+            if current is None:
+                return False
+            current_owner, expires_at = current
+            if expires_at < time.time() or current_owner != owner:
+                return False
+            self._locks[_runtime_scope_key(context)][key] = (owner, time.time() + ttl_seconds)
+            return True
+
+    def release_turn_lock(self, context: RuntimeContext | None, *, owner: str) -> None:
+        key = context.conversation_id if context and context.conversation_id else "local"
+        with self._lock:
+            locks = self._locks.get(_runtime_scope_key(context), {})
+            current = locks.get(key)
+            if current is not None and current[0] == owner:
+                locks.pop(key, None)
 
     def append(self, context: RuntimeContext | None, event: Mapping[str, Any]) -> None:
         with self._lock:

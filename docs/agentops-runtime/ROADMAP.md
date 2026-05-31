@@ -505,9 +505,11 @@ Required semantics:
 
 ### M6. Session/conversation backend abstraction
 
-**Status:** Pending
+**Status:** Started
 
 **Goal:** Make Hermes session persistence worker-safe and optionally remote.
+
+**Autonomous run note (2026-05-31):** Began the native session backend abstraction with `agent/runtime_sessions.py`: `LocalSQLiteSessionBackend` wraps the existing `SessionDB` lifecycle/transcript/search/resume-lineage path, preserves native message encoding/counters/FTS/WAL behavior, exposes scoped append/read/search methods, derives collision-resistant AgentOps session IDs from `RuntimeContext` scope including conversation identity, and adds a context-scoped per-conversation turn lock table with expiry-aware renew/reclaim behavior for local worker coordination. The generic `SessionBackend` protocol now includes the M6 transcript, resume, and lock surface while the in-memory `LocalSessionBackend` remains available for registry/fake tests. Test evidence so far: `python -m pytest tests/agent/test_runtime_session_backend.py tests/agent/test_runtime_backends.py -q` → 24 passed; `python -m ruff check agent/runtime_sessions.py agent/runtime_backends.py tests/agent/test_runtime_session_backend.py` → passed. Remaining before M6 can be marked Done: wire worker/agent session writes through the registry-selected backend, add a fake/remote session backend contract test covering append/read/search/resume lineage, and prove restart-on-different-worker behavior through the runtime supervisor/worker path rather than backend-only tests.
 
 **Acceptance criteria:**
 
