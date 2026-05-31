@@ -26,6 +26,8 @@ Design rules enforced here:
 
 from __future__ import annotations
 
+import copy
+import threading
 from enum import Enum
 from typing import Any, Callable, Mapping, Protocol, runtime_checkable
 
@@ -255,9 +257,11 @@ class DeliveryBackend(Protocol):
 class LocalMemoryBackend:
     def __init__(self) -> None:
         self._store: dict[tuple[Any, ...], dict[str, str]] = {}
+        self._lock = threading.RLock()
 
     def read(self, context: RuntimeContext | None, *, target: str = "memory") -> str | None:
-        return self._store.get(_runtime_scope_key(context), {}).get(target)
+        with self._lock:
+            return self._store.get(_runtime_scope_key(context), {}).get(target)
 
     def write(
         self,
@@ -267,29 +271,36 @@ class LocalMemoryBackend:
         target: str = "memory",
         action: str = "add",
     ) -> None:
-        self._store.setdefault(_runtime_scope_key(context), {})[target] = content
+        with self._lock:
+            self._store.setdefault(_runtime_scope_key(context), {})[target] = content
 
 
 class LocalSkillBackend:
     def __init__(self) -> None:
         self._skills: dict[tuple[Any, ...], dict[str, str]] = {}
+        self._lock = threading.RLock()
 
     def list_skills(self, context: RuntimeContext | None) -> list[str]:
-        return sorted(self._skills.get(_runtime_scope_key(context), {}))
+        with self._lock:
+            return sorted(self._skills.get(_runtime_scope_key(context), {}))
 
     def load_skill(self, context: RuntimeContext | None, name: str) -> str | None:
-        return self._skills.get(_runtime_scope_key(context), {}).get(name)
+        with self._lock:
+            return self._skills.get(_runtime_scope_key(context), {}).get(name)
 
 
 class LocalSessionBackend:
     def __init__(self) -> None:
         self._events: dict[tuple[Any, ...], list[Mapping[str, Any]]] = {}
+        self._lock = threading.RLock()
 
     def append(self, context: RuntimeContext | None, event: Mapping[str, Any]) -> None:
-        self._events.setdefault(_runtime_scope_key(context), []).append(dict(event))
+        with self._lock:
+            self._events.setdefault(_runtime_scope_key(context), []).append(copy.deepcopy(dict(event)))
 
     def read(self, context: RuntimeContext | None, *, limit: int | None = None) -> list[Any]:
-        events = list(self._events.get(_runtime_scope_key(context), []))
+        with self._lock:
+            events = copy.deepcopy(self._events.get(_runtime_scope_key(context), []))
         if limit is None:
             return events
         if limit <= 0:
@@ -297,7 +308,9 @@ class LocalSessionBackend:
         return events[-limit:]
 
     def search(self, context: RuntimeContext | None, query: str) -> list[Any]:
-        return [event for event in self._events.get(_runtime_scope_key(context), []) if query in repr(event)]
+        with self._lock:
+            events = copy.deepcopy(self._events.get(_runtime_scope_key(context), []))
+        return [event for event in events if query in repr(event)]
 
 
 class LocalCronBackend:
@@ -305,53 +318,66 @@ class LocalCronBackend:
         self._jobs: dict[tuple[Any, ...], dict[str, dict[str, Any]]] = {}
         self._history: dict[tuple[Any, ...], dict[str, list[Any]]] = {}
         self._counter = 0
+        self._lock = threading.RLock()
 
     def create(self, context: RuntimeContext | None, job: Mapping[str, Any]) -> str:
-        self._counter += 1
-        job_id = str(self._counter)
-        scope = _runtime_scope_key(context)
-        self._jobs.setdefault(scope, {})[job_id] = {**dict(job), "paused": False}
-        self._history.setdefault(scope, {})[job_id] = []
-        return job_id
+        with self._lock:
+            self._counter += 1
+            job_id = str(self._counter)
+            scope = _runtime_scope_key(context)
+            self._jobs.setdefault(scope, {})[job_id] = {**copy.deepcopy(dict(job)), "paused": False}
+            self._history.setdefault(scope, {})[job_id] = []
+            return job_id
 
     def update(self, context: RuntimeContext | None, job_id: str, job: Mapping[str, Any]) -> None:
-        self._jobs.setdefault(_runtime_scope_key(context), {}).setdefault(job_id, {}).update(dict(job))
+        with self._lock:
+            self._jobs.setdefault(_runtime_scope_key(context), {}).setdefault(job_id, {}).update(copy.deepcopy(dict(job)))
 
     def pause(self, context: RuntimeContext | None, job_id: str) -> None:
-        self._jobs.setdefault(_runtime_scope_key(context), {}).setdefault(job_id, {})["paused"] = True
+        with self._lock:
+            self._jobs.setdefault(_runtime_scope_key(context), {}).setdefault(job_id, {})["paused"] = True
 
     def resume(self, context: RuntimeContext | None, job_id: str) -> None:
-        self._jobs.setdefault(_runtime_scope_key(context), {}).setdefault(job_id, {})["paused"] = False
+        with self._lock:
+            self._jobs.setdefault(_runtime_scope_key(context), {}).setdefault(job_id, {})["paused"] = False
 
     def remove(self, context: RuntimeContext | None, job_id: str) -> None:
-        scope = _runtime_scope_key(context)
-        self._jobs.get(scope, {}).pop(job_id, None)
-        self._history.get(scope, {}).pop(job_id, None)
+        with self._lock:
+            scope = _runtime_scope_key(context)
+            self._jobs.get(scope, {}).pop(job_id, None)
+            self._history.get(scope, {}).pop(job_id, None)
 
     def list_jobs(self, context: RuntimeContext | None) -> list[Any]:
-        return list(self._jobs.get(_runtime_scope_key(context), {}).values())
+        with self._lock:
+            return copy.deepcopy(list(self._jobs.get(_runtime_scope_key(context), {}).values()))
 
     def run_history(self, context: RuntimeContext | None, job_id: str) -> list[Any]:
-        return list(self._history.get(_runtime_scope_key(context), {}).get(job_id, []))
+        with self._lock:
+            return copy.deepcopy(self._history.get(_runtime_scope_key(context), {}).get(job_id, []))
 
 
 class LocalCredentialResolver:
     def __init__(self) -> None:
         self._refs: dict[tuple[Any, ...], dict[str, str]] = {}
+        self._lock = threading.RLock()
 
     def resolve(self, context: RuntimeContext | None, ref: str) -> str | None:
-        return self._refs.get(_runtime_scope_key(context), {}).get(ref)
+        with self._lock:
+            return self._refs.get(_runtime_scope_key(context), {}).get(ref)
 
 
 class LocalSecretStore:
     def __init__(self) -> None:
         self._secrets: dict[tuple[Any, ...], dict[str, str]] = {}
+        self._lock = threading.RLock()
 
     def get_secret(self, context: RuntimeContext | None, ref: str) -> str | None:
-        return self._secrets.get(_runtime_scope_key(context), {}).get(ref)
+        with self._lock:
+            return self._secrets.get(_runtime_scope_key(context), {}).get(ref)
 
     def put_secret(self, context: RuntimeContext | None, ref: str, value: str) -> None:
-        self._secrets.setdefault(_runtime_scope_key(context), {})[ref] = value
+        with self._lock:
+            self._secrets.setdefault(_runtime_scope_key(context), {})[ref] = value
 
 
 class LocalQueueBackend:
@@ -359,6 +385,7 @@ class LocalQueueBackend:
         self._items: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
         self._seen_keys: dict[tuple[Any, ...], set[str]] = {}
         self._counter = 0
+        self._lock = threading.RLock()
 
     def enqueue(
         self,
@@ -367,27 +394,30 @@ class LocalQueueBackend:
         *,
         idempotency_key: str | None = None,
     ) -> str:
-        scope = _runtime_scope_key(context)
-        seen = self._seen_keys.setdefault(scope, set())
-        if idempotency_key is not None and idempotency_key in seen:
-            return idempotency_key
-        if idempotency_key is not None:
-            seen.add(idempotency_key)
-        self._counter += 1
-        receipt = idempotency_key or str(self._counter)
-        self._items.setdefault(scope, []).append({"receipt": receipt, "payload": dict(payload)})
-        return receipt
+        with self._lock:
+            scope = _runtime_scope_key(context)
+            seen = self._seen_keys.setdefault(scope, set())
+            if idempotency_key is not None and idempotency_key in seen:
+                return idempotency_key
+            if idempotency_key is not None:
+                seen.add(idempotency_key)
+            self._counter += 1
+            receipt = idempotency_key or str(self._counter)
+            self._items.setdefault(scope, []).append({"receipt": receipt, "payload": copy.deepcopy(dict(payload))})
+            return receipt
 
     def claim(self, context: RuntimeContext | None, *, capability: str | None = None) -> Any | None:
-        items = self._items.get(_runtime_scope_key(context), [])
-        return items.pop(0) if items else None
+        with self._lock:
+            items = self._items.get(_runtime_scope_key(context), [])
+            return copy.deepcopy(items.pop(0)) if items else None
 
     def ack(self, context: RuntimeContext | None, receipt: Any) -> None:
         return None
 
     def nack(self, context: RuntimeContext | None, receipt: Any, *, requeue: bool = True) -> None:
         if requeue and isinstance(receipt, Mapping):
-            self._items.setdefault(_runtime_scope_key(context), []).append(dict(receipt))
+            with self._lock:
+                self._items.setdefault(_runtime_scope_key(context), []).append(copy.deepcopy(dict(receipt)))
 
     def extend_lease(self, context: RuntimeContext | None, receipt: Any, *, seconds: int) -> None:
         return None
@@ -396,22 +426,26 @@ class LocalQueueBackend:
 class LocalRunLeaseBackend:
     def __init__(self) -> None:
         self._owners: dict[tuple[Any, ...], dict[str, str]] = {}
+        self._lock = threading.RLock()
 
     def claim(self, context: RuntimeContext | None, key: str, *, owner: str) -> bool:
-        owners = self._owners.setdefault(_runtime_scope_key(context), {})
-        current = owners.get(key)
-        if current is not None and current != owner:
-            return False
-        owners[key] = owner
-        return True
+        with self._lock:
+            owners = self._owners.setdefault(_runtime_scope_key(context), {})
+            current = owners.get(key)
+            if current is not None and current != owner:
+                return False
+            owners[key] = owner
+            return True
 
     def renew(self, context: RuntimeContext | None, key: str, *, owner: str) -> bool:
-        return self._owners.get(_runtime_scope_key(context), {}).get(key) == owner
+        with self._lock:
+            return self._owners.get(_runtime_scope_key(context), {}).get(key) == owner
 
     def release(self, context: RuntimeContext | None, key: str, *, owner: str) -> None:
-        owners = self._owners.get(_runtime_scope_key(context), {})
-        if owners.get(key) == owner:
-            owners.pop(key, None)
+        with self._lock:
+            owners = self._owners.get(_runtime_scope_key(context), {})
+            if owners.get(key) == owner:
+                owners.pop(key, None)
 
     def expire_stale(self, context: RuntimeContext | None) -> int:
         return 0
@@ -421,6 +455,7 @@ class LocalConversationRouter:
     def __init__(self) -> None:
         self._active_runs: dict[tuple[Any, ...], dict[str, str]] = {}
         self._counter = 0
+        self._lock = threading.RLock()
 
     def resolve_conversation(self, context: RuntimeContext | None, event: Mapping[str, Any]) -> str:
         if context is not None and context.conversation_id:
@@ -428,34 +463,40 @@ class LocalConversationRouter:
         return str(event.get("conversation_id") or event.get("thread_id") or "local")
 
     def find_active_run(self, context: RuntimeContext | None, conversation_id: str) -> str | None:
-        return self._active_runs.get(_runtime_scope_key(context), {}).get(conversation_id)
+        with self._lock:
+            return self._active_runs.get(_runtime_scope_key(context), {}).get(conversation_id)
 
     def route_turn(self, context: RuntimeContext | None, conversation_id: str, turn: Mapping[str, Any]) -> str:
-        active_runs = self._active_runs.setdefault(_runtime_scope_key(context), {})
-        run_id = active_runs.get(conversation_id)
-        if run_id is None:
-            self._counter += 1
-            run_id = str(self._counter)
-            active_runs[conversation_id] = run_id
-        return run_id
+        with self._lock:
+            active_runs = self._active_runs.setdefault(_runtime_scope_key(context), {})
+            run_id = active_runs.get(conversation_id)
+            if run_id is None:
+                self._counter += 1
+                run_id = str(self._counter)
+                active_runs[conversation_id] = run_id
+            return run_id
 
 
 class LocalWorkerRegistry:
     def __init__(self) -> None:
         self._workers: dict[tuple[Any, ...], dict[str, dict[str, Any]]] = {}
         self._counter = 0
+        self._lock = threading.RLock()
 
     def register(self, context: RuntimeContext | None, worker: Mapping[str, Any]) -> str:
-        self._counter += 1
-        worker_id = str(worker.get("id") or self._counter)
-        self._workers.setdefault(_runtime_scope_key(context), {})[worker_id] = {**dict(worker), "draining": False}
-        return worker_id
+        with self._lock:
+            self._counter += 1
+            worker_id = str(worker.get("id") or self._counter)
+            self._workers.setdefault(_runtime_scope_key(context), {})[worker_id] = {**dict(worker), "draining": False}
+            return worker_id
 
     def heartbeat(self, context: RuntimeContext | None, worker_id: str, *, slots: Mapping[str, Any]) -> None:
-        self._workers.setdefault(_runtime_scope_key(context), {}).setdefault(worker_id, {})["slots"] = dict(slots)
+        with self._lock:
+            self._workers.setdefault(_runtime_scope_key(context), {}).setdefault(worker_id, {})["slots"] = dict(slots)
 
     def mark_draining(self, context: RuntimeContext | None, worker_id: str) -> None:
-        self._workers.setdefault(_runtime_scope_key(context), {}).setdefault(worker_id, {})["draining"] = True
+        with self._lock:
+            self._workers.setdefault(_runtime_scope_key(context), {}).setdefault(worker_id, {})["draining"] = True
 
     def recover_expired(self, context: RuntimeContext | None) -> list[str]:
         return []
@@ -464,33 +505,41 @@ class LocalWorkerRegistry:
 class LocalArtifactBackend:
     def __init__(self) -> None:
         self._artifacts: dict[tuple[Any, ...], dict[str, bytes]] = {}
+        self._lock = threading.RLock()
 
     def put(self, context: RuntimeContext | None, ref: str, data: bytes) -> str:
-        self._artifacts.setdefault(_runtime_scope_key(context), {})[ref] = bytes(data)
-        return ref
+        with self._lock:
+            self._artifacts.setdefault(_runtime_scope_key(context), {})[ref] = bytes(data)
+            return ref
 
     def get(self, context: RuntimeContext | None, ref: str) -> bytes | None:
-        return self._artifacts.get(_runtime_scope_key(context), {}).get(ref)
+        with self._lock:
+            return self._artifacts.get(_runtime_scope_key(context), {}).get(ref)
 
     def list_artifacts(self, context: RuntimeContext | None) -> list[str]:
-        return sorted(self._artifacts.get(_runtime_scope_key(context), {}))
+        with self._lock:
+            return sorted(self._artifacts.get(_runtime_scope_key(context), {}))
 
 
 class LocalAuditBackend:
     def __init__(self) -> None:
         self._events: dict[tuple[Any, ...], list[Mapping[str, Any]]] = {}
+        self._lock = threading.RLock()
 
     def record(self, context: RuntimeContext | None, event: Mapping[str, Any]) -> None:
         sanitized = _redact_audit_value(event)
-        self._events.setdefault(_runtime_scope_key(context), []).append(dict(sanitized))
+        with self._lock:
+            self._events.setdefault(_runtime_scope_key(context), []).append(dict(sanitized))
 
 
 class LocalDeliveryBackend:
     def __init__(self) -> None:
         self._delivered: dict[tuple[Any, ...], list[Mapping[str, Any]]] = {}
+        self._lock = threading.RLock()
 
     def deliver(self, context: RuntimeContext | None, message: Mapping[str, Any]) -> None:
-        self._delivered.setdefault(_runtime_scope_key(context), []).append(dict(message))
+        with self._lock:
+            self._delivered.setdefault(_runtime_scope_key(context), []).append(dict(message))
 
 
 # Factories receive static options only. RuntimeContext remains a method-level
@@ -546,6 +595,7 @@ class RuntimeBackendRegistry:
         self._backends_config: Mapping[str, Any] = backends_config
         self._factories: dict[BackendCapability, dict[str, BackendFactory]] = {}
         self._instances: dict[tuple[BackendCapability, str], Any] = {}
+        self._lock = threading.RLock()
         self._register_local_defaults()
 
     def _register_local_defaults(self) -> None:
@@ -564,8 +614,9 @@ class RuntimeBackendRegistry:
         profile: str = _DEFAULT_PROFILE,
     ) -> None:
         cap = _coerce_capability(capability)
-        self._factories.setdefault(cap, {})[profile] = factory
-        self._instances.pop((cap, profile), None)
+        with self._lock:
+            self._factories.setdefault(cap, {})[profile] = factory
+            self._instances.pop((cap, profile), None)
 
     def resolve_profile(
         self,
@@ -601,17 +652,18 @@ class RuntimeBackendRegistry:
         cap = _coerce_capability(capability)
         profile = self.resolve_profile(cap, context)
         cache_key = (cap, profile)
-        cached = self._instances.get(cache_key)
-        if cached is not None:
-            return cached
-        factories = self._factories.get(cap, {})
-        factory = factories.get(profile)
-        if factory is None:
-            available = sorted(factories)
-            raise BackendSelectionError(
-                f"No backend registered for capability {cap.value!r} under "
-                f"profile {profile!r}. Available profiles: {available}."
-            )
-        instance = factory(self._capability_options(cap))
-        self._instances[cache_key] = instance
-        return instance
+        with self._lock:
+            cached = self._instances.get(cache_key)
+            if cached is not None:
+                return cached
+            factories = self._factories.get(cap, {})
+            factory = factories.get(profile)
+            if factory is None:
+                available = sorted(factories)
+                raise BackendSelectionError(
+                    f"No backend registered for capability {cap.value!r} under "
+                    f"profile {profile!r}. Available profiles: {available}."
+                )
+            instance = factory(self._capability_options(cap))
+            self._instances[cache_key] = instance
+            return instance

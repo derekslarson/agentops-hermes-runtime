@@ -454,9 +454,11 @@ Required semantics:
 
 ### M3. Local multi-run concurrency baseline
 
-**Status:** Pending
+**Status:** Done
 
 **Goal:** Prove that local mode can run multiple scoped Hermes runs concurrently before remote adapters are added.
+
+**Completion note (2026-05-31):** Landed `agent/runtime_supervisor.py` with a local `LocalRunSupervisor` that binds each run inside its own `RuntimeContext`, can run multiple callable Hermes run units through a configurable `ThreadPoolExecutor`, records local worker/audit/session events through the runtime backend registry, isolates ordinary run failures so a crashed run returns a failed `RunResult` without corrupting sibling state, and keeps `run_sync()` inline by default to preserve existing single-user local behavior unless concurrent local execution is explicitly selected. Hardened local runtime backends with re-entrant locks around shared in-process state and deep-copy boundaries for mutable session, cron, and queue payloads so concurrent callers cannot mutate backend internals outside the lock. Added context-scoped run lease and queue idempotency coverage; queue payloads are deep-copied on enqueue/claim/requeue. Audit metadata now redacts common secret-looking exception fragments while returning raw local `RunResult.error` to the caller. Cloud/database/provider-specific adapters remain deferred to later milestones; local SQLite/file WAL integration is covered at this milestone by the local locking/idempotency baseline where those local backends are represented by in-process contract adapters. Test evidence: `python -m pytest tests/agent/test_runtime_supervisor.py tests/agent/test_runtime_backends.py -q` → 21 passed; `python -m pytest tests/agent/test_runtime_context.py tests/agent/test_runtime_context_surfaces.py -q` → 16 passed, 1 known dependency deprecation warning; `python -m ruff check agent/runtime_backends.py agent/runtime_supervisor.py tests/agent/test_runtime_supervisor.py` → passed; `git diff --check` → passed. Independent review gates: spec compliance PASS; final quality/security PASS after mutable-state deep-copy fixes.
 
 **Acceptance criteria:**
 
