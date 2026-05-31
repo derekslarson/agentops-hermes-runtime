@@ -521,11 +521,11 @@ Required semantics:
 
 ### M7. Skills backend abstraction
 
-**Status:** Started
+**Status:** Pending
 
 **Goal:** Keep native Hermes skills while allowing remote scoped skill sources.
 
-**Start note (2026-05-31):** M6 is complete and pushed at `7854bd839`, so the next autonomous-builder target is M7. The implementation must preserve native `skills_list`, `skill_view`, and `skill_manage` semantics rather than adding a sidecar prompt-injection mechanism. Existing auto-loaded skill bindings from platform/channel/topic configuration are load-time selections only; they should resolve through the same scoped skill backend path and must not silently grant mutation rights or bypass policy.
+**Planning note (2026-05-31):** M6 is complete and pushed at `7854bd839`, so M7 is the next roadmap target when implementation resumes. The implementation must preserve native `skills_list`, `skill_view`, and `skill_manage` semantics rather than adding a sidecar prompt-injection mechanism. Existing auto-loaded skill bindings from platform/channel/topic configuration are load-time selections only; they should resolve through the same scoped skill backend path and must not silently grant mutation rights or bypass policy.
 
 **Scope model:**
 
