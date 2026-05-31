@@ -23,10 +23,11 @@ from __future__ import annotations
 
 import re
 import threading
+import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable
+from typing import Any, Callable, Iterable, Mapping
 
 from agent.runtime_backends import BackendCapability, RuntimeBackendRegistry
 from agent.runtime_context import RuntimeContext, use_runtime_context
@@ -126,6 +127,88 @@ def _execute_run(
     return RunResult(status=RunStatus.SUCCEEDED, context=context, value=value)
 
 
+TurnHandler = Callable[[list[Any]], Mapping[str, Any] | Iterable[Mapping[str, Any]] | None]
+
+
+def _normalize_outbound(outbound: Any) -> list[dict[str, Any]]:
+    """Coerce a handler result into a list of message mappings to append."""
+
+    if outbound is None:
+        return []
+    if isinstance(outbound, Mapping):
+        return [_session_message(outbound)]
+    return [_session_message(message) for message in outbound]
+
+
+def _session_message(message: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a SessionBackend-safe message bound to the active context.
+
+    Turn payloads may come from external requests and must not be able to steer
+    writes away from the scoped conversation selected by RuntimeContext.
+    """
+
+    sanitized = dict(message)
+    sanitized.pop("session_id", None)
+    return sanitized
+
+
+def _execute_turn(
+    registry: RuntimeBackendRegistry | None,
+    context: RuntimeContext,
+    worker_id: str,
+    message: Mapping[str, Any],
+    handler: TurnHandler,
+    *,
+    lock_ttl_seconds: float = 300.0,
+) -> RunResult:
+    if registry is None:
+        return RunResult(
+            status=RunStatus.FAILED,
+            context=context,
+            error="process_turn requires a configured backend registry",
+        )
+    if context.mode == "agentops" and context.run_type == "conversation" and not context.conversation_id:
+        return RunResult(
+            status=RunStatus.FAILED,
+            context=context,
+            error="agentops conversation turns require RuntimeContext.conversation_id",
+        )
+    _record_audit(registry, context, worker_id, RunStatus.STARTED)
+    claimed = False
+    sessions: Any = None
+    lock_owner = f"{worker_id}:{uuid.uuid4().hex}"
+    try:
+        sessions = registry.get(BackendCapability.SESSION, context)
+        if not sessions.claim_turn_lock(context, owner=lock_owner, ttl_seconds=lock_ttl_seconds):
+            raise RuntimeError("conversation turn lock is held by another worker")
+        claimed = True
+        # Scope the session to the active conversation, never to a payload id.
+        session_id = context.conversation_id if context.conversation_id else None
+        sessions.create_session(context, session_id=session_id)
+        sessions.append_message(context, _session_message(message))
+        transcript = sessions.read_messages(context)
+        with use_runtime_context(context):
+            outbound = handler(transcript)
+        appended = _normalize_outbound(outbound)
+        if not sessions.renew_turn_lock(context, owner=lock_owner, ttl_seconds=lock_ttl_seconds):
+            raise RuntimeError("conversation turn lock expired or was lost before outbound write")
+        for outbound_message in appended:
+            sessions.append_message(context, outbound_message)
+    except Exception as exc:  # a turn crashing must not corrupt others
+        error = f"{type(exc).__name__}: {exc}"
+        audit_error = f"{type(exc).__name__}: {_sanitize_error_for_audit(str(exc))}"
+        _record_audit(registry, context, worker_id, RunStatus.FAILED, error=audit_error)
+        return RunResult(status=RunStatus.FAILED, context=context, error=error)
+    finally:
+        if claimed:
+            try:
+                sessions.release_turn_lock(context, owner=lock_owner)
+            except Exception:
+                pass
+    _record_audit(registry, context, worker_id, RunStatus.SUCCEEDED)
+    return RunResult(status=RunStatus.SUCCEEDED, context=context, value=appended)
+
+
 class LocalRunSupervisor:
     """Runs scoped Hermes run callables locally, inline or concurrently."""
 
@@ -174,6 +257,33 @@ class LocalRunSupervisor:
         """Run a scoped callable inline on the calling thread (local default)."""
 
         return _execute_run(self._registry, context, self.worker_id, fn)
+
+    def process_turn(
+        self,
+        context: RuntimeContext,
+        message: Mapping[str, Any],
+        handler: TurnHandler,
+        *,
+        lock_ttl_seconds: float = 300.0,
+    ) -> RunResult:
+        """Run one scoped conversation turn against the selected SessionBackend.
+
+        The inbound ``message`` is persisted to the registry-selected
+        :class:`SessionBackend` under a per-conversation turn lock owned by this
+        worker, the scoped transcript is handed to ``handler``, and any returned
+        outbound/tool message(s) are appended to the same backend before the lock
+        is released. With no registry configured this fails cleanly with a
+        ``FAILED`` :class:`RunResult` and mutates no state.
+        """
+
+        return _execute_turn(
+            self._registry,
+            context,
+            self.worker_id,
+            message,
+            handler,
+            lock_ttl_seconds=lock_ttl_seconds,
+        )
 
     def shutdown(self, *, wait: bool = True) -> None:
         with self._lock:

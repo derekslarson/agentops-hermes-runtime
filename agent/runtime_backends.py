@@ -61,6 +61,28 @@ def _runtime_scope_key(context: RuntimeContext | None) -> tuple[Any, ...]:
     )
 
 
+def _session_scope_key(context: RuntimeContext | None) -> tuple[Any, ...]:
+    """Return the local session/conversation scope for transcript state.
+
+    Session backends model durable conversation history, so the key is based on
+    tenant/user/project/conversation identity and intentionally excludes
+    per-execution identifiers such as ``run_id`` and ``job_id``. A restarted or
+    rescheduled worker with a new run id must still see the same transcript.
+    """
+
+    if context is None:
+        return (_DEFAULT_PROFILE,)
+    return (
+        context.mode,
+        context.org_id,
+        context.workspace_id,
+        context.user_id,
+        context.conversation_id,
+        context.agent_profile_id,
+        context.project_id,
+    )
+
+
 def _redact_audit_value(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {
@@ -396,7 +418,7 @@ class LocalSessionBackend:
     ) -> bool:
         key = context.conversation_id if context and context.conversation_id else "local"
         with self._lock:
-            locks = self._locks.setdefault(_runtime_scope_key(context), {})
+            locks = self._locks.setdefault(_session_scope_key(context), {})
             now = time.time()
             current = locks.get(key)
             if current is not None:
@@ -415,30 +437,30 @@ class LocalSessionBackend:
     ) -> bool:
         key = context.conversation_id if context and context.conversation_id else "local"
         with self._lock:
-            current = self._locks.get(_runtime_scope_key(context), {}).get(key)
+            current = self._locks.get(_session_scope_key(context), {}).get(key)
             if current is None:
                 return False
             current_owner, expires_at = current
             if expires_at < time.time() or current_owner != owner:
                 return False
-            self._locks[_runtime_scope_key(context)][key] = (owner, time.time() + ttl_seconds)
+            self._locks[_session_scope_key(context)][key] = (owner, time.time() + ttl_seconds)
             return True
 
     def release_turn_lock(self, context: RuntimeContext | None, *, owner: str) -> None:
         key = context.conversation_id if context and context.conversation_id else "local"
         with self._lock:
-            locks = self._locks.get(_runtime_scope_key(context), {})
+            locks = self._locks.get(_session_scope_key(context), {})
             current = locks.get(key)
             if current is not None and current[0] == owner:
                 locks.pop(key, None)
 
     def append(self, context: RuntimeContext | None, event: Mapping[str, Any]) -> None:
         with self._lock:
-            self._events.setdefault(_runtime_scope_key(context), []).append(copy.deepcopy(dict(event)))
+            self._events.setdefault(_session_scope_key(context), []).append(copy.deepcopy(dict(event)))
 
     def read(self, context: RuntimeContext | None, *, limit: int | None = None) -> list[Any]:
         with self._lock:
-            events = copy.deepcopy(self._events.get(_runtime_scope_key(context), []))
+            events = copy.deepcopy(self._events.get(_session_scope_key(context), []))
         if limit is None:
             return events
         if limit <= 0:
@@ -447,7 +469,7 @@ class LocalSessionBackend:
 
     def search(self, context: RuntimeContext | None, query: str) -> list[Any]:
         with self._lock:
-            events = copy.deepcopy(self._events.get(_runtime_scope_key(context), []))
+            events = copy.deepcopy(self._events.get(_session_scope_key(context), []))
         return [event for event in events if query in repr(event)]
 
 
