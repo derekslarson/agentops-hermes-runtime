@@ -1612,6 +1612,25 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     tools. Used by the concurrent execution path; the sequential path retains
     its own inline invocation for backward-compatible display handling.
     """
+    _runtime_ctx = getattr(agent, "runtime_context", None)
+    if _runtime_ctx is not None:
+        try:
+            from agent.runtime_context import get_current_runtime_context, use_runtime_context
+        except Exception:
+            get_current_runtime_context = None  # type: ignore[assignment]
+            use_runtime_context = None  # type: ignore[assignment]
+        if use_runtime_context is not None and get_current_runtime_context is not None and get_current_runtime_context() != _runtime_ctx:
+            with use_runtime_context(_runtime_ctx):
+                return invoke_tool(
+                    agent,
+                    function_name,
+                    function_args,
+                    effective_task_id,
+                    tool_call_id,
+                    messages,
+                    pre_tool_block_checked,
+                )
+
     # Check plugin hooks for a block directive before executing anything.
     block_message: Optional[str] = None
     if not pre_tool_block_checked:
@@ -1694,6 +1713,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             skip_pre_tool_call_hook=True,
             enabled_toolsets=getattr(agent, "enabled_toolsets", None),
             disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+            runtime_context=getattr(agent, "runtime_context", None),
         )
 
 

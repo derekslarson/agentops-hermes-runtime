@@ -380,6 +380,21 @@ def run_conversation(
     # Installed once, transparent when streams are healthy, prevents crash on write.
     _install_safe_stdio()
 
+    runtime_ctx = getattr(agent, "runtime_context", None)
+    if runtime_ctx is not None:
+        from agent.runtime_context import get_current_runtime_context, use_runtime_context
+        if get_current_runtime_context() != runtime_ctx:
+            with use_runtime_context(runtime_ctx):
+                return run_conversation(
+                    agent,
+                    user_message,
+                    system_message,
+                    conversation_history,
+                    task_id,
+                    stream_callback,
+                    persist_user_message,
+                )
+
     agent._ensure_db_session()
 
     # Tell auxiliary_client what the live main provider/model are for

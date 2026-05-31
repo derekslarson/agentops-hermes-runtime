@@ -810,6 +810,7 @@ def handle_function_call(
     skip_pre_tool_call_hook: bool = False,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    runtime_context=None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -835,6 +836,24 @@ def handle_function_call(
     Returns:
         Function result as a JSON string.
     """
+    if runtime_context is not None:
+        from agent.runtime_context import use_runtime_context
+
+        with use_runtime_context(runtime_context):
+            return handle_function_call(
+                function_name=function_name,
+                function_args=function_args,
+                task_id=task_id,
+                tool_call_id=tool_call_id,
+                session_id=session_id,
+                user_task=user_task,
+                enabled_tools=enabled_tools,
+                skip_pre_tool_call_hook=skip_pre_tool_call_hook,
+                enabled_toolsets=enabled_toolsets,
+                disabled_toolsets=disabled_toolsets,
+                runtime_context=None,
+            )
+
     # Coerce string arguments to their schema-declared types (e.g. "42"→42)
     function_args = coerce_tool_args(function_name, function_args)
 
@@ -909,6 +928,7 @@ def handle_function_call(
                 skip_pre_tool_call_hook=skip_pre_tool_call_hook,
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                runtime_context=runtime_context,
             )
 
     try:

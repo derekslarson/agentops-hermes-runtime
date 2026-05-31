@@ -306,9 +306,11 @@ Required semantics:
 
 ### M1. RuntimeContext foundation
 
-**Status:** Pending
+**Status:** Started
 
 **Goal:** Introduce a first-class context object that can be passed through Hermes without changing local behavior.
+
+**Autonomous run note (2026-05-31):** Landed the first RuntimeContext primitive and propagation seam: local/env/config/work-item resolution, per-agent context assignment, ContextVar binding for conversation and tool execution paths, immutable metadata snapshots, fail-closed malformed context handling, and focused regression coverage. Future M1/M2 follow-up should connect this seam to concrete backend registries and cron/delivery adapter contracts rather than sidecar context injection.
 
 **Acceptance criteria:**
 

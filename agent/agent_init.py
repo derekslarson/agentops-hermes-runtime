@@ -200,6 +200,8 @@ def init_agent(
     checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
+    runtime_context=None,
+    runtime_work_item: Optional[Dict[str, Any]] = None,
 ):
     """
     Initialize the AI Agent.
@@ -270,6 +272,45 @@ def init_agent(
     agent._chat_type = chat_type
     agent._thread_id = thread_id
     agent._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
+    _runtime_cfg = None
+    try:
+        from agent.runtime_context import resolve_runtime_context
+        from hermes_cli.config import load_config as _load_runtime_cfg
+
+        _runtime_cfg = _load_runtime_cfg()
+        _profile_id = os.environ.get("HERMES_PROFILE", "default")
+        agent.runtime_context = resolve_runtime_context(
+            explicit=runtime_context,
+            work_item=runtime_work_item,
+            config=_runtime_cfg,
+            profile_id=_profile_id,
+            session_id=session_id,
+            platform=platform,
+            user_id=user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            parent_session_id=parent_session_id,
+            backend_profile=cfg_get(_runtime_cfg, "agentops", "backend_profile", default=None),
+        )
+    except Exception as _runtime_context_err:
+        _has_runtime_cfg = isinstance(_runtime_cfg, dict) and (
+            "runtime_context" in _runtime_cfg
+            or isinstance(_runtime_cfg.get("agentops"), dict)
+            and "runtime_context" in _runtime_cfg["agentops"]
+        )
+        if runtime_context is not None or runtime_work_item is not None or os.environ.get("HERMES_RUNTIME_CONTEXT") or _has_runtime_cfg:
+            raise
+        logger.warning("Failed to resolve RuntimeContext, falling back to local context: %s", _runtime_context_err)
+        from agent.runtime_context import build_local_runtime_context
+        agent.runtime_context = build_local_runtime_context(
+            profile_id=os.environ.get("HERMES_PROFILE", "default"),
+            session_id=session_id,
+            platform=platform,
+            user_id=user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            parent_session_id=parent_session_id,
+        )
     # Pluggable print function — CLI replaces this with _cprint so that
     # raw ANSI status lines are routed through prompt_toolkit's renderer
     # instead of going directly to stdout where patch_stdout's StdoutProxy
@@ -972,6 +1013,19 @@ def init_agent(
         timestamp_str = agent.session_start.strftime("%Y%m%d_%H%M%S")
         short_uuid = uuid.uuid4().hex[:6]
         agent.session_id = f"{timestamp_str}_{short_uuid}"
+
+    if getattr(getattr(agent, "runtime_context", None), "mode", None) == "local" and not getattr(agent.runtime_context, "conversation_id", None):
+        from agent.runtime_context import build_local_runtime_context
+        agent.runtime_context = build_local_runtime_context(
+            profile_id=os.environ.get("HERMES_PROFILE", "default"),
+            session_id=agent.session_id,
+            platform=platform,
+            user_id=user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            parent_session_id=parent_session_id,
+            backend_profile=getattr(agent.runtime_context, "backend_profile", None),
+        )
 
     # Expose session ID to tools (terminal, execute_code) so agents can
     # reference their own session for --resume commands, cross-session

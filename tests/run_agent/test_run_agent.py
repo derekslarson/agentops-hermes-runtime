@@ -2430,6 +2430,7 @@ class TestConcurrentToolExecution:
                 skip_pre_tool_call_hook=True,
                 enabled_toolsets=agent.enabled_toolsets,
                 disabled_toolsets=agent.disabled_toolsets,
+                runtime_context=agent.runtime_context,
             )
             assert result == "result"
 
