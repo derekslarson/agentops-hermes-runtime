@@ -157,6 +157,9 @@ SEND_MESSAGE_SCHEMA = {
 
 def send_message_tool(args, **kw):
     """Handle cross-channel send_message tool calls."""
+    from agent.runtime_context import get_runtime_context_for_surface
+    get_runtime_context_for_surface("delivery")
+
     action = args.get("action", "send")
 
     if action == "list":

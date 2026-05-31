@@ -382,7 +382,7 @@ def run_conversation(
 
     runtime_ctx = getattr(agent, "runtime_context", None)
     if runtime_ctx is not None:
-        from agent.runtime_context import get_current_runtime_context, use_runtime_context
+        from agent.runtime_context import get_current_runtime_context, get_runtime_context_for_surface, use_runtime_context
         if get_current_runtime_context() != runtime_ctx:
             with use_runtime_context(runtime_ctx):
                 return run_conversation(
@@ -394,6 +394,7 @@ def run_conversation(
                     stream_callback,
                     persist_user_message,
                 )
+        get_runtime_context_for_surface("logging_audit")
 
     agent._ensure_db_session()
 

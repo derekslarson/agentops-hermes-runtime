@@ -643,6 +643,9 @@ def skills_list(category: str = None, task_id: str = None) -> str:
     Returns:
         JSON string with minimal skill info: name, description, category
     """
+    from agent.runtime_context import get_runtime_context_for_surface
+    get_runtime_context_for_surface("skills")
+
     try:
         if not SKILLS_DIR.exists():
             SKILLS_DIR.mkdir(parents=True, exist_ok=True)
@@ -825,6 +828,9 @@ def skill_view(
     Returns:
         JSON string with skill content or error message
     """
+    from agent.runtime_context import get_runtime_context_for_surface
+    get_runtime_context_for_surface("skills")
+
     try:
         local_category_name: str | None = None
         # ── Qualified name dispatch (plugin skills) ──────────────────

@@ -830,6 +830,9 @@ def skill_manage(
 
     Returns JSON string with results.
     """
+    from agent.runtime_context import get_runtime_context_for_surface
+    get_runtime_context_for_surface("skills")
+
     if action == "create":
         if not content:
             return tool_error("content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).", success=False)

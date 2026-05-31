@@ -397,6 +397,9 @@ def session_search(
     Scroll wins over discovery when both are set — the agent has explicitly
     asked for a slice of a known session.
     """
+    from agent.runtime_context import get_runtime_context_for_surface
+    get_runtime_context_for_surface("session_state")
+
     if db is None:
         try:
             from hermes_state import SessionDB

@@ -441,6 +441,8 @@ def cronjob(
 ) -> str:
     """Unified cron job management tool."""
     del task_id  # unused but kept for handler signature compatibility
+    from agent.runtime_context import get_runtime_context_for_surface
+    get_runtime_context_for_surface("cron")
 
     try:
         normalized = (action or "").strip().lower()

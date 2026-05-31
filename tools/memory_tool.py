@@ -611,6 +611,9 @@ def memory_tool(
 
     Returns JSON string with results.
     """
+    from agent.runtime_context import get_runtime_context_for_surface
+    get_runtime_context_for_surface("memory")
+
     if store is None:
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
 

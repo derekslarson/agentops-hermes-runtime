@@ -2153,6 +2153,9 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
 
 
 def load_pool(provider: str) -> CredentialPool:
+    from agent.runtime_context import get_runtime_context_for_surface
+    get_runtime_context_for_surface("credential_resolution")
+
     provider = (provider or "").strip().lower()
     raw_entries = read_credential_pool(provider)
     raw_needs_sanitization = any(

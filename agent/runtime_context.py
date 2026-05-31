@@ -271,6 +271,20 @@ def current_runtime_context() -> RuntimeContext | None:
     return get_current_runtime_context()
 
 
+def get_runtime_context_for_surface(surface_name: str) -> RuntimeContext | None:
+    """Return the currently bound RuntimeContext at a native runtime surface.
+
+    M1 intentionally does not move memory, skills, sessions, cron, credentials,
+    audit, or delivery behind new backend abstractions. This helper is the
+    explicit seam those surfaces call so tests can prove the context is visible
+    without changing local behavior. Later backend-registry work can replace
+    these no-op observations with scoped backend selection.
+    """
+
+    del surface_name  # reserved for future diagnostics/backend routing
+    return get_current_runtime_context()
+
+
 @contextmanager
 def use_runtime_context(context: RuntimeContext | Mapping[str, Any] | None) -> Iterator[RuntimeContext | None]:
     ctx = RuntimeContext.from_mapping(context) if isinstance(context, Mapping) else context
