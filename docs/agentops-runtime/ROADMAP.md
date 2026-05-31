@@ -438,9 +438,11 @@ Required semantics:
 
 ### M2. Backend registry/contracts
 
-**Status:** Pending
+**Status:** Done
 
 **Goal:** Add generic backend contracts and a runtime backend registry without implementing cloud-specific behavior yet.
+
+**Completion note (2026-05-31):** Landed `agent/runtime_backends.py`: structural `Protocol` contracts for all thirteen capabilities (`MemoryBackend`, `SkillBackend`, `SessionBackend`, `CronBackend`, `CredentialResolver`, `SecretStore`, `QueueBackend`, `RunLeaseBackend`, `ConversationRouter`, `WorkerRegistry`, `ArtifactBackend`, `AuditBackend`, `DeliveryBackend`), lightweight `Local*` implementations that preserve the current local-mode path while partitioning their in-process state by `RuntimeContext`, and a `RuntimeBackendRegistry` that selects a backend per capability by a deployment profile derived from config + `RuntimeContext` (precedence: per-capability config override > `RuntimeContext.backend_profile` > config default profile > `"local"`). Selection fails closed via `BackendSelectionError` when a requested profile is unregistered, fakes can be injected per profile through `register(...)`, factory replacement invalidates cached instances, and each registry owns its own factory table and instance cache so isolated registries never share mutable state. Factory construction receives static options only; tenant/run scope stays on backend method calls. Cloud/database/secret-store behavior is intentionally deferred to later milestones. Test evidence: `python -m pytest tests/agent/test_runtime_backends.py -q` → 16 passed; `python -m pytest tests/agent/test_runtime_context.py tests/agent/test_runtime_context_surfaces.py -q` → 16 passed; the suite includes source and sentinel tests asserting no AWS/GCP/database/secret-store provider names leak into the core module and local audit redacts sensitive event keys.
 
 **Acceptance criteria:**
 
