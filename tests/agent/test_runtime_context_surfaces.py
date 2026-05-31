@@ -76,7 +76,9 @@ def test_native_memory_agent_init_wires_agentops_backend_and_context():
     assert "BackendCapability.MEMORY" in memory_section
     assert "LocalFileMemoryBackend" in memory_section
     assert 'getattr(runtime_context, "mode", None) == "agentops"' in memory_section
-    assert "resolve_profile(BackendCapability.MEMORY, runtime_context) == \"local\"" in memory_section
+    assert "memory_profile = backend_registry.resolve_profile(BackendCapability.MEMORY, runtime_context)" in memory_section
+    assert 'memory_profile in {"local", "local-multi"}' in memory_section
+    assert "register_http_memory_backend(backend_registry, profile=memory_profile)" in memory_section
     assert "LocalFileMemoryBackend(scope_by_context=True)" in memory_section
     assert "backend=memory_backend" in memory_section
     assert "context=memory_context" in memory_section

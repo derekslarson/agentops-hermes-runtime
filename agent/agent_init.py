@@ -1137,9 +1137,13 @@ def init_agent(
                     from agent.runtime_backends import BackendCapability, RuntimeBackendRegistry
 
                     backend_registry = RuntimeBackendRegistry(_agent_cfg)
-                    if backend_registry.resolve_profile(BackendCapability.MEMORY, runtime_context) == "local":
+                    memory_profile = backend_registry.resolve_profile(BackendCapability.MEMORY, runtime_context)
+                    if memory_profile in {"local", "local-multi"}:
                         memory_backend = LocalFileMemoryBackend(scope_by_context=True)
                     else:
+                        from agent.runtime_memory_http import register_http_memory_backend
+
+                        register_http_memory_backend(backend_registry, profile=memory_profile)
                         memory_backend = backend_registry.get(
                             BackendCapability.MEMORY,
                             runtime_context,

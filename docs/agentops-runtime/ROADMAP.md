@@ -487,7 +487,9 @@ Required semantics:
 
 ### M5. Remote memory adapter MVP
 
-**Status:** Pending
+**Status:** Done
+
+**Completion note (2026-05-31):** Landed the first real remote memory adapter without changing the native Hermes `memory` tool interface. `agent/runtime_memory_http.py` adds a stdlib-only `HttpMemoryBackend` plus `register_http_memory_backend(...)` for non-local runtime memory profiles such as `compose-self-hosted`; AgentOps memory init now maps `local`/`local-multi` to scoped `LocalFileMemoryBackend` and registers the HTTP adapter for remote profiles. The adapter reads/writes complete native memory snapshots through a provider-neutral `/memory` HTTP contract, sends a minimal RuntimeContext-derived memory scope (org/workspace/project/channel/thread/conversation/user) instead of raw metadata/secret refs/run IDs, keeps bearer tokens in the Authorization header only, validates base URL/timeout configuration fail-closed, and sanitizes error messages. Tests use a fake in-memory HTTP control-plane server and prove native `MemoryStore` round trips through the remote adapter, cross-user/thread isolation, registry-based compose profile selection, local-multi fallback availability, secret-safe payload/error behavior, and minimal scope serialization. Linearizable multi-writer remote memory updates remain the control plane's responsibility for later durable backend/worker milestones; this client preserves the existing MemoryBackend full-snapshot contract. Test evidence: `./scripts/run_tests.sh tests/agent/test_remote_memory_backend.py tests/agent/test_runtime_context_surfaces.py tests/tools/test_memory_tool.py tests/agent/test_runtime_backends.py` → 131 passed; `python -m ruff check agent/runtime_memory_http.py agent/agent_init.py tests/agent/test_remote_memory_backend.py tests/agent/test_runtime_context_surfaces.py` → passed.
 
 **Goal:** Implement the first real remote memory adapter against a cloud/db-agnostic contract.
 
