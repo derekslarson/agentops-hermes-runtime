@@ -23,7 +23,9 @@ This is not a wrapper that injects memory around Hermes. The native Hermes surfa
 9. **Remote cron is mandatory.** Cron/autonomous jobs are part of Hermes’s identity; they need remote storage, leases, delivery targeting, worker execution, and local fallback.
 10. **Tenant isolation beats convenience.** Cross-user/org/project/thread memory, skill, credential, cron, or session leakage is an MVP blocker.
 11. **Warm workers are an optimization, remote state is authoritative.** Conversation runs may stay warm until idle timeout, but all durable state must survive worker death.
-12. **Small fork deltas.** Prefer modular seams that could be upstreamed or maintained as a small patch stack.
+12. **Infrastructure provisioning is separate from application activation.** Terraform/OpenTofu should create inert cloud resources and output URLs/refs; a bootstrap UI/CLI should store integration secrets, configure policies, run migrations, and prove the system works.
+13. **Secrets stay out of Terraform state.** Terraform may create secret containers/placeholders and IAM access, but Slack/GitHub/Linear/Jira/model-provider secret values should be written by bootstrap directly into the configured secret backend.
+14. **Small fork deltas.** Prefer modular seams that could be upstreamed or maintained as a small patch stack.
 
 ## Required deployment profiles
 
@@ -96,6 +98,8 @@ Acceptance invariants:
 - ECS task count can scale up/down during the day based on expected load or queue metrics.
 - Each ECS task can host zero to N concurrent Hermes runs, e.g. 0–8 active slots.
 - Draining tasks stop accepting new runs and gracefully finish/checkpoint active runs before shutdown.
+- Terraform/OpenTofu can provision the managed AWS stack from account/region/domain/capacity settings and output bootstrap/webhook URLs.
+- App/integration secret values are added after infrastructure provisioning through bootstrap, not stored directly in Terraform state.
 - AWS-specific code lives in adapter packages, not core runtime contracts.
 
 ### Profile D: gcp-managed
@@ -116,6 +120,8 @@ Cloud Logging/Monitoring
 Acceptance invariants:
 
 - Same runtime contracts and worker lifecycle as AWS.
+- Terraform/OpenTofu can provision the managed GCP stack from project/region/domain/capacity settings and output bootstrap/webhook URLs.
+- App/integration secret values are added after infrastructure provisioning through bootstrap, not stored directly in Terraform state.
 - GCP-specific code lives in adapter packages.
 
 ### Profile E: hybrid
@@ -125,6 +131,112 @@ Mixed deployments are allowed: for example, local/compose workers with remote RD
 Acceptance invariant:
 
 - Backend choices are configured independently per capability: memory, sessions, skills, cron, queue, credentials, artifacts, audit, delivery.
+
+## Provisioning and bootstrap flow
+
+The intended customer deployment experience is two-phase:
+
+```text
+terraform/tofu apply
+→ cloud infrastructure exists, workers/API/scheduler can start, URLs/refs are output
+
+agentops bootstrap or /bootstrap UI
+→ admin/org/project/integrations/secrets/policies are configured
+→ migrations and smoke tests run
+→ first real Hermes-backed conversation/job works
+```
+
+### Terraform/OpenTofu phase
+
+Terraform/OpenTofu owns infrastructure shape, not app secrets.
+
+Customer-provided inputs should be infrastructure/account settings such as:
+
+- project/application name
+- environment name
+- cloud account/project and region
+- domain name or generated cloud URL preference
+- VPC/network choices, including bring-your-own VPC/subnet options
+- worker min/max task counts
+- worker CPU/memory
+- worker `max_concurrent_runs`
+- DB size/class/storage settings
+- artifact retention settings
+- enabled integration surfaces, e.g. Slack/GitHub/Linear/Jira webhooks
+
+Terraform/OpenTofu should output copy-paste-friendly activation values:
+
+- AgentOps API URL
+- one-time or time-bounded bootstrap URL/token reference
+- Slack events URL
+- GitHub webhook URL
+- Linear webhook URL
+- Jira webhook URL
+- artifact bucket/store ref
+- queue refs
+- secret backend refs/placeholders
+- worker/scheduler service names
+- smoke-test command hints
+
+### Bootstrap UI/CLI phase
+
+Bootstrap owns application activation:
+
+- create initial org/workspace/admin user
+- run DB migrations
+- select default backend profile
+- configure RuntimeContext policy defaults
+- configure model provider credential refs
+- store model/Slack/GitHub/Linear/Jira/etc. secret values directly into the selected secret backend
+- configure integration webhook secrets/signing validation
+- configure default worker/run policies: idle timeout, max run duration, approval policy, allowed tools, default memory scope, cron enablement
+- create first project/workspace bindings
+- run smoke tests
+
+Bootstrap may be a CLI, a temporary local UI, or a served `/bootstrap` page. The desired customer experience is: paste integration credentials, click OK/run bootstrap, see verified green checks, then send the first Slack/GitHub/Linear/Jira event.
+
+### Integration readiness checklist
+
+Each integration should have visible status checks, for example:
+
+- Slack: bot token stored, signing secret stored, events URL verified, bot installed, test message delivered.
+- GitHub: app/PAT credential stored, webhook secret stored, installation/repo selected, test webhook received.
+- Linear: API/OAuth credential stored, workspace/team selected, test issue read or webhook received.
+- Jira: base URL/account selected, credential stored, webhook URL/secret configured, test issue event received.
+- Model provider: credential stored, provider health check passed, default model selected.
+
+### Deployment packaging targets
+
+The repo should eventually expose:
+
+```text
+deploy/
+  compose/
+    docker-compose.yml
+    .env.example
+
+  helm/
+    Chart.yaml
+    values.yaml
+    templates/
+
+  terraform/
+    aws-managed/
+      main.tf
+      variables.tf
+      outputs.tf
+      terraform.tfvars.example
+      README.md
+
+    gcp-managed/
+      main.tf
+      variables.tf
+      outputs.tf
+      terraform.tfvars.example
+      README.md
+```
+
+Kubernetes/Helm is the preferred cloud-agnostic path for customers who want container-managed Postgres/queue/object-store in cloud. Managed Terraform stacks are the preferred "easy AWS/GCP" path.
 
 ## Core runtime concepts
 
@@ -543,6 +655,37 @@ Required semantics:
 - Same worker lifecycle runs locally, in Compose, and in AWS adapter mode.
 - ECS desired task count can scale independently from per-task run concurrency.
 
+### M15. Managed cloud Terraform/OpenTofu packaging
+
+**Status:** Pending
+
+**Goal:** Provide the easiest AWS/GCP path: customers edit account/region/domain/capacity settings, run Terraform/OpenTofu, and receive working infrastructure plus bootstrap/webhook outputs.
+
+**Acceptance criteria:**
+
+- `deploy/terraform/aws-managed/` provisions the AWS managed profile: API/control-plane, worker service, scheduler, RDS/Postgres or selected DB adapter, queue, artifact store, secret placeholders/refs, logs, IAM, and autoscaling.
+- `deploy/terraform/gcp-managed/` is scaffolded or implemented with equivalent GCP resources and clear parity gaps.
+- `terraform.tfvars.example` avoids raw app/integration secret values where possible; secret containers/refs are created instead.
+- Outputs include AgentOps API URL, bootstrap URL/token ref, Slack/GitHub/Linear/Jira webhook URLs, secret refs, queue refs, artifact refs, worker service names, and smoke-test hints.
+- Bring-your-own-network and bring-your-own-managed-resource paths are represented through variables such as existing VPC/subnet/database/bucket/secret refs.
+- Terraform/OpenTofu state does not contain Slack/GitHub/Linear/Jira/model-provider raw secret values in the recommended path.
+
+### M16. Bootstrap UI/CLI and activation smoke test
+
+**Status:** Pending
+
+**Goal:** Turn provisioned infrastructure into an activated AgentOps Hermes Runtime install through a customer-friendly UI/CLI.
+
+**Acceptance criteria:**
+
+- Bootstrap can create the initial org/workspace/admin/project and default backend profile.
+- Bootstrap runs migrations and validates DB/queue/worker/scheduler/artifact/secret backend health.
+- Bootstrap stores model provider, Slack, GitHub, Linear, Jira, and future integration secrets directly into the configured secret backend.
+- Bootstrap configures RuntimeContext defaults, worker/run policy, memory scope policy, approval policy, allowed tools, cron enablement, and delivery defaults.
+- Bootstrap shows per-integration readiness checks and verifies webhook/signing secrets where possible.
+- Smoke test verifies API health, worker registration/heartbeat, queue claim, scoped memory read/write, session append/read, cron create/claim, secret resolution, artifact write/read, and at least one integration event-to-response loop.
+- Customer can complete the intended path: run Terraform/OpenTofu, open bootstrap UI or run bootstrap CLI, paste integration credentials, click/run OK, see green checks, then send a first Slack/GitHub/Linear/Jira event.
+
 ## Initial implementation order
 
 1. M0 docs/repo hygiene.
@@ -558,6 +701,8 @@ Required semantics:
 11. M12 Compose self-hosted distributed MVP.
 12. M13 Slack smoke.
 13. M14 AWS adapter spike.
+14. M15 managed cloud Terraform/OpenTofu packaging.
+15. M16 bootstrap UI/CLI and activation smoke test.
 
 ## Reference MVP proof
 
@@ -605,7 +750,7 @@ This proof must work first in local-multi and compose-self-hosted profiles befor
 
 ## Explicit non-goals for MVP
 
-- Polished dashboard.
+- Polished dashboard beyond the minimal bootstrap/activation UI required to make deployments usable.
 - Complex approval UI.
 - Full enterprise RBAC.
 - Deep billing/metering.
@@ -623,3 +768,6 @@ This proof must work first in local-multi and compose-self-hosted profiles befor
 - What is the smallest safe credential grant model that still supports useful tools?
 - Should the first durable distributed backend be Postgres everywhere, or should AWS-native DynamoDB be developed early as a separate adapter?
 - Should warm conversation runs be subprocesses for isolation from the start, or can some local profiles safely run multiple agents in-process?
+- Should the recommended AWS path use Terraform, OpenTofu, or a wrapper CLI that can drive both?
+- Should bootstrap be primarily a CLI, a hosted web UI, or both from the beginning?
+- Which integrations are mandatory for the first activation smoke test: Slack only, or Slack plus GitHub/Linear/Jira scaffolds?
