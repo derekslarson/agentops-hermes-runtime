@@ -405,9 +405,11 @@ Required semantics:
 
 ### M0. Fork baseline and contribution hygiene
 
-**Status:** Started
+**Status:** Done
 
 **Goal:** Establish this repo as the clean AgentOps Hermes runtime fork.
+
+**Completion note (2026-05-31):** M0 is complete: `origin` points to Derek's fork, `upstream` is fetch-only for `NousResearch/hermes-agent`, AgentOps runtime architecture/roadmap docs live under `docs/agentops-runtime/`, and `README.md` documents the local dev baseline, focused test command, pre-commit hygiene, and upstream sync strategy.
 
 **Acceptance criteria:**
 

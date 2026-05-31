@@ -27,3 +27,45 @@ The goal is not to inject a parallel context system around Hermes. The native He
 ## Repository relationship
 
 This repository is a fork of `NousResearch/hermes-agent` created for AgentOps runtime work. Changes should be kept in small, reviewable slices and structured so generally useful backend seams can be upstreamed later if desired.
+
+Expected remotes:
+
+- `origin`: `git@github.com:derekslarson/agentops-hermes-runtime.git` for Derek's AgentOps runtime fork.
+- `upstream`: `git@github.com:NousResearch/hermes-agent.git` for fetch-only synchronization with Hermes Agent.
+
+## Local dev baseline
+
+Start from a clean checkout on `main`:
+
+```bash
+git status --short
+git remote -v
+```
+
+Focused Python verification used by the runtime-context foundation slices:
+
+```bash
+python -m pytest tests/agent/test_runtime_context.py tests/agent/test_runtime_context_surfaces.py tests/run_agent/test_run_agent.py::TestConcurrentToolExecution -q
+```
+
+Before committing runtime changes, run:
+
+```bash
+git diff --check
+git status --short
+```
+
+## Upstream sync strategy
+
+Keep AgentOps runtime changes small and reviewable on top of upstream Hermes:
+
+1. Fetch upstream without pushing to it:
+   ```bash
+   git fetch upstream
+   ```
+2. Inspect upstream changes before integrating:
+   ```bash
+   git log --oneline --left-right main...upstream/main
+   ```
+3. Rebase or merge deliberately in a separate sync slice, then rerun focused runtime tests plus any upstream-affected tests.
+4. Push only to `origin`; `upstream` remains fetch-only.
