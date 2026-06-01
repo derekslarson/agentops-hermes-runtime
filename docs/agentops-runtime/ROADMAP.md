@@ -612,7 +612,9 @@ Required semantics:
 
 ### M10. Artifact and audit backends
 
-**Status:** Pending
+**Status:** Started
+
+**Autonomous run note (2026-06-01):** Began the artifact/audit backend slice with `agent/runtime_artifacts_audit.py`. Added local durable file-backed artifact and audit backends scoped by `RuntimeContext`, provider-neutral HTTP artifact/audit adapters for remote control-plane profiles, registry registration helpers, path-escape rejection for artifact refs, RuntimeContext scope serialization, and recursive audit sanitization for secret-like keys and local path fields. Focused tests cover local artifact durability/isolation, unsafe ref rejection, sanitized local audit JSONL persistence, and remote HTTP registry selection without leaking bearer tokens into payloads. Remaining before M10 can be marked `Done`: wire these backends into the native Hermes runtime paths so audit events are emitted for every required surface (memory writes, skill loads/mutations, credential resolutions, cron runs, session events, worker lifecycle, queue/lease events, delivery events, and tool calls) and add regression tests for those end-to-end event emissions.
 
 **Goal:** Centralize durable artifacts and audit trails for distributed runs.
 
