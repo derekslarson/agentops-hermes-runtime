@@ -1,0 +1,99 @@
+"""Minimal compose-self-hosted service processes for AgentOps Runtime.
+
+These processes intentionally expose only health and configuration surfaces.
+The real distributed behavior continues to live behind Hermes runtime backend
+contracts; M12 composes those processes with database/queue/artifact/secret
+services so follow-up slices can wire durable adapters without changing the
+compose topology.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import signal
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+
+_SERVICE_PORTS = {
+    "api": 8710,
+    "worker": 8711,
+    "scheduler": 8712,
+    "local-secrets": 8713,
+}
+
+_REQUIRED_ENV = (
+    "HERMES_RUNTIME_MODE",
+    "HERMES_BACKEND_PROFILE",
+    "AGENTOPS_DATABASE_URL",
+    "AGENTOPS_QUEUE_URL",
+    "AGENTOPS_ARTIFACT_ENDPOINT",
+    "AGENTOPS_SECRET_STORE_URL",
+)
+
+
+def _health_payload(service: str) -> dict[str, Any]:
+    missing = [name for name in _REQUIRED_ENV if not os.getenv(name)]
+    payload: dict[str, Any] = {
+        "ok": not missing,
+        "service": service,
+        "runtime_mode": os.getenv("HERMES_RUNTIME_MODE", ""),
+        "backend_profile": os.getenv("HERMES_BACKEND_PROFILE", ""),
+        "missing": missing,
+    }
+    if service == "worker":
+        payload["max_concurrent_runs"] = int(os.getenv("AGENTOPS_WORKER_MAX_CONCURRENT_RUNS", "1"))
+    return payload
+
+
+class _Handler(BaseHTTPRequestHandler):
+    server_version = "AgentOpsRuntimeCompose/0.1"
+
+    def do_GET(self) -> None:  # noqa: N802 - stdlib callback name
+        if self.path not in {"/healthz", "/readyz"}:
+            self.send_error(404)
+            return
+        payload = _health_payload(self.server.service_name)  # type: ignore[attr-defined]
+        body = json.dumps(payload, sort_keys=True).encode("utf-8")
+        self.send_response(200 if payload["ok"] else 503)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - stdlib signature
+        print(f"{self.server.service_name}: " + format % args, file=sys.stderr)  # type: ignore[attr-defined]
+
+
+class _Server(ThreadingHTTPServer):
+    service_name: str
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = argv if argv is not None else sys.argv[1:]
+    service = args[0] if args else "api"
+    if service not in _SERVICE_PORTS:
+        print(f"unknown AgentOps compose service: {service}", file=sys.stderr)
+        return 2
+
+    port = int(os.getenv("AGENTOPS_SERVICE_PORT", str(_SERVICE_PORTS[service])))
+    server = _Server(("0.0.0.0", port), _Handler)
+    server.service_name = service
+    stopped = threading.Event()
+
+    def _stop(_signum: int, _frame: object) -> None:
+        stopped.set()
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+    print(f"AgentOps {service} listening on :{port}", flush=True)
+    server.serve_forever(poll_interval=0.2)
+    stopped.set()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

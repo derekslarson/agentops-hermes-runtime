@@ -1,0 +1,79 @@
+"""Static contract tests for the AgentOps compose-self-hosted MVP profile."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import tomllib
+import yaml
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+COMPOSE_DIR = REPO_ROOT / "deploy" / "compose"
+COMPOSE_FILE = COMPOSE_DIR / "docker-compose.yml"
+ENV_EXAMPLE = COMPOSE_DIR / ".env.example"
+README = COMPOSE_DIR / "README.md"
+PYPROJECT = REPO_ROOT / "pyproject.toml"
+
+
+def _compose() -> dict:
+    with COMPOSE_FILE.open("r", encoding="utf-8") as handle:
+        return yaml.safe_load(handle)
+
+
+def test_compose_profile_declares_required_distributed_services():
+    compose = _compose()
+
+    services = compose["services"]
+
+    assert {"api", "worker", "scheduler", "postgres", "redis", "minio", "local-secrets"}.issubset(
+        services
+    )
+    assert services["api"]["depends_on"]["postgres"]["condition"] == "service_healthy"
+    assert services["worker"]["depends_on"]["api"]["condition"] == "service_healthy"
+    assert services["scheduler"]["depends_on"]["api"]["condition"] == "service_healthy"
+
+
+def test_workers_are_scale_safe_and_configure_multiple_slots():
+    services = _compose()["services"]
+    worker = services["worker"]
+
+    assert "container_name" not in worker
+    assert worker["deploy"]["replicas"] == 1
+    assert any(str(item).startswith("AGENTOPS_WORKER_MAX_CONCURRENT_RUNS=") for item in worker["environment"])
+    assert "${AGENTOPS_WORKER_MAX_CONCURRENT_RUNS:-2}" in "\n".join(worker["environment"])
+
+
+def test_compose_services_use_agentops_runtime_profile_and_backend_refs():
+    services = _compose()["services"]
+
+    for service_name in ("api", "worker", "scheduler"):
+        env = "\n".join(services[service_name]["environment"])
+        assert "HERMES_RUNTIME_MODE=agentops" in env
+        assert "HERMES_BACKEND_PROFILE=compose-self-hosted" in env
+        assert "AGENTOPS_DATABASE_URL=" in env
+        assert "${AGENTOPS_POSTGRES_PASSWORD" in env
+        assert "AGENTOPS_QUEUE_URL=" in env
+        assert "AGENTOPS_ARTIFACT_ENDPOINT=" in env
+        assert "AGENTOPS_SECRET_STORE_URL=" in env
+
+
+def test_compose_profile_documents_scale_and_smoke_commands_without_raw_secrets():
+    env_text = ENV_EXAMPLE.read_text(encoding="utf-8")
+    readme_text = README.read_text(encoding="utf-8")
+
+    assert "AGENTOPS_WORKER_MAX_CONCURRENT_RUNS=" in env_text
+    assert "docker compose --scale worker=3" in readme_text
+    assert "docker compose up" in readme_text
+    assert "raw app/integration secrets" in readme_text
+    assert "SLACK_BOT_TOKEN=" not in env_text
+    assert "OPENAI_API_KEY=" not in env_text
+
+
+def test_agentops_runtime_compose_service_is_packaged_in_wheels():
+    pyproject = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+
+    packages = pyproject["tool"]["setuptools"]["packages"]["find"]["include"]
+
+    assert "agentops_runtime" in packages
+    assert "agentops_runtime.*" in packages

@@ -658,7 +658,9 @@ Required semantics:
 
 ### M12. Compose self-hosted distributed MVP
 
-**Status:** Pending
+**Status:** Started
+
+**Autonomous run note (2026-06-01):** Started M12 with the first Compose packaging slice. Added `deploy/compose/docker-compose.yml`, `.env.example`, and README covering an API/control-plane service, horizontally scalable workers with per-worker slot configuration, scheduler, Postgres database, Redis queue, MinIO artifact store, and a local development secret-store service. Added packaged `agentops_runtime.compose_services`, a minimal stdlib health service used by the API/worker/scheduler/local-secrets containers so `docker compose config` validates a runnable topology while durable adapter wiring is completed in later M12 slices. Static tests assert the required services, health dependencies, scale-safe worker shape, AgentOps runtime profile/backend refs, DB credential wiring, package inclusion, and no raw app/integration secrets in the sample env. Test evidence: focused RED/GREEN for missing Compose profile; focused RED/GREEN for reviewer-found DB URL/package discovery gaps; `python3 -m pytest tests/deploy/test_agentops_compose_profile.py -q -o 'addopts='` → 5 passed; `python3 -m ruff check agentops_runtime/compose_services.py tests/deploy/test_agentops_compose_profile.py` → passed; `docker compose -f deploy/compose/docker-compose.yml config` → passed; `git diff --check` → passed. M12 remains Started: remaining acceptance work is wiring real Compose durable backends through the registry, proving horizontal workers/multiple slots with actual runs, proving two-user/thread memory/session isolation plus shared org/project skills, remote cron duplicate prevention with multiple schedulers/workers, and worker restart/resume from durable state.
 
 **Goal:** Prove distributed semantics without cloud lock-in.
 

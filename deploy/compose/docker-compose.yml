@@ -1,0 +1,153 @@
+services:
+  api:
+    build:
+      context: ../..
+    image: agentops-hermes-runtime:local
+    restart: unless-stopped
+    command: ["python", "-m", "agentops_runtime.compose_services", "api"]
+    ports:
+      - "${AGENTOPS_API_PORT:-8710}:8710"
+    environment:
+      - HERMES_RUNTIME_MODE=agentops
+      - HERMES_BACKEND_PROFILE=compose-self-hosted
+      - AGENTOPS_DATABASE_URL=postgresql://agentops:${AGENTOPS_POSTGRES_PASSWORD:-agentops-dev-password}@postgres:5432/${AGENTOPS_POSTGRES_DB:-agentops}
+      - AGENTOPS_QUEUE_URL=redis://redis:6379/0
+      - AGENTOPS_ARTIFACT_ENDPOINT=http://minio:9000
+      - AGENTOPS_ARTIFACT_BUCKET=${AGENTOPS_ARTIFACT_BUCKET:-agentops-artifacts}
+      - AGENTOPS_SECRET_STORE_URL=http://local-secrets:8713
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      local-secrets:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8710/healthz', timeout=2).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+  worker:
+    build:
+      context: ../..
+    image: agentops-hermes-runtime:local
+    restart: unless-stopped
+    command: ["python", "-m", "agentops_runtime.compose_services", "worker"]
+    environment:
+      - HERMES_RUNTIME_MODE=agentops
+      - HERMES_BACKEND_PROFILE=compose-self-hosted
+      - AGENTOPS_DATABASE_URL=postgresql://agentops:${AGENTOPS_POSTGRES_PASSWORD:-agentops-dev-password}@postgres:5432/${AGENTOPS_POSTGRES_DB:-agentops}
+      - AGENTOPS_QUEUE_URL=redis://redis:6379/0
+      - AGENTOPS_ARTIFACT_ENDPOINT=http://minio:9000
+      - AGENTOPS_ARTIFACT_BUCKET=${AGENTOPS_ARTIFACT_BUCKET:-agentops-artifacts}
+      - AGENTOPS_SECRET_STORE_URL=http://local-secrets:8713
+      - AGENTOPS_WORKER_MAX_CONCURRENT_RUNS=${AGENTOPS_WORKER_MAX_CONCURRENT_RUNS:-2}
+    depends_on:
+      api:
+        condition: service_healthy
+    deploy:
+      replicas: 1
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8711/healthz', timeout=2).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+  scheduler:
+    build:
+      context: ../..
+    image: agentops-hermes-runtime:local
+    restart: unless-stopped
+    command: ["python", "-m", "agentops_runtime.compose_services", "scheduler"]
+    environment:
+      - HERMES_RUNTIME_MODE=agentops
+      - HERMES_BACKEND_PROFILE=compose-self-hosted
+      - AGENTOPS_DATABASE_URL=postgresql://agentops:${AGENTOPS_POSTGRES_PASSWORD:-agentops-dev-password}@postgres:5432/${AGENTOPS_POSTGRES_DB:-agentops}
+      - AGENTOPS_QUEUE_URL=redis://redis:6379/0
+      - AGENTOPS_ARTIFACT_ENDPOINT=http://minio:9000
+      - AGENTOPS_ARTIFACT_BUCKET=${AGENTOPS_ARTIFACT_BUCKET:-agentops-artifacts}
+      - AGENTOPS_SECRET_STORE_URL=http://local-secrets:8713
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8712/healthz', timeout=2).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=${AGENTOPS_POSTGRES_DB:-agentops}
+      - POSTGRES_USER=agentops
+      - POSTGRES_PASSWORD=${AGENTOPS_POSTGRES_PASSWORD:-agentops-dev-password}
+    volumes:
+      - agentops-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentops -d ${AGENTOPS_POSTGRES_DB:-agentops}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - agentops-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      - MINIO_ROOT_USER=${AGENTOPS_MINIO_ROOT_USER:-agentopsminio}
+      - MINIO_ROOT_PASSWORD=${AGENTOPS_MINIO_ROOT_PASSWORD:-agentops-minio-dev-password}
+    volumes:
+      - agentops-minio:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+  local-secrets:
+    build:
+      context: ../..
+    image: agentops-hermes-runtime:local
+    restart: unless-stopped
+    command: ["python", "-m", "agentops_runtime.compose_services", "local-secrets"]
+    environment:
+      - HERMES_RUNTIME_MODE=agentops
+      - HERMES_BACKEND_PROFILE=compose-self-hosted
+      - AGENTOPS_DATABASE_URL=postgresql://agentops:${AGENTOPS_POSTGRES_PASSWORD:-agentops-dev-password}@postgres:5432/${AGENTOPS_POSTGRES_DB:-agentops}
+      - AGENTOPS_QUEUE_URL=redis://redis:6379/0
+      - AGENTOPS_ARTIFACT_ENDPOINT=http://minio:9000
+      - AGENTOPS_SECRET_STORE_URL=http://local-secrets:8713
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8713/healthz', timeout=2).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+volumes:
+  agentops-postgres:
+  agentops-redis:
+  agentops-minio:
