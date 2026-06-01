@@ -491,6 +491,218 @@ def test_supervisor_process_turn_blocks_concurrent_same_worker_turn_until_lock_r
     assert [message["content"] for message in backend.read_messages(context)] == ["first inbound", "first done"]
 
 
+def test_supervisor_warm_conversation_reuses_active_run_until_idle_timeout():
+    backend = _FakeRemoteSessionBackend()
+    registry = RuntimeBackendRegistry()
+    registry.register(BackendCapability.SESSION, lambda options: backend, profile="compose-self-hosted")
+    supervisor = LocalRunSupervisor(worker_id="worker-warm", max_concurrent_runs=2, registry=registry)
+    first_context = _remote_context("run-warm-first", conversation_id="thread-warm")
+    second_context = _remote_context("run-warm-second", conversation_id="thread-warm")
+    third_context = _remote_context("run-warm-third", conversation_id="thread-warm")
+    observed_run_ids: list[str | None] = []
+
+    def handler(transcript):
+        current = get_current_runtime_context()
+        observed_run_ids.append(current.run_id if current else None)
+        return {"role": "assistant", "content": f"reply {len(transcript)}"}
+
+    first = supervisor.submit_warm_turn(
+        first_context,
+        {"role": "user", "content": "first inbound"},
+        handler,
+        idle_timeout_seconds=10.0,
+        now=100.0,
+    )
+    second = supervisor.submit_warm_turn(
+        second_context,
+        {"role": "user", "content": "second inbound before idle"},
+        handler,
+        idle_timeout_seconds=10.0,
+        now=105.0,
+    )
+    assert first.result(timeout=2).status is RunStatus.SUCCEEDED
+    assert second.result(timeout=2).status is RunStatus.SUCCEEDED
+    third = supervisor.submit_warm_turn(
+        third_context,
+        {"role": "user", "content": "third inbound after idle"},
+        handler,
+        idle_timeout_seconds=10.0,
+        now=116.0,
+    )
+
+    assert third.result(timeout=2).status is RunStatus.SUCCEEDED
+    assert observed_run_ids == ["run-warm-first", "run-warm-first", "run-warm-third"]
+    assert [message["content"] for message in backend.read_messages(third_context)] == [
+        "first inbound",
+        "reply 1",
+        "second inbound before idle",
+        "reply 3",
+        "third inbound after idle",
+        "reply 5",
+    ]
+
+
+def test_supervisor_warm_conversation_does_not_expire_while_turn_is_active():
+    backend = _FakeRemoteSessionBackend()
+    registry = RuntimeBackendRegistry()
+    registry.register(BackendCapability.SESSION, lambda options: backend, profile="compose-self-hosted")
+    supervisor = LocalRunSupervisor(worker_id="worker-warm-active", max_concurrent_runs=2, registry=registry)
+    first_context = _remote_context("run-warm-active-first", conversation_id="thread-warm-active")
+    second_context = _remote_context("run-warm-active-second", conversation_id="thread-warm-active")
+    handler_started = threading.Event()
+    release_handler = threading.Event()
+    observed_run_ids: list[str | None] = []
+
+    def handler(transcript):
+        current = get_current_runtime_context()
+        observed_run_ids.append(current.run_id if current else None)
+        handler_started.set()
+        release_handler.wait(timeout=2)
+        return {"role": "assistant", "content": "ok"}
+
+    first = supervisor.submit_warm_turn(
+        first_context,
+        {"role": "user", "content": "first slow turn"},
+        handler,
+        idle_timeout_seconds=10.0,
+        now=100.0,
+    )
+    assert handler_started.wait(timeout=2)
+    assert supervisor.reap_idle_conversations(now=116.0) == 0
+    second = supervisor.submit_warm_turn(
+        second_context,
+        {"role": "user", "content": "follow-up while first still active"},
+        handler,
+        idle_timeout_seconds=10.0,
+        now=116.0,
+    )
+
+    release_handler.set()
+    assert first.result(timeout=2).status is RunStatus.SUCCEEDED
+    assert second.result(timeout=2).status is RunStatus.SUCCEEDED
+    assert observed_run_ids == ["run-warm-active-first", "run-warm-active-first"]
+
+
+def test_supervisor_warm_conversation_starts_fresh_run_when_permissions_change():
+    backend = _FakeRemoteSessionBackend()
+    registry = RuntimeBackendRegistry()
+    registry.register(BackendCapability.SESSION, lambda options: backend, profile="compose-self-hosted")
+    supervisor = LocalRunSupervisor(worker_id="worker-warm-permissions", max_concurrent_runs=2, registry=registry)
+    first_context = RuntimeContext(**{**_remote_context("run-warm-broad").to_dict(), "permissions_ref": "broad"})
+    second_context = RuntimeContext(**{**_remote_context("run-warm-narrow").to_dict(), "permissions_ref": "narrow"})
+    observed: list[tuple[str | None, str | None]] = []
+
+    def handler(transcript):
+        current = get_current_runtime_context()
+        observed.append((current.run_id if current else None, current.permissions_ref if current else None))
+        return {"role": "assistant", "content": "ok"}
+
+    first = supervisor.submit_warm_turn(
+        first_context,
+        {"role": "user", "content": "first"},
+        handler,
+        idle_timeout_seconds=10.0,
+        now=100.0,
+    )
+    second = supervisor.submit_warm_turn(
+        second_context,
+        {"role": "user", "content": "second with narrower permission"},
+        handler,
+        idle_timeout_seconds=10.0,
+        now=105.0,
+    )
+
+    assert first.result(timeout=2).status is RunStatus.SUCCEEDED
+    assert second.result(timeout=2).status is RunStatus.SUCCEEDED
+    assert observed == [("run-warm-broad", "broad"), ("run-warm-narrow", "narrow")]
+
+
+def test_supervisor_warm_conversation_expires_at_idle_timeout_boundary():
+    backend = _FakeRemoteSessionBackend()
+    registry = RuntimeBackendRegistry()
+    registry.register(BackendCapability.SESSION, lambda options: backend, profile="compose-self-hosted")
+    supervisor = LocalRunSupervisor(worker_id="worker-warm-boundary", max_concurrent_runs=2, registry=registry)
+    first_context = _remote_context("run-warm-boundary-first", conversation_id="thread-warm-boundary")
+    second_context = _remote_context("run-warm-boundary-second", conversation_id="thread-warm-boundary")
+    observed_run_ids: list[str | None] = []
+
+    def handler(transcript):
+        current = get_current_runtime_context()
+        observed_run_ids.append(current.run_id if current else None)
+        return {"role": "assistant", "content": "ok"}
+
+    first = supervisor.submit_warm_turn(
+        first_context,
+        {"role": "user", "content": "first"},
+        handler,
+        idle_timeout_seconds=10.0,
+        now=100.0,
+    )
+    assert first.result(timeout=2).status is RunStatus.SUCCEEDED
+    assert supervisor.reap_idle_conversations(now=110.0) == 1
+    second = supervisor.submit_warm_turn(
+        second_context,
+        {"role": "user", "content": "second at boundary"},
+        handler,
+        idle_timeout_seconds=10.0,
+        now=110.0,
+    )
+
+    assert first.result(timeout=2).status is RunStatus.SUCCEEDED
+    assert second.result(timeout=2).status is RunStatus.SUCCEEDED
+    assert observed_run_ids == ["run-warm-boundary-first", "run-warm-boundary-second"]
+
+
+def test_supervisor_warm_turn_rejects_non_conversation_run_type():
+    registry = RuntimeBackendRegistry()
+    supervisor = LocalRunSupervisor(worker_id="worker-warm-event", max_concurrent_runs=2, registry=registry)
+    context = RuntimeContext(**{**_remote_context("run-warm-event").to_dict(), "run_type": "event"})
+    handler_called = False
+
+    def handler(transcript):
+        nonlocal handler_called
+        handler_called = True
+        return {"role": "assistant", "content": "must not run"}
+
+    handle = supervisor.submit_warm_turn(
+        context,
+        {"role": "user", "content": "event should not be warm"},
+        handler,
+        idle_timeout_seconds=10.0,
+        now=100.0,
+    )
+
+    result = handle.result(timeout=2)
+    assert result.status is RunStatus.FAILED
+    assert result.error == "warm turns require RuntimeContext.run_type='conversation'"
+    assert handler_called is False
+    assert supervisor.reap_idle_conversations(now=111.0) == 0
+
+
+def test_supervisor_warm_turn_after_drain_does_not_record_active_conversation():
+    backend = _FakeRemoteSessionBackend()
+    registry = RuntimeBackendRegistry()
+    registry.register(BackendCapability.SESSION, lambda options: backend, profile="compose-self-hosted")
+    supervisor = LocalRunSupervisor(worker_id="worker-warm-drain", max_concurrent_runs=2, registry=registry)
+    context = _remote_context("run-warm-drain", conversation_id="thread-warm-drain")
+
+    drain_result = supervisor.request_drain()
+    handle = supervisor.submit_warm_turn(
+        context,
+        {"role": "user", "content": "ignored while draining"},
+        lambda transcript: {"role": "assistant", "content": "should not run"},
+        idle_timeout_seconds=10.0,
+        now=100.0,
+    )
+
+    assert drain_result.status is RunStatus.SUCCEEDED
+    result = handle.result(timeout=2)
+    assert result.status is RunStatus.FAILED
+    assert result.error == "worker is draining and cannot accept new runs"
+    assert supervisor.reap_idle_conversations(now=111.0) == 0
+    assert backend.read_messages(context) == []
+
+
 def test_supervisor_submit_turn_queues_busy_same_conversation_in_order():
     backend = _FakeRemoteSessionBackend()
     registry = RuntimeBackendRegistry()

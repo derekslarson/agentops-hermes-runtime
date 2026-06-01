@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 import uuid
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -142,6 +143,12 @@ class _QueuedTurn:
     executor_future: Future | None = None
 
 
+@dataclass(slots=True)
+class _WarmConversation:
+    context: RuntimeContext
+    expires_at: float
+
+
 def _turn_queue_key(context: RuntimeContext) -> tuple[str | None, ...]:
     """Return the worker-local sequential-turn queue key for a context."""
 
@@ -153,6 +160,21 @@ def _turn_queue_key(context: RuntimeContext) -> tuple[str | None, ...]:
         context.agent_profile_id,
         context.project_id,
         context.conversation_id or context.run_id,
+    )
+
+
+def _warm_conversation_key(context: RuntimeContext) -> tuple[str | None, ...]:
+    """Return the worker-local warm-run key, including security/backend policy."""
+
+    return (
+        *_turn_queue_key(context),
+        context.workspace_type,
+        context.external_channel_id,
+        context.external_thread_id,
+        context.permissions_ref,
+        context.backend_profile,
+        context.delivery_ref,
+        repr(context.metadata),
     )
 
 
@@ -261,6 +283,7 @@ class LocalRunSupervisor:
         self._draining = False
         self._shutting_down = False
         self._turn_queues: dict[tuple[str | None, ...], deque[_QueuedTurn]] = {}
+        self._warm_conversations: dict[tuple[str | None, ...], _WarmConversation] = {}
         self._register_worker()
 
     @property
@@ -392,6 +415,66 @@ class LocalRunSupervisor:
                 self._schedule_queued_turn(queued)
         return RunHandle(context=context, _future=future)
 
+    def submit_warm_turn(
+        self,
+        context: RuntimeContext,
+        message: Mapping[str, Any],
+        handler: TurnHandler,
+        *,
+        idle_timeout_seconds: float,
+        now: float | None = None,
+        lock_ttl_seconds: float = 300.0,
+    ) -> RunHandle:
+        """Queue a conversation turn on an active warm run when possible.
+
+        The first turn for a conversation records its ``RuntimeContext`` as the
+        active warm run. Follow-up turns arriving before ``idle_timeout_seconds``
+        expires are processed with that active context, so native session,
+        audit, and tool paths observe the same run owner. Once idle, a later
+        turn starts a fresh active run using the incoming context while durable
+        session state remains scoped to the same conversation.
+        """
+
+        if idle_timeout_seconds <= 0:
+            raise ValueError("idle_timeout_seconds must be > 0")
+        if context.run_type != "conversation":
+            return self._failed_handle(context, "warm turns require RuntimeContext.run_type='conversation'")
+        current_time = time.time() if now is None else now
+        queue_key = _warm_conversation_key(context)
+        with self._lock:
+            if self._draining:
+                return self._failed_handle(context, "worker is draining and cannot accept new runs")
+            if self._shutting_down:
+                return self._failed_handle(context, "worker is shutting down and cannot accept new runs")
+            active = self._warm_conversations.get(queue_key)
+            active_turns_pending = active is not None and _turn_queue_key(active.context) in self._turn_queues
+            if active is None or (active.expires_at <= current_time and not active_turns_pending):
+                active = _WarmConversation(context=context, expires_at=current_time + idle_timeout_seconds)
+                self._warm_conversations[queue_key] = active
+            else:
+                active.expires_at = current_time + idle_timeout_seconds
+            active_context = active.context
+        return self.submit_turn(
+            active_context,
+            message,
+            handler,
+            lock_ttl_seconds=lock_ttl_seconds,
+        )
+
+    def reap_idle_conversations(self, *, now: float | None = None) -> int:
+        """Drop locally cached warm-run records whose idle timeout expired."""
+
+        current_time = time.time() if now is None else now
+        with self._lock:
+            expired = [
+                key
+                for key, warm in self._warm_conversations.items()
+                if warm.expires_at <= current_time and _turn_queue_key(warm.context) not in self._turn_queues
+            ]
+            for key in expired:
+                self._warm_conversations.pop(key, None)
+        return len(expired)
+
     def _schedule_queued_turn(self, queued: _QueuedTurn) -> None:
         if self._draining or self._shutting_down:
             queued.future.set_result(
@@ -471,6 +554,7 @@ class LocalRunSupervisor:
 
         with self._lock:
             self._draining = True
+            self._warm_conversations.clear()
             self._fail_pending_queued_turns_locked("worker is draining and cannot accept queued turn")
             self._cancel_unstarted_queued_heads_locked("worker is draining and cannot accept queued turn")
             if self._registry is not None:
@@ -488,6 +572,7 @@ class LocalRunSupervisor:
     def shutdown(self, *, wait: bool = True) -> None:
         with self._lock:
             self._shutting_down = True
+            self._warm_conversations.clear()
             self._fail_pending_queued_turns_locked("worker is shutting down and cannot accept queued turn")
             self._cancel_unstarted_queued_heads_locked("worker is shutting down and cannot accept queued turn")
             executor, self._executor = self._executor, None
