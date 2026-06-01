@@ -129,8 +129,8 @@ def test_local_supervisor_isolates_state_and_survives_one_run_crashing():
             ctx_fail.job_id,
         )
     ]
-    assert [event["status"] for event in ok_events] == ["started", "succeeded"]
-    assert [event["status"] for event in fail_events] == ["started", "failed"]
+    assert [event["status"] for event in ok_events if "status" in event] == ["started", "succeeded"]
+    assert [event["status"] for event in fail_events if "status" in event] == ["started", "failed"]
 
 
 def test_local_supervisor_isolates_locks_queue_idempotency_and_audit_error_secrets():
@@ -184,7 +184,7 @@ def test_local_supervisor_isolates_locks_queue_idempotency_and_audit_error_secre
             ctx_b.job_id,
         )
     ]
-    failed_event = [event for event in fail_events if event["status"] == "failed"][0]
+    failed_event = [event for event in fail_events if event.get("status") == "failed"][0]
     assert "sentinel-secret" not in failed_event["error"]
     assert "token=[REDACTED]" in failed_event["error"]
 
@@ -523,7 +523,7 @@ def test_supervisor_process_turn_releases_lock_and_preserves_raw_error_when_hand
             context.job_id,
         )
     ]
-    failed_event = [event for event in fail_events if event["status"] == "failed"][0]
+    failed_event = [event for event in fail_events if event.get("status") == "failed"][0]
     assert "sentinel-secret" not in failed_event["error"]
     assert "token=[REDACTED]" in failed_event["error"]
 

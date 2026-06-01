@@ -34,6 +34,85 @@ from toolsets import resolve_toolset, validate_toolset
 
 logger = logging.getLogger(__name__)
 
+_TOOL_AUDIT_REGISTRY_CACHE: dict[str, Any] = {}
+_TOOL_AUDIT_REGISTRY_LOCK = threading.Lock()
+
+
+def _get_runtime_tool_audit_registry(config: Dict[str, Any]):
+    """Return a process-local registry used for runtime tool audit delivery."""
+
+    from agent.runtime_artifacts_audit import register_http_artifact_backend, register_http_audit_backend
+    from agent.runtime_backends import RuntimeBackendRegistry
+
+    try:
+        cache_key = json.dumps(config or {}, sort_keys=True, default=str)
+    except TypeError:
+        cache_key = repr(config)
+    with _TOOL_AUDIT_REGISTRY_LOCK:
+        cached = _TOOL_AUDIT_REGISTRY_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        registry_instance = RuntimeBackendRegistry(config=config)
+        register_http_artifact_backend(registry_instance)
+        register_http_audit_backend(registry_instance)
+        _TOOL_AUDIT_REGISTRY_CACHE[cache_key] = registry_instance
+        return registry_instance
+
+
+def _record_runtime_tool_audit(
+    tool_name: str,
+    args: Dict[str, Any] | None,
+    *,
+    success: bool,
+    task_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    tool_call_id: Optional[str] = None,
+    duration_ms: Optional[int] = None,
+    result: Optional[str] = None,
+    error: Optional[str] = None,
+    runtime_context=None,
+) -> None:
+    """Record a sanitized runtime audit event for a native tool dispatch."""
+
+    try:
+        from agent.runtime_backends import BackendCapability, _redact_audit_value
+        from agent.runtime_context import get_current_runtime_context
+        from hermes_cli.config import load_config
+
+        context = get_current_runtime_context() or runtime_context
+        if context is None:
+            return
+        config = load_config()
+        registry_instance = _get_runtime_tool_audit_registry(config if isinstance(config, dict) else {})
+        audit = registry_instance.get(BackendCapability.AUDIT, context)
+        event: dict[str, Any] = {
+            "action": f"tool.{tool_name}",
+            "tool_name": tool_name,
+            "success": success,
+            "task_id": task_id,
+            "session_id": session_id,
+            "tool_call_id": tool_call_id,
+            "duration_ms": duration_ms,
+            "args": args or {},
+        }
+        if result is not None:
+            event["result_preview"] = result[:2000]
+        if error is not None:
+            event["error"] = error
+        audit.record(context, _redact_audit_value(event))
+    except Exception:
+        logger.debug("runtime tool audit failed", exc_info=True)
+
+
+def _tool_result_is_error(result: str | None) -> bool:
+    if not isinstance(result, str):
+        return False
+    try:
+        parsed = json.loads(result)
+    except Exception:
+        return result.startswith("[TOOL_ERROR]") or result.startswith("Error executing")
+    return isinstance(parsed, dict) and bool(parsed.get("error"))
+
 
 # =============================================================================
 # Async Bridging  (single source of truth -- used by registry.dispatch too)
@@ -899,7 +978,17 @@ def handle_function_call(
         if function_name == _ts_mod.TOOL_CALL_NAME:
             underlying_name, underlying_args, err = _ts_mod.resolve_underlying_call(function_args or {})
             if err or not underlying_name:
-                return json.dumps({"error": err or "tool_call could not be resolved"},
+                error = err or "tool_call could not be resolved"
+                _record_runtime_tool_audit(
+                    function_name,
+                    function_args,
+                    success=False,
+                    task_id=task_id,
+                    session_id=session_id,
+                    tool_call_id=tool_call_id,
+                    error=error,
+                )
+                return json.dumps({"error": error},
                                   ensure_ascii=False)
             # Defense in depth: the underlying tool MUST be in the session's
             # scoped deferrable catalog. resolve_underlying_call() only checks
@@ -909,12 +998,20 @@ def handle_function_call(
             # the bridge even if the catalog scoping above regressed.
             _scoped_deferrable = _ts_mod.scoped_deferrable_names(current_defs)
             if underlying_name not in _scoped_deferrable:
-                return json.dumps({
-                    "error": (
-                        f"'{underlying_name}' is not available in this session. "
-                        "Use tool_search to find tools you can call."
-                    ),
-                }, ensure_ascii=False)
+                error = (
+                    f"'{underlying_name}' is not available in this session. "
+                    "Use tool_search to find tools you can call."
+                )
+                _record_runtime_tool_audit(
+                    underlying_name,
+                    underlying_args,
+                    success=False,
+                    task_id=task_id,
+                    session_id=session_id,
+                    tool_call_id=tool_call_id,
+                    error=error,
+                )
+                return json.dumps({"error": error}, ensure_ascii=False)
             # Recurse with the underlying tool. All hooks fire against the
             # real tool name. The bridge is invisible to hooks by design.
             return handle_function_call(
@@ -933,7 +1030,17 @@ def handle_function_call(
 
     try:
         if function_name in _AGENT_LOOP_TOOLS:
-            return json.dumps({"error": f"{function_name} must be handled by the agent loop"})
+            error = f"{function_name} must be handled by the agent loop"
+            _record_runtime_tool_audit(
+                function_name,
+                function_args,
+                success=False,
+                task_id=task_id,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                error=error,
+            )
+            return json.dumps({"error": error})
 
         # Check plugin hooks for a block directive (unless caller already
         # checked — e.g. run_agent._invoke_tool passes skip=True to
@@ -960,6 +1067,15 @@ def handle_function_call(
                 logger.debug("pre_tool_call hook error: %s", _hook_err)
 
             if block_message is not None:
+                _record_runtime_tool_audit(
+                    function_name,
+                    function_args,
+                    success=False,
+                    task_id=task_id,
+                    session_id=session_id,
+                    tool_call_id=tool_call_id,
+                    error=block_message,
+                )
                 return json.dumps({"error": block_message}, ensure_ascii=False)
 
         # ACP/Zed edit approval runs before any file mutation.  The requester
@@ -970,11 +1086,30 @@ def handle_function_call(
 
             edit_block_message = maybe_require_edit_approval(function_name, function_args)
             if edit_block_message is not None:
+                _record_runtime_tool_audit(
+                    function_name,
+                    function_args,
+                    success=False,
+                    task_id=task_id,
+                    session_id=session_id,
+                    tool_call_id=tool_call_id,
+                    error=edit_block_message,
+                )
                 return edit_block_message
         except Exception as _edit_approval_err:
             logger.debug("ACP edit approval guard error: %s", _edit_approval_err)
             if function_name in {"write_file", "patch"}:
-                return json.dumps({"error": "Edit approval denied: approval guard failed"}, ensure_ascii=False)
+                error = "Edit approval denied: approval guard failed"
+                _record_runtime_tool_audit(
+                    function_name,
+                    function_args,
+                    success=False,
+                    task_id=task_id,
+                    session_id=session_id,
+                    tool_call_id=tool_call_id,
+                    error=error,
+                )
+                return json.dumps({"error": error}, ensure_ascii=False)
 
         # Notify the read-loop tracker when a non-read/search tool runs,
         # so the *consecutive* counter resets (reads after other work are fine).
@@ -1009,6 +1144,18 @@ def handle_function_call(
                 user_task=user_task,
             )
         duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
+        result_is_error = _tool_result_is_error(result)
+        _record_runtime_tool_audit(
+            function_name,
+            function_args,
+            success=not result_is_error,
+            task_id=task_id,
+            session_id=session_id,
+            tool_call_id=tool_call_id,
+            duration_ms=duration_ms,
+            result=result,
+            error=result if result_is_error else None,
+        )
 
         try:
             from hermes_cli.plugins import invoke_hook
@@ -1055,7 +1202,17 @@ def handle_function_call(
     except Exception as e:
         error_msg = f"Error executing {function_name}: {str(e)}"
         logger.exception(error_msg)
-        return json.dumps({"error": _sanitize_tool_error(error_msg)}, ensure_ascii=False)
+        sanitized_error = _sanitize_tool_error(error_msg)
+        _record_runtime_tool_audit(
+            function_name,
+            function_args,
+            success=False,
+            task_id=task_id,
+            session_id=session_id,
+            tool_call_id=tool_call_id,
+            error=sanitized_error,
+        )
+        return json.dumps({"error": sanitized_error}, ensure_ascii=False)
 
 
 # =============================================================================

@@ -10,7 +10,7 @@ from agent.runtime_artifacts_audit import (
     register_http_artifact_backend,
     register_http_audit_backend,
 )
-from agent.runtime_backends import BackendCapability, BackendSelectionError, RuntimeBackendRegistry
+from agent.runtime_backends import BackendCapability, BackendSelectionError, RuntimeBackendRegistry, _redact_audit_value
 from agent.runtime_context import RuntimeContext
 
 
@@ -319,3 +319,285 @@ def test_http_artifact_get_returns_none_for_not_found():
     artifacts = registry.get(BackendCapability.ARTIFACT, _context("derek"))
 
     assert artifacts.get(_context("derek"), "missing.txt") is None
+
+
+def test_registry_local_backends_emit_audit_events_for_required_runtime_surfaces():
+    registry = RuntimeBackendRegistry()
+    context = RuntimeContext(
+        mode="agentops",
+        org_id="acme",
+        workspace_id="workspace",
+        user_id="derek",
+        conversation_id="thread-1",
+        agent_profile_id="default",
+        project_id="proj",
+        run_id="run-audit",
+        backend_profile="local",
+    )
+
+    registry.get(BackendCapability.MEMORY, context).write(context, "memory", target="memory", action="add")
+    registry.get(BackendCapability.SKILL, context).list_skills(context)
+    registry.get(BackendCapability.SESSION, context).append(context, {"role": "user", "content": "hi"})
+    cron = registry.get(BackendCapability.CRON, context)
+    job_id = cron.create(context, {"prompt": "summarize", "one_shot": True})
+    cron.claim_due(context, owner="worker-1", now=1.0)
+    cron.complete_run(context, job_id, owner="worker-1", output="done", now=2.0)
+    queue = registry.get(BackendCapability.QUEUE, context)
+    receipt = queue.enqueue(context, {"type": "turn"}, idempotency_key="turn-1")
+    queue.claim(context)
+    queue.ack(context, receipt)
+    leases = registry.get(BackendCapability.RUN_LEASE, context)
+    leases.claim(context, "run-audit", owner="worker-1")
+    leases.renew(context, "run-audit", owner="worker-1")
+    leases.release(context, "run-audit", owner="worker-1")
+    workers = registry.get(BackendCapability.WORKER_REGISTRY, context)
+    worker_id = workers.register(context, {"id": "worker-1", "max_concurrent_runs": 2})
+    workers.heartbeat(context, worker_id, slots={"0": "idle"})
+    registry.get(BackendCapability.ARTIFACT, context).put(
+        context,
+        "tool-output/result.txt",
+        b"bytes from /Users/derek/private and token=secret",
+    )
+    registry.get(BackendCapability.DELIVERY, context).deliver(
+        context,
+        {"route": "slack", "content": "done", "webhook_token": "secret-token"},
+    )
+
+    audit = registry.get(BackendCapability.AUDIT, context)
+    events = audit._events[(
+        context.mode,
+        context.org_id,
+        context.workspace_id,
+        context.user_id,
+        context.conversation_id,
+        context.agent_profile_id,
+        context.project_id,
+        context.run_id,
+        context.job_id,
+    )]
+    actions = {event["action"] for event in events}
+
+    assert {
+        "memory.write",
+        "skill.list_skills",
+        "session.append",
+        "cron.create",
+        "cron.claim_due",
+        "cron.complete_run",
+        "queue.enqueue",
+        "queue.claim",
+        "queue.ack",
+        "run_lease.claim",
+        "run_lease.renew",
+        "run_lease.release",
+        "worker_registry.register",
+        "worker_registry.heartbeat",
+        "artifact.put",
+        "delivery.deliver",
+    }.issubset(actions)
+    assert "secret-token" not in repr(events)
+    assert "/Users/derek" not in repr(events)
+
+
+def test_backend_failure_audit_redacts_secret_like_exception_text():
+    class ExplodingMemoryBackend:
+        def read(self, context, *, target="memory"):
+            return None
+
+        def write(self, context, content, *, target="memory", action="add"):
+            raise RuntimeError("failed with token=secret-token and /Users/derek/private.txt")
+
+    registry = RuntimeBackendRegistry()
+    registry.register(BackendCapability.MEMORY, lambda options: ExplodingMemoryBackend(), profile="local")
+    context = RuntimeContext(mode="agentops", org_id="acme", run_id="run-failure")
+
+    try:
+        registry.get(BackendCapability.MEMORY, context).write(context, "memory")
+    except RuntimeError:
+        pass
+    else:  # pragma: no cover - assertion path
+        raise AssertionError("expected backend failure")
+
+    events = registry.get(BackendCapability.AUDIT, context)._events[
+        (
+            context.mode,
+            context.org_id,
+            context.workspace_id,
+            context.user_id,
+            context.conversation_id,
+            context.agent_profile_id,
+            context.project_id,
+            context.run_id,
+            context.job_id,
+        )
+    ]
+    assert events[-1]["success"] is False
+    assert "secret-token" not in repr(events)
+    assert "/Users/derek" not in repr(events)
+
+
+def test_registry_can_audit_slotted_protocol_backends_without_requiring_instance_mutation():
+    class SlottedMemoryBackend:
+        __slots__ = ()
+
+        def read(self, context, *, target="memory"):
+            return None
+
+        def write(self, context, content, *, target="memory", action="add"):
+            return None
+
+    registry = RuntimeBackendRegistry()
+    registry.register(BackendCapability.MEMORY, lambda options: SlottedMemoryBackend(), profile="local")
+    context = RuntimeContext(mode="agentops", org_id="acme", run_id="run-slotted")
+
+    backend = registry.get(BackendCapability.MEMORY, context)
+    backend.write(context, "memory")
+
+    events = registry.get(BackendCapability.AUDIT, context)._events[
+        (
+            context.mode,
+            context.org_id,
+            context.workspace_id,
+            context.user_id,
+            context.conversation_id,
+            context.agent_profile_id,
+            context.project_id,
+            context.run_id,
+            context.job_id,
+        )
+    ]
+    assert events[-1]["action"] == "memory.write"
+    assert events[-1]["success"] is True
+
+
+def test_shared_backend_instances_audit_to_each_registry_scope():
+    class SharedMemoryBackend:
+        def read(self, context, *, target="memory"):
+            return None
+
+        def write(self, context, content, *, target="memory", action="add"):
+            return None
+
+    shared = SharedMemoryBackend()
+    first = RuntimeBackendRegistry()
+    second = RuntimeBackendRegistry()
+    first.register(BackendCapability.MEMORY, lambda options: shared, profile="local")
+    second.register(BackendCapability.MEMORY, lambda options: shared, profile="local")
+    first_context = RuntimeContext(mode="agentops", org_id="acme", run_id="run-first")
+    second_context = RuntimeContext(mode="agentops", org_id="acme", run_id="run-second")
+
+    first.get(BackendCapability.MEMORY, first_context).write(first_context, "first")
+    second.get(BackendCapability.MEMORY, second_context).write(second_context, "second")
+
+    first_events = first.get(BackendCapability.AUDIT, first_context)._events[
+        (
+            first_context.mode,
+            first_context.org_id,
+            first_context.workspace_id,
+            first_context.user_id,
+            first_context.conversation_id,
+            first_context.agent_profile_id,
+            first_context.project_id,
+            first_context.run_id,
+            first_context.job_id,
+        )
+    ]
+    second_events = second.get(BackendCapability.AUDIT, second_context)._events[
+        (
+            second_context.mode,
+            second_context.org_id,
+            second_context.workspace_id,
+            second_context.user_id,
+            second_context.conversation_id,
+            second_context.agent_profile_id,
+            second_context.project_id,
+            second_context.run_id,
+            second_context.job_id,
+        )
+    ]
+    assert [event["action"] for event in first_events] == ["memory.write"]
+    assert [event["action"] for event in second_events] == ["memory.write"]
+    assert second_context.run_id not in {
+        key[-2] for key in first.get(BackendCapability.AUDIT, first_context)._events
+    }
+
+
+def test_local_audit_backend_redacts_secret_and_path_text_at_boundary(tmp_path):
+    context = RuntimeContext(mode="agentops", org_id="acme", run_id="run-audit-boundary")
+    backend = LocalFileAuditBackend(root=tmp_path / "audit")
+
+    backend.record(
+        context,
+        {
+            "action": "tool.unsafe",
+            "error": "failed with token=secret-token in /Users/derek/private.txt",
+            "result_preview": '{"path": "/Users/derek/private.txt", "token": "secret-token"}',
+        },
+    )
+
+    events = backend.list_events(context)
+    assert "secret-token" not in repr(events)
+    assert "/Users/derek" not in repr(events)
+    assert events[0]["event"]["error"] == "failed with token=[REDACTED] in [REDACTED_PATH]"
+
+
+def test_audit_redacts_secret_text_inside_lists_and_bearer_headers():
+    event = {
+        "argv": ["--authorization=raw-token", "token=secret-token"],
+        "message": "Authorization: Bearer bearer-secret",
+    }
+
+    sanitized = _redact_audit_value(event)
+
+    assert "raw-token" not in repr(sanitized)
+    assert "secret-token" not in repr(sanitized)
+    assert "bearer-secret" not in repr(sanitized)
+    assert sanitized["argv"] == ["--authorization=[REDACTED]", "token=[REDACTED]"]
+    assert sanitized["message"] == "Authorization=[REDACTED] [REDACTED]"
+
+
+def test_handle_function_call_records_runtime_tool_call_audit(monkeypatch):
+    import model_tools
+    from tools.registry import registry as tool_registry
+
+    context = RuntimeContext(mode="agentops", org_id="acme", run_id="run-tool")
+
+    if hasattr(model_tools, "_TOOL_AUDIT_REGISTRY_CACHE"):
+        model_tools._TOOL_AUDIT_REGISTRY_CACHE.clear()
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+    monkeypatch.setattr(
+        tool_registry,
+        "dispatch",
+        lambda name, args, **kw: '{"ok": true, "path": "/Users/derek/private.txt", "token": "secret-token"}',
+    )
+
+    result = model_tools.handle_function_call(
+        "runtime_audit_dummy",
+        {"command": "cat /Users/derek/private.txt && echo token=secret-token"},
+        task_id="task-1",
+        session_id="session-1",
+        tool_call_id="tool-call-1",
+        skip_pre_tool_call_hook=True,
+        runtime_context=context,
+    )
+
+    audit_registry = model_tools._get_runtime_tool_audit_registry({})
+    events = audit_registry.get(BackendCapability.AUDIT, context)._events[
+        (
+            context.mode,
+            context.org_id,
+            context.workspace_id,
+            context.user_id,
+            context.conversation_id,
+            context.agent_profile_id,
+            context.project_id,
+            context.run_id,
+            context.job_id,
+        )
+    ]
+    tool_events = [event for event in events if event["action"] == "tool.runtime_audit_dummy"]
+    assert result == '{"ok": true, "path": "/Users/derek/private.txt", "token": "secret-token"}'
+    assert tool_events[-1]["success"] is True
+    assert tool_events[-1]["tool_name"] == "runtime_audit_dummy"
+    assert "secret-token" not in repr(tool_events)
+    assert "/Users/derek" not in repr(tool_events)

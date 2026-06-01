@@ -58,6 +58,27 @@ def _ra():
     return run_agent
 
 
+def _record_runtime_tool_audit_safely(agent, function_name: str, function_args: dict, *, success: bool, task_id: str, tool_call_id: str | None, duration_ms: int, result, error=None) -> None:
+    try:
+        from model_tools import _record_runtime_tool_audit
+        result_text = result if isinstance(result, str) else str(result)
+        error_text = error if isinstance(error, str) else (str(error) if error is not None else None)
+        _record_runtime_tool_audit(
+            function_name,
+            function_args,
+            success=success,
+            task_id=task_id,
+            session_id=getattr(agent, "session_id", None) or "",
+            tool_call_id=tool_call_id,
+            duration_ms=duration_ms,
+            result=result_text,
+            error=error_text,
+            runtime_context=getattr(agent, "runtime_context", None),
+        )
+    except Exception:
+        pass
+
+
 def _tool_search_scoped_names(agent) -> frozenset:
     """Return the deferrable tool names the session may invoke via tool_call.
 
@@ -268,6 +289,17 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     results = [None] * num_tools
     for i, (tc, name, args, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
         if block_result is not None:
+            _record_runtime_tool_audit_safely(
+                agent,
+                name,
+                args,
+                success=False,
+                task_id=effective_task_id,
+                tool_call_id=tc.id,
+                duration_ms=0,
+                result=block_result,
+                error=block_result,
+            )
             results[i] = (name, args, block_result, 0.0, True, True)
 
     # Touch activity before launching workers so the gateway knows
@@ -320,6 +352,17 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
             duration = time.time() - start
             is_error, _ = _detect_tool_failure(function_name, result)
+            _record_runtime_tool_audit_safely(
+                agent,
+                function_name,
+                function_args,
+                success=not is_error,
+                task_id=effective_task_id,
+                tool_call_id=tool_call.id,
+                duration_ms=int(duration * 1000),
+                result=result,
+                error=result if is_error else None,
+            )
             if is_error:
                 logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
             else:
@@ -897,6 +940,17 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Log tool errors to the persistent error log so [error] tags
         # in the UI always have a corresponding detailed entry on disk.
         _is_error_result, _ = _detect_tool_failure(function_name, function_result)
+        _record_runtime_tool_audit_safely(
+            agent,
+            function_name,
+            function_args,
+            success=not _is_error_result,
+            task_id=effective_task_id,
+            tool_call_id=tool_call.id,
+            duration_ms=int(tool_duration * 1000),
+            result=function_result,
+            error=function_result if _is_error_result else None,
+        )
         if not _execution_blocked:
             function_result = agent._append_guardrail_observation(
                 function_name,

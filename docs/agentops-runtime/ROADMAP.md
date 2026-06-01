@@ -20,7 +20,7 @@ This is not a wrapper that injects memory around Hermes. The native Hermes surfa
 6. **Cloud agnostic.** AWS is likely the first production adapter, but no core interface should name ECS, SQS, DynamoDB, Secrets Manager, etc.
 7. **DB agnostic at the contract level, optimized at the adapter level.** Do not force lowest-common-denominator data modeling; Postgres, SQLite, DynamoDB, etc. can implement the same contracts differently.
 8. **Secret-store agnostic.** Local env files, encrypted local stores, AWS Secrets Manager, GCP Secret Manager, Vault, and future stores are implementations of a credential/secret resolver contract.
-9. **Remote cron is mandatory.** Cron/autonomous jobs are part of Hermes’s identity; they need remote storage, leases, delivery targeting, worker execution, and local fallback.
+9. **Remote cron is mandatory.** Cron/autonomous jobs are part of Hermes’s identity; they need remote storage, leases, delivery targeting, worker execution, and local fallback. Cron locking must be per job/run/lease, not one global scheduler-execution lock: a long-running autonomous coding job may prevent another run of that same job, but must not starve unrelated lightweight watchdog/script jobs that are due on their own schedules.
 10. **Tenant isolation beats convenience.** Cross-user/org/project/thread memory, skill, credential, cron, or session leakage is an MVP blocker.
 11. **Warm workers are an optimization, remote state is authoritative.** Conversation runs may stay warm until idle timeout, but all durable state must survive worker death.
 12. **Infrastructure provisioning is separate from application activation.** Terraform/OpenTofu should create inert cloud resources and output URLs/refs; a bootstrap UI/CLI should store integration secrets, configure policies, run migrations, and prove the system works.
@@ -318,6 +318,13 @@ event/job arrives
 → exit
 ```
 
+Cron concurrency invariant:
+
+- Scheduler coordination may briefly claim due work atomically, but it must not hold a global execution lock while jobs run.
+- Each cron firing is protected by a scoped lease/idempotency key so duplicate execution is prevented per job/firing.
+- Long-running cron jobs, including repo/workdir agent jobs, only serialize against conflicting jobs for the same scoped resource; unrelated `no_agent` script/watchdog jobs continue to fire on time.
+- Tests must cover the historical failure mode where a long workdir/autonomous builder job is active while a separate script-only watchdog becomes due; the watchdog must still be claimed and executed without waiting for the builder to finish.
+
 ## Required backend contracts
 
 ### Backend registry
@@ -612,9 +619,9 @@ Required semantics:
 
 ### M10. Artifact and audit backends
 
-**Status:** Started
+**Status:** Done
 
-**Autonomous run note (2026-06-01):** Began the artifact/audit backend slice with `agent/runtime_artifacts_audit.py`. Added local durable file-backed artifact and audit backends scoped by `RuntimeContext`, provider-neutral HTTP artifact/audit adapters for remote control-plane profiles, registry registration helpers, path-escape rejection for artifact refs, RuntimeContext scope serialization, and recursive audit sanitization for secret-like keys and local path fields. Focused tests cover local artifact durability/isolation, unsafe ref rejection, sanitized local audit JSONL persistence, and remote HTTP registry selection without leaking bearer tokens into payloads. Remaining before M10 can be marked `Done`: wire these backends into the native Hermes runtime paths so audit events are emitted for every required surface (memory writes, skill loads/mutations, credential resolutions, cron runs, session events, worker lifecycle, queue/lease events, delivery events, and tool calls) and add regression tests for those end-to-end event emissions.
+**Completion note (2026-06-01):** Completed the artifact/audit backend slice. `agent/runtime_artifacts_audit.py` provides local durable file-backed artifact and audit backends scoped by `RuntimeContext`, provider-neutral HTTP artifact/audit adapters for remote control-plane profiles, registry registration helpers, path-escape rejection for artifact refs, RuntimeContext scope serialization, and recursive audit sanitization for secret-like keys, secret-like/path-bearing text, and local path fields. `RuntimeBackendRegistry` now instruments selected native backend methods in-place while preserving backend object identity for mutable local/native adapters, falling back to a proxy only when protocol-compatible slotted adapters cannot be mutated, so the selected audit backend receives events for memory writes, skill list/load/mutation, session events, cron scheduling/run/lease operations, queue operations, run leases, conversation routing, worker registry lifecycle, artifact access, and delivery. `model_tools.handle_function_call` records sanitized tool-call audit events for direct scoped tool dispatches, and `agent/tool_executor.py` records scoped audit events for normal sequential/concurrent agent tool paths, including agent-level tools and denied attempts. Credential resolution already records through `RuntimeCredentialBroker`, and worker lifecycle/run failures continue to record through `LocalRunSupervisor`; existing supervisor tests were updated to tolerate the additional backend-level audit events. Tests prove local artifact durability/isolation, unsafe ref and symlink rejection, sanitized local audit JSONL persistence, HTTP artifact/audit registry selection without leaking bearer tokens into payloads, path/secret redaction (including failure exception/result-preview text and audit-backend boundary sanitization), tool-call audit emission, shared/slotted backend compatibility, and required runtime-surface audit event emission. Test evidence: `python -m pytest tests/agent/test_runtime_artifacts_audit.py tests/agent/test_runtime_backends.py tests/agent/test_runtime_supervisor.py tests/agent/test_runtime_credentials.py tests/tools/test_memory_tool.py tests/tools/test_skills_runtime_backend.py tests/tools/test_skill_manager_runtime_backend.py tests/test_model_tools.py tests/test_transform_tool_result_hook.py -q` → 206 passed; `python -m ruff check agent/runtime_backends.py agent/runtime_artifacts_audit.py model_tools.py agent/tool_executor.py tests/agent/test_runtime_artifacts_audit.py tests/agent/test_runtime_supervisor.py` → passed; `git diff --check` → passed.
 
 **Goal:** Centralize durable artifacts and audit trails for distributed runs.
 
@@ -640,6 +647,7 @@ Required semantics:
 - Per-conversation turns are processed sequentially or explicitly queued while a run is busy.
 - Worker drain prevents new claims and gracefully finishes, checkpoints, or releases active runs before shutdown.
 - Expired leases allow recovery after worker death.
+- Cron/job execution uses per-job/per-firing leases rather than a global run lock, so unrelated scheduled jobs can run concurrently; a long repo/workdir autonomous builder cannot block a lightweight watchdog job that becomes due later.
 - Same lifecycle works in local-multi, compose-self-hosted, and AWS adapter profiles.
 
 ### M12. Compose self-hosted distributed MVP
@@ -787,6 +795,14 @@ Schedule cron:
   org=acme/project=x daily summary
 
 Two schedulers/workers are running, but only one claims the job.
+
+Schedule two unrelated cron jobs:
+  repo autonomous builder every 5m, long-running, workdir-scoped
+  lightweight script watchdog every 10m, no_agent/script-only
+
+While the builder is still running:
+  the next watchdog firing is still claimed and executed on time
+  the builder does not start a duplicate overlapping builder run
 
 Restart a worker between turns:
   conversation resumes from remote/local-durable state.

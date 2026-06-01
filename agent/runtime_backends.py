@@ -29,6 +29,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import threading
 import time
 from datetime import datetime
@@ -38,7 +39,13 @@ from typing import Any, Callable, Mapping, Protocol, runtime_checkable
 from agent.runtime_context import RuntimeContext
 
 _DEFAULT_PROFILE = "local"
-_SENSITIVE_EVENT_KEYS = ("secret", "token", "password", "api_key", "apikey", "credential")
+_SENSITIVE_EVENT_KEYS = ("secret", "token", "password", "api_key", "apikey", "credential", "authorization", "auth")
+_PATH_EVENT_KEYS = ("path", "file", "filename", "dirname", "cwd", "workdir", "directory")
+_SENSITIVE_TEXT_PATTERN = re.compile(
+    r"(?i)\b(secret|token|password|api[_-]?key|x-api-key|credential|authorization|auth)\b[\"']?\s*[:=]\s*[\"']?[^\"'\s,;}]+"
+)
+_BEARER_TEXT_PATTERN = re.compile(r"(?i)(bearer\s+)[a-z0-9._~+/=-]+")
+_PATH_TEXT_PATTERN = re.compile(r"(?:/Users/[^\s,;]+|/private/[^\s,;]+|/tmp/[^\s,;]+)")
 _CRON_SILENT_MARKERS = ("[SILENT]",)
 # Context fields safe to bind into a durable cron job record. Secret-bearing
 # refs (``permissions_ref``) and per-execution identifiers (``run_id``) are
@@ -226,16 +233,42 @@ def _cron_scope_key(context: RuntimeContext | None) -> tuple[Any, ...]:
 def _redact_audit_value(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {
-            str(key): "[REDACTED]"
-            if any(marker in str(key).lower() for marker in _SENSITIVE_EVENT_KEYS) and item is not None
-            else _redact_audit_value(item)
+            str(key): _redact_audit_mapping_item(str(key), item)
             for key, item in value.items()
         }
     if isinstance(value, list):
         return [_redact_audit_value(item) for item in value]
     if isinstance(value, tuple):
         return tuple(_redact_audit_value(item) for item in value)
+    if isinstance(value, str):
+        return _redact_audit_text(value)
     return value
+
+
+def _redact_audit_text(value: str) -> str:
+    value = _BEARER_TEXT_PATTERN.sub(lambda match: f"{match.group(1)}[REDACTED]", value)
+    value = _SENSITIVE_TEXT_PATTERN.sub(lambda match: f"{match.group(1)}=[REDACTED]", value)
+    return _PATH_TEXT_PATTERN.sub("[REDACTED_PATH]", value)
+
+
+def _redact_audit_mapping_item(key: str, value: Any) -> Any:
+    lowered = key.lower()
+    normalized = "".join(ch for ch in lowered if ch.isalnum())
+    if value is not None and (
+        any(marker in lowered for marker in _SENSITIVE_EVENT_KEYS)
+        or any("".join(ch for ch in marker if ch.isalnum()) in normalized for marker in _SENSITIVE_EVENT_KEYS)
+    ):
+        return "[REDACTED]"
+    if value is not None and (
+        any(marker == lowered or lowered.endswith(f"_{marker}") for marker in _PATH_EVENT_KEYS)
+        or any("".join(ch for ch in marker if ch.isalnum()) in normalized for marker in _PATH_EVENT_KEYS)
+    ):
+        return "[REDACTED_PATH]"
+    if isinstance(value, str):
+        if lowered == "ref" or lowered.endswith("_ref"):
+            return value
+        return _redact_audit_text(value)
+    return _redact_audit_value(value)
 
 
 class BackendCapability(str, Enum):
@@ -254,6 +287,41 @@ class BackendCapability(str, Enum):
     ARTIFACT = "artifact"
     AUDIT = "audit"
     DELIVERY = "delivery"
+
+
+_AUDITED_BACKEND_METHODS: dict[BackendCapability, tuple[str, ...]] = {
+    BackendCapability.MEMORY: ("write",),
+    BackendCapability.SKILL: ("list_skills", "load_skill", "manage_skill"),
+    BackendCapability.SESSION: (
+        "create_session",
+        "append_message",
+        "read_messages",
+        "append",
+        "read",
+        "search",
+        "claim_turn_lock",
+        "renew_turn_lock",
+        "release_turn_lock",
+    ),
+    BackendCapability.CRON: (
+        "create",
+        "update",
+        "pause",
+        "resume",
+        "remove",
+        "claim_due",
+        "renew_lease",
+        "release_lease",
+        "complete_run",
+        "fail_run",
+    ),
+    BackendCapability.QUEUE: ("enqueue", "claim", "ack", "nack", "extend_lease"),
+    BackendCapability.RUN_LEASE: ("claim", "renew", "release", "expire_stale"),
+    BackendCapability.CONVERSATION_ROUTER: ("resolve_conversation", "find_active_run", "route_turn"),
+    BackendCapability.WORKER_REGISTRY: ("register", "heartbeat", "mark_draining", "recover_expired"),
+    BackendCapability.ARTIFACT: ("put", "get", "list_artifacts"),
+    BackendCapability.DELIVERY: ("deliver",),
+}
 
 
 REQUIRED_CAPABILITIES: frozenset[BackendCapability] = frozenset(BackendCapability)
@@ -1305,6 +1373,53 @@ def _coerce_capability(capability: BackendCapability | str) -> BackendCapability
         raise BackendSelectionError(f"Unknown backend capability: {capability!r}") from exc
 
 
+class _AuditedBackendProxy:
+    """Audit wrapper used only for backend instances that cannot be mutated in place."""
+
+    def __init__(
+        self,
+        registry: "RuntimeBackendRegistry",
+        capability: BackendCapability,
+        instance: Any,
+        method_names: tuple[str, ...],
+    ) -> None:
+        self._runtime_audit_registry = registry
+        self._runtime_audit_capability = capability
+        self._runtime_audit_instance = instance
+        self._runtime_audit_method_names = method_names
+
+    def __getattr__(self, name: str) -> Any:
+        original_methods = getattr(self._runtime_audit_instance, "_runtime_audit_original_methods", {})
+        attr = original_methods.get(name) if isinstance(original_methods, dict) else None
+        if attr is None:
+            attr = getattr(self._runtime_audit_instance, name)
+        if name not in self._runtime_audit_method_names or not callable(attr):
+            return attr
+
+        def audited_method(*args: Any, **kwargs: Any) -> Any:
+            context = args[0] if args and (args[0] is None or isinstance(args[0], RuntimeContext)) else kwargs.get("context")
+            try:
+                result = attr(*args, **kwargs)
+            except Exception as exc:
+                self._runtime_audit_registry._record_backend_audit(
+                    self._runtime_audit_capability,
+                    name,
+                    context,
+                    success=False,
+                    error=exc,
+                )
+                raise
+            self._runtime_audit_registry._record_backend_audit(
+                self._runtime_audit_capability,
+                name,
+                context,
+                success=True,
+            )
+            return result
+
+        return audited_method
+
+
 class RuntimeBackendRegistry:
     """Selects a concrete backend per capability by config + RuntimeContext.
 
@@ -1377,6 +1492,70 @@ class RuntimeBackendRegistry:
                 return capability_options
         return {}
 
+    def _instrument_for_audit(self, capability: BackendCapability, instance: Any) -> Any:
+        method_names = _AUDITED_BACKEND_METHODS.get(capability)
+        if not method_names:
+            return instance
+        registry_id = id(self)
+        wrapped_registry_id = getattr(instance, "_runtime_audit_registry_id", None)
+        if wrapped_registry_id is not None and wrapped_registry_id != registry_id:
+            return _AuditedBackendProxy(self, capability, instance, method_names)
+        wrapped = set(getattr(instance, "_runtime_audit_wrapped_methods", set()))
+        original_methods = dict(getattr(instance, "_runtime_audit_original_methods", {}))
+        for method_name in method_names:
+            if method_name in wrapped or not hasattr(instance, method_name):
+                continue
+            original = getattr(instance, method_name)
+            if not callable(original):
+                continue
+
+            original_methods.setdefault(method_name, original)
+            def audited_method(*args: Any, _method_name: str = method_name, _original: Callable[..., Any] = original, **kwargs: Any) -> Any:
+                context = args[0] if args and (args[0] is None or isinstance(args[0], RuntimeContext)) else kwargs.get("context")
+                try:
+                    result = _original(*args, **kwargs)
+                except Exception as exc:
+                    self._record_backend_audit(capability, _method_name, context, success=False, error=exc)
+                    raise
+                self._record_backend_audit(capability, _method_name, context, success=True)
+                return result
+
+            try:
+                setattr(instance, method_name, audited_method)
+            except (AttributeError, TypeError):
+                return _AuditedBackendProxy(self, capability, instance, method_names)
+            wrapped.add(method_name)
+        try:
+            setattr(instance, "_runtime_audit_wrapped_methods", wrapped)
+            setattr(instance, "_runtime_audit_original_methods", original_methods)
+            setattr(instance, "_runtime_audit_registry_id", registry_id)
+        except Exception:
+            return instance
+        return instance
+
+    def _record_backend_audit(
+        self,
+        capability: BackendCapability,
+        method_name: str,
+        context: RuntimeContext | None,
+        *,
+        success: bool,
+        error: Exception | None = None,
+    ) -> None:
+        try:
+            audit = self.get(BackendCapability.AUDIT, context)
+            event: dict[str, Any] = {
+                "action": f"{capability.value}.{method_name}",
+                "capability": capability.value,
+                "method": method_name,
+                "success": success,
+            }
+            if error is not None:
+                event["error"] = f"{type(error).__name__}: {error}"
+            audit.record(context, _redact_audit_value(event))
+        except Exception:
+            return None
+
     def get(
         self,
         capability: BackendCapability | str,
@@ -1398,5 +1577,6 @@ class RuntimeBackendRegistry:
                     f"profile {profile!r}. Available profiles: {available}."
                 )
             instance = factory(self._capability_options(cap))
+            instance = self._instrument_for_audit(cap, instance)
             self._instances[cache_key] = instance
             return instance

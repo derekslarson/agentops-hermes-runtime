@@ -23,6 +23,7 @@ from agent.runtime_backends import (
     BackendCapability,
     BackendSelectionError,
     RuntimeBackendRegistry,
+    _redact_audit_text,
 )
 from agent.runtime_context import RuntimeContext
 
@@ -141,6 +142,8 @@ def _sanitize_audit_value(value: Any, *, key: str | None = None) -> Any:
         return [_sanitize_audit_value(item) for item in value]
     if isinstance(value, tuple):
         return [_sanitize_audit_value(item) for item in value]
+    if isinstance(value, str):
+        return _redact_audit_text(value)
     return value
 
 
