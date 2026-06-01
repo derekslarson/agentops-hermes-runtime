@@ -25,6 +25,7 @@ import multiprocessing
 import os
 import pickle
 import re
+import signal
 import tempfile
 import threading
 import time
@@ -162,6 +163,11 @@ def _execute_run_from_context_data(
 def _execute_fn_to_result_file(context_data: Mapping[str, Any], fn: Callable[[], Any], result_path: str) -> None:
     """Execute a user callable in a standalone process and pickle a small outcome tuple."""
 
+    if hasattr(os, "setsid"):
+        try:
+            os.setsid()
+        except OSError:
+            pass
     context = RuntimeContext(**dict(context_data))
     try:
         with use_runtime_context(context):
@@ -512,12 +518,41 @@ class LocalRunSupervisor:
         future.set_result(RunResult(status=RunStatus.FAILED, context=context, error=error))
         return RunHandle(context=context, _future=future)
 
+    @staticmethod
+    def _terminate_process_tree(process: Any) -> None:
+        """Terminate a process-isolated run and any user-spawned descendants."""
+
+        pid = process.pid
+        if pid is not None and hasattr(os, "killpg"):
+            try:
+                os.killpg(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                process.terminate()
+        else:
+            process.terminate()
+        process.join(timeout=1.0)
+        if not process.is_alive():
+            return
+        if pid is not None and hasattr(os, "killpg"):
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                process.kill()
+        else:
+            process.kill()
+        process.join(timeout=1.0)
+
     def _run_callable_in_process_until_timeout(
         self,
         context: RuntimeContext,
         fn: Callable[[], Any],
         *,
         max_runtime_seconds: float,
+        cancel_requested: Callable[[], bool] | None = None,
     ) -> tuple[str, Any | None, str | None]:
         """Run user code in a child process and terminate it at max runtime.
 
@@ -546,13 +581,21 @@ class LocalRunSupervisor:
             except FileNotFoundError:
                 pass
             return ("error", None, f"could not start child process: {type(exc).__name__}: {exc}")
-        process.join(timeout=max_runtime_seconds)
+        deadline = time.monotonic() + max_runtime_seconds
+        while process.is_alive():
+            if cancel_requested is not None and cancel_requested():
+                self._terminate_process_tree(process)
+                try:
+                    os.unlink(result_path)
+                except FileNotFoundError:
+                    pass
+                return ("cancelled", None, "run was cancelled")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            process.join(timeout=min(0.05, remaining))
         if process.is_alive():
-            process.terminate()
-            process.join(timeout=1.0)
-            if process.is_alive():
-                process.kill()
-                process.join(timeout=1.0)
+            self._terminate_process_tree(process)
             try:
                 os.unlink(result_path)
             except FileNotFoundError:
@@ -605,6 +648,15 @@ class LocalRunSupervisor:
         key = lease_key or context.job_id or context.run_id or "run"
         with self._lock:
             self._cancelled_runs.add(_run_control_key(context, key))
+        if self._registry is not None:
+            lease_context = _run_lease_context(context, key)
+            try:
+                lease = self._registry.get(BackendCapability.RUN_LEASE, lease_context)
+                request_cancel = getattr(lease, "request_cancel", None)
+                if callable(request_cancel):
+                    request_cancel(lease_context, key, requester=self.worker_id)
+            except Exception:
+                pass
         _record_audit(self._registry, context, self.worker_id, RunStatus.CANCELLED, error="run cancellation requested")
         return RunResult(status=RunStatus.CANCELLED, context=context, error="run cancellation requested")
 
@@ -697,6 +749,16 @@ class LocalRunSupervisor:
         lease_context = _run_lease_context(context, key)
         owner = f"{self.worker_id}:{uuid.uuid4().hex}"
         lease = self._registry.get(BackendCapability.RUN_LEASE, lease_context)
+
+        def durable_cancel_requested() -> bool:
+            is_cancelled = getattr(lease, "is_cancelled", None)
+            return bool(callable(is_cancelled) and is_cancelled(lease_context, key))
+
+        def clear_durable_cancel() -> None:
+            clear_cancelled = getattr(lease, "clear_cancelled", None)
+            if callable(clear_cancelled):
+                clear_cancelled(lease_context, key)
+
         lease_clock = clock or time.time
         claim_now = now if now is not None else lease_clock()
         if not lease.claim(lease_context, key, owner=owner, now=claim_now, lease_seconds=lease_seconds):
@@ -706,8 +768,9 @@ class LocalRunSupervisor:
                 error=f"run lease {key!r} is held by another owner",
             )
         with self._lock:
-            if cancel_key in self._cancelled_runs:
+            if cancel_key in self._cancelled_runs or durable_cancel_requested():
                 self._cancelled_runs.discard(cancel_key)
+                clear_durable_cancel()
                 try:
                     lease.release(lease_context, key, owner=owner)
                 except Exception:
@@ -727,7 +790,14 @@ class LocalRunSupervisor:
                         context,
                         fn,
                         max_runtime_seconds=max_runtime_seconds,
+                        cancel_requested=lambda: cancel_key in self._cancelled_runs or durable_cancel_requested(),
                     )
+                    if outcome == "cancelled":
+                        with self._lock:
+                            self._cancelled_runs.discard(cancel_key)
+                            clear_durable_cancel()
+                        _record_audit(self._registry, context, self.worker_id, RunStatus.CANCELLED, error="run was cancelled")
+                        return RunResult(status=RunStatus.CANCELLED, context=context, error="run was cancelled")
                     if outcome != "ok":
                         with self._lock:
                             self._cancelled_runs.discard(cancel_key)
@@ -746,8 +816,10 @@ class LocalRunSupervisor:
                             _record_audit(self._registry, context, self.worker_id, RunStatus.FAILED, error=audit_error)
                             return RunResult(status=RunStatus.FAILED, context=context, error=error)
             with self._lock:
-                was_cancelled = cancel_key in self._cancelled_runs
+                was_cancelled = cancel_key in self._cancelled_runs or durable_cancel_requested()
                 self._cancelled_runs.discard(cancel_key)
+                if was_cancelled:
+                    clear_durable_cancel()
             if was_cancelled:
                 _record_audit(self._registry, context, self.worker_id, RunStatus.CANCELLED, error="run was cancelled")
                 return RunResult(status=RunStatus.CANCELLED, context=context, error="run was cancelled")

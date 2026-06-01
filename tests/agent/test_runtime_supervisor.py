@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import copy
 import os
+import subprocess
+import sys
 import threading
 import time
 from typing import Any, Mapping
+
+import pytest
 
 from agent.runtime_backends import BackendCapability, LocalAuditBackend, LocalRunLeaseBackend, RuntimeBackendRegistry
 from agent.runtime_context import RuntimeContext, get_current_runtime_context
@@ -40,6 +44,29 @@ def _subprocess_pid_and_context() -> dict[str, str | int | None]:
 
 def _sleep_past_process_max_runtime() -> str:
     time.sleep(1.0)
+    return "finished-too-late"
+
+
+def _spawn_grandchild_then_sleep_past_process_max_runtime() -> str:
+    marker_path = os.environ["HERMES_TEST_GRANDCHILD_MARKER"]
+    started_path = os.environ.get("HERMES_TEST_GRANDCHILD_STARTED")
+    subprocess.Popen(  # noqa: S603 - test helper launches current Python with fixed code
+        [
+            sys.executable,
+            "-c",
+            (
+                "import pathlib, time; "
+                "time.sleep(0.8); "
+                f"pathlib.Path({marker_path!r}).write_text('grandchild-survived')"
+            ),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if started_path:
+        with open(started_path, "w", encoding="utf-8") as handle:
+            handle.write("started")
+    time.sleep(2.0)
     return "finished-too-late"
 
 
@@ -1445,6 +1472,28 @@ def test_process_isolated_run_to_completion_terminates_when_max_runtime_expires(
     supervisor.shutdown()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups are required for descendant cleanup")
+def test_process_isolated_run_to_completion_cleans_up_user_spawned_process_tree(tmp_path, monkeypatch):
+    registry = RuntimeBackendRegistry()
+    supervisor = LocalRunSupervisor(worker_id="worker-rtc-process-tree", registry=registry, run_isolation="process")
+    context = _job_context("run-rtc-process-tree", job_id="job-rtc-process-tree")
+    marker = tmp_path / "grandchild-survived.txt"
+    monkeypatch.setenv("HERMES_TEST_GRANDCHILD_MARKER", str(marker))
+
+    result = supervisor.run_to_completion(
+        context,
+        _spawn_grandchild_then_sleep_past_process_max_runtime,
+        lease_seconds=30.0,
+        max_runtime_seconds=0.2,
+    )
+    time.sleep(1.1)
+
+    assert result.status is RunStatus.FAILED
+    assert result.error == "run exceeded max runtime of 0.2 seconds"
+    assert not marker.exists()
+    supervisor.shutdown()
+
+
 def test_process_isolated_run_to_completion_fails_when_result_cannot_cross_process_boundary():
     registry = RuntimeBackendRegistry()
     supervisor = LocalRunSupervisor(worker_id="worker-rtc-process-unpickleable", registry=registry, run_isolation="process")
@@ -1531,6 +1580,67 @@ def test_run_to_completion_reports_cancel_requested_while_active():
     assert cancel_result.status is RunStatus.CANCELLED
     assert result.status is RunStatus.CANCELLED
     assert result.error == "run was cancelled"
+
+
+def test_run_to_completion_observes_fleet_visible_cancel_requested_by_another_worker():
+    registry = RuntimeBackendRegistry()
+    active_worker = LocalRunSupervisor(worker_id="worker-rtc-cancel-active", registry=registry)
+    control_worker = LocalRunSupervisor(worker_id="worker-rtc-cancel-control", registry=registry)
+    context = _job_context("run-rtc-fleet-cancel", job_id="job-rtc-fleet-cancel")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def active_run():
+        entered.set()
+        release.wait(timeout=2)
+        return "would-have-finished"
+
+    handle = active_worker.submit_run_to_completion(context, active_run, lease_seconds=30.0)
+    assert entered.wait(timeout=2)
+
+    cancel_result = control_worker.cancel_run(context)
+    release.set()
+    result = handle.result(timeout=2)
+
+    assert cancel_result.status is RunStatus.CANCELLED
+    assert result.status is RunStatus.CANCELLED
+    assert result.error == "run was cancelled"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups are required for descendant cleanup")
+def test_process_isolated_run_to_completion_cancel_terminates_user_spawned_process_tree(tmp_path, monkeypatch):
+    registry = RuntimeBackendRegistry()
+    active_worker = LocalRunSupervisor(
+        worker_id="worker-rtc-process-cancel-active", registry=registry, run_isolation="process"
+    )
+    control_worker = LocalRunSupervisor(worker_id="worker-rtc-process-cancel-control", registry=registry)
+    context = _job_context("run-rtc-process-cancel", job_id="job-rtc-process-cancel")
+    marker = tmp_path / "grandchild-survived-after-cancel.txt"
+    started = tmp_path / "child-started.txt"
+    monkeypatch.setenv("HERMES_TEST_GRANDCHILD_MARKER", str(marker))
+    monkeypatch.setenv("HERMES_TEST_GRANDCHILD_STARTED", str(started))
+
+    handle = active_worker.submit_run_to_completion(
+        context,
+        _spawn_grandchild_then_sleep_past_process_max_runtime,
+        lease_seconds=30.0,
+        max_runtime_seconds=1.5,
+    )
+    deadline = time.monotonic() + 2.0
+    while not started.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert started.exists()
+
+    cancel_result = control_worker.cancel_run(context)
+    result = handle.result(timeout=2)
+    time.sleep(1.1)
+
+    assert cancel_result.status is RunStatus.CANCELLED
+    assert result.status is RunStatus.CANCELLED
+    assert result.error == "run was cancelled"
+    assert not marker.exists()
+    active_worker.shutdown()
+    control_worker.shutdown()
 
 
 def test_run_to_completion_lifecycle_uses_selected_backends_across_deployment_profiles():

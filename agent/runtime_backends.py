@@ -316,7 +316,15 @@ _AUDITED_BACKEND_METHODS: dict[BackendCapability, tuple[str, ...]] = {
         "fail_run",
     ),
     BackendCapability.QUEUE: ("enqueue", "claim", "ack", "nack", "extend_lease"),
-    BackendCapability.RUN_LEASE: ("claim", "renew", "release", "expire_stale"),
+    BackendCapability.RUN_LEASE: (
+        "claim",
+        "renew",
+        "release",
+        "request_cancel",
+        "is_cancelled",
+        "clear_cancelled",
+        "expire_stale",
+    ),
     BackendCapability.CONVERSATION_ROUTER: ("resolve_conversation", "find_active_run", "route_turn"),
     BackendCapability.WORKER_REGISTRY: ("register", "heartbeat", "mark_draining", "recover_expired", "list_workers"),
     BackendCapability.ARTIFACT: ("put", "get", "list_artifacts"),
@@ -611,6 +619,12 @@ class RunLeaseBackend(Protocol):
     ) -> bool: ...
 
     def release(self, context: RuntimeContext | None, key: str, *, owner: str) -> None: ...
+
+    def request_cancel(self, context: RuntimeContext | None, key: str, *, requester: str) -> None: ...
+
+    def is_cancelled(self, context: RuntimeContext | None, key: str) -> bool: ...
+
+    def clear_cancelled(self, context: RuntimeContext | None, key: str) -> None: ...
 
     def expire_stale(self, context: RuntimeContext | None, *, now: float | None = None) -> int: ...
 
@@ -1263,6 +1277,7 @@ class LocalQueueBackend:
 class LocalRunLeaseBackend:
     def __init__(self) -> None:
         self._owners: dict[tuple[Any, ...], dict[str, tuple[str, float | None]]] = {}
+        self._cancelled: dict[tuple[Any, ...], set[str]] = {}
         self._lock = threading.RLock()
 
     def claim(
@@ -1315,6 +1330,24 @@ class LocalRunLeaseBackend:
             current = owners.get(key)
             if current is not None and current[0] == owner:
                 owners.pop(key, None)
+
+    def request_cancel(self, context: RuntimeContext | None, key: str, *, requester: str) -> None:
+        del requester
+        with self._lock:
+            self._cancelled.setdefault(_runtime_scope_key(context), set()).add(key)
+
+    def is_cancelled(self, context: RuntimeContext | None, key: str) -> bool:
+        with self._lock:
+            return key in self._cancelled.get(_runtime_scope_key(context), set())
+
+    def clear_cancelled(self, context: RuntimeContext | None, key: str) -> None:
+        with self._lock:
+            cancelled = self._cancelled.get(_runtime_scope_key(context))
+            if cancelled is None:
+                return
+            cancelled.discard(key)
+            if not cancelled:
+                self._cancelled.pop(_runtime_scope_key(context), None)
 
     def expire_stale(self, context: RuntimeContext | None, *, now: float | None = None) -> int:
         clock = time.time() if now is None else now
