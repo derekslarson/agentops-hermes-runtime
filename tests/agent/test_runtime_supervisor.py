@@ -491,6 +491,285 @@ def test_supervisor_process_turn_blocks_concurrent_same_worker_turn_until_lock_r
     assert [message["content"] for message in backend.read_messages(context)] == ["first inbound", "first done"]
 
 
+def test_supervisor_submit_turn_queues_busy_same_conversation_in_order():
+    backend = _FakeRemoteSessionBackend()
+    registry = RuntimeBackendRegistry()
+    registry.register(BackendCapability.SESSION, lambda options: backend, profile="compose-self-hosted")
+    supervisor = LocalRunSupervisor(worker_id="worker-turn-queue", max_concurrent_runs=2, registry=registry)
+    context = _remote_context("run-queued", conversation_id="thread-queued")
+    first_handler_entered = threading.Event()
+    release_first_handler = threading.Event()
+    second_seen: list[list[str]] = []
+
+    def first_handler(transcript):
+        first_handler_entered.set()
+        release_first_handler.wait(timeout=2)
+        return {"role": "assistant", "content": "first response"}
+
+    first = supervisor.submit_turn(context, {"role": "user", "content": "first inbound"}, first_handler)
+    assert first_handler_entered.wait(timeout=2)
+    second = supervisor.submit_turn(
+        context,
+        {"role": "user", "content": "second inbound"},
+        lambda transcript: second_seen.append([message["content"] for message in transcript])
+        or {"role": "assistant", "content": "second response"},
+    )
+
+    time.sleep(0.02)
+    assert not second.done()
+    release_first_handler.set()
+
+    assert first.result(timeout=2).status is RunStatus.SUCCEEDED
+    assert second.result(timeout=2).status is RunStatus.SUCCEEDED
+    assert second_seen == [["first inbound", "first response", "second inbound"]]
+    assert [message["content"] for message in backend.read_messages(context)] == [
+        "first inbound",
+        "first response",
+        "second inbound",
+        "second response",
+    ]
+    assert supervisor._turn_queues == {}
+
+
+def test_supervisor_submit_turn_backlog_for_one_conversation_does_not_block_another_conversation():
+    backend = _FakeRemoteSessionBackend()
+    registry = RuntimeBackendRegistry()
+    registry.register(BackendCapability.SESSION, lambda options: backend, profile="compose-self-hosted")
+    supervisor = LocalRunSupervisor(worker_id="worker-turn-fairness", max_concurrent_runs=2, registry=registry)
+    busy_context = _remote_context("run-busy", conversation_id="thread-busy")
+    other_context = _remote_context("run-other", conversation_id="thread-other")
+    first_handler_entered = threading.Event()
+    release_first_handler = threading.Event()
+    other_handler_called = threading.Event()
+
+    def busy_handler(transcript):
+        first_handler_entered.set()
+        release_first_handler.wait(timeout=5)
+        return {"role": "assistant", "content": "busy response"}
+
+    first = supervisor.submit_turn(busy_context, {"role": "user", "content": "busy first"}, busy_handler)
+    assert first_handler_entered.wait(timeout=2)
+    queued_same_conversation = supervisor.submit_turn(
+        busy_context,
+        {"role": "user", "content": "busy second"},
+        lambda transcript: {"role": "assistant", "content": "busy second response"},
+    )
+
+    other = supervisor.submit_turn(
+        other_context,
+        {"role": "user", "content": "other inbound"},
+        lambda transcript: other_handler_called.set() or {"role": "assistant", "content": "other response"},
+    )
+
+    assert other_handler_called.wait(timeout=0.2)
+    assert other.result(timeout=2).status is RunStatus.SUCCEEDED
+    assert not queued_same_conversation.done()
+
+    release_first_handler.set()
+    assert first.result(timeout=2).status is RunStatus.SUCCEEDED
+    assert queued_same_conversation.result(timeout=2).status is RunStatus.SUCCEEDED
+    assert supervisor._turn_queues == {}
+
+
+def test_supervisor_drain_fails_queued_turns_without_starting_them():
+    backend = _FakeRemoteSessionBackend()
+    registry = RuntimeBackendRegistry()
+    registry.register(BackendCapability.SESSION, lambda options: backend, profile="compose-self-hosted")
+    supervisor = LocalRunSupervisor(worker_id="worker-turn-drain", max_concurrent_runs=2, registry=registry)
+    context = _remote_context("run-drain-queued", conversation_id="thread-drain-queued")
+    first_handler_entered = threading.Event()
+    release_first_handler = threading.Event()
+    queued_handler_called = threading.Event()
+
+    def first_handler(transcript):
+        first_handler_entered.set()
+        release_first_handler.wait(timeout=2)
+        return {"role": "assistant", "content": "active response"}
+
+    active = supervisor.submit_turn(context, {"role": "user", "content": "active inbound"}, first_handler)
+    assert first_handler_entered.wait(timeout=2)
+    queued = supervisor.submit_turn(
+        context,
+        {"role": "user", "content": "queued inbound"},
+        lambda transcript: queued_handler_called.set() or {"role": "assistant", "content": "must not run"},
+    )
+
+    drain_result = supervisor.request_drain()
+    release_first_handler.set()
+
+    assert drain_result.status is RunStatus.SUCCEEDED
+    assert active.result(timeout=2).status is RunStatus.SUCCEEDED
+    queued_result = queued.result(timeout=2)
+    assert queued_result.status is RunStatus.FAILED
+    assert queued_result.error == "worker is draining and cannot accept queued turn"
+    assert not queued_handler_called.is_set()
+    assert [message["content"] for message in backend.read_messages(context)] == ["active inbound", "active response"]
+    assert supervisor._turn_queues == {}
+
+
+def test_supervisor_drain_cancels_queued_turn_head_that_has_not_started():
+    backend = _FakeRemoteSessionBackend()
+    registry = RuntimeBackendRegistry()
+    registry.register(BackendCapability.SESSION, lambda options: backend, profile="compose-self-hosted")
+    supervisor = LocalRunSupervisor(worker_id="worker-drain-pending", max_concurrent_runs=1, registry=registry)
+    context = _remote_context("run-drain-pending", conversation_id="thread-drain-pending")
+    executor_busy = threading.Event()
+    release_executor = threading.Event()
+    queued_handler_called = threading.Event()
+
+    busy = supervisor.submit(
+        context,
+        lambda: executor_busy.set() or release_executor.wait(timeout=2) or "released",
+    )
+    assert executor_busy.wait(timeout=2)
+    queued = supervisor.submit_turn(
+        context,
+        {"role": "user", "content": "queued while executor saturated"},
+        lambda transcript: queued_handler_called.set() or {"role": "assistant", "content": "must not run"},
+    )
+
+    drain_result = supervisor.request_drain()
+
+    queued_result = queued.result(timeout=2)
+    assert drain_result.status is RunStatus.SUCCEEDED
+    assert queued_result.status is RunStatus.FAILED
+    assert queued_result.error == "worker is draining and cannot accept queued turn"
+    assert not queued_handler_called.is_set()
+    assert backend.read_messages(context) == []
+    assert supervisor._turn_queues == {}
+
+    release_executor.set()
+    assert busy.result(timeout=2).status is RunStatus.SUCCEEDED
+
+
+def test_supervisor_shutdown_fails_queued_turns_without_creating_replacement_executor():
+    backend = _FakeRemoteSessionBackend()
+    registry = RuntimeBackendRegistry()
+    registry.register(BackendCapability.SESSION, lambda options: backend, profile="compose-self-hosted")
+    supervisor = LocalRunSupervisor(worker_id="worker-turn-shutdown", max_concurrent_runs=2, registry=registry)
+    context = _remote_context("run-shutdown-queued", conversation_id="thread-shutdown-queued")
+    first_handler_entered = threading.Event()
+    release_first_handler = threading.Event()
+    queued_handler_called = threading.Event()
+
+    def first_handler(transcript):
+        first_handler_entered.set()
+        release_first_handler.wait(timeout=2)
+        return {"role": "assistant", "content": "active response"}
+
+    active = supervisor.submit_turn(context, {"role": "user", "content": "active inbound"}, first_handler)
+    assert first_handler_entered.wait(timeout=2)
+    queued = supervisor.submit_turn(
+        context,
+        {"role": "user", "content": "queued inbound"},
+        lambda transcript: queued_handler_called.set() or {"role": "assistant", "content": "must not run"},
+    )
+
+    release_first_handler.set()
+    supervisor.shutdown(wait=True)
+
+    assert active.result(timeout=2).status is RunStatus.SUCCEEDED
+    queued_result = queued.result(timeout=2)
+    assert queued_result.status is RunStatus.FAILED
+    assert queued_result.error == "worker is shutting down and cannot accept queued turn"
+    assert not queued_handler_called.is_set()
+    assert supervisor._executor is None
+    assert supervisor._turn_queues == {}
+
+
+def test_supervisor_shutdown_is_terminal_for_new_run_and_turn_paths():
+    registry = RuntimeBackendRegistry()
+    supervisor = LocalRunSupervisor(worker_id="worker-terminal-shutdown", registry=registry)
+    context = _remote_context("run-after-shutdown")
+
+    supervisor.shutdown(wait=True)
+
+    submitted = supervisor.submit(context, lambda: "must not run").result(timeout=2)
+    inline = supervisor.run_sync(context, lambda: "must not run")
+    turn = supervisor.process_turn(
+        context,
+        {"role": "user", "content": "must not persist"},
+        lambda transcript: {"role": "assistant", "content": "must not run"},
+    )
+
+    assert submitted.status is RunStatus.FAILED
+    assert inline.status is RunStatus.FAILED
+    assert turn.status is RunStatus.FAILED
+    assert submitted.error == "worker is shutting down and cannot accept new runs"
+    assert inline.error == "worker is shutting down and cannot accept new runs"
+    assert turn.error == "worker is shutting down and cannot accept new runs"
+
+
+def test_supervisor_shutdown_cancels_queued_turn_head_that_has_not_started():
+    backend = _FakeRemoteSessionBackend()
+    registry = RuntimeBackendRegistry()
+    registry.register(BackendCapability.SESSION, lambda options: backend, profile="compose-self-hosted")
+    supervisor = LocalRunSupervisor(worker_id="worker-cancel-pending", max_concurrent_runs=1, registry=registry)
+    context = _remote_context("run-pending-head", conversation_id="thread-pending-head")
+    executor_busy = threading.Event()
+    release_executor = threading.Event()
+    queued_handler_called = threading.Event()
+
+    busy = supervisor.submit(
+        context,
+        lambda: executor_busy.set() or release_executor.wait(timeout=2) or "released",
+    )
+    assert executor_busy.wait(timeout=2)
+    queued = supervisor.submit_turn(
+        context,
+        {"role": "user", "content": "queued while executor saturated"},
+        lambda transcript: queued_handler_called.set() or {"role": "assistant", "content": "must not run"},
+    )
+
+    supervisor.shutdown(wait=False)
+
+    queued_result = queued.result(timeout=2)
+    assert queued_result.status is RunStatus.FAILED
+    assert queued_result.error == "worker is shutting down and cannot accept queued turn"
+    assert not queued_handler_called.is_set()
+    assert backend.read_messages(context) == []
+    assert supervisor._turn_queues == {}
+
+    release_executor.set()
+    assert busy.result(timeout=2).status is RunStatus.SUCCEEDED
+
+
+def test_supervisor_submit_turn_applies_per_conversation_backpressure():
+    backend = _FakeRemoteSessionBackend()
+    registry = RuntimeBackendRegistry()
+    registry.register(BackendCapability.SESSION, lambda options: backend, profile="compose-self-hosted")
+    supervisor = LocalRunSupervisor(
+        worker_id="worker-turn-backpressure",
+        max_concurrent_runs=2,
+        registry=registry,
+        max_queued_turns_per_conversation=1,
+    )
+    context = _remote_context("run-backpressure", conversation_id="thread-backpressure")
+    first_handler_entered = threading.Event()
+    release_first_handler = threading.Event()
+
+    def first_handler(transcript):
+        first_handler_entered.set()
+        release_first_handler.wait(timeout=2)
+        return {"role": "assistant", "content": "active response"}
+
+    active = supervisor.submit_turn(context, {"role": "user", "content": "active inbound"}, first_handler)
+    assert first_handler_entered.wait(timeout=2)
+    rejected = supervisor.submit_turn(
+        context,
+        {"role": "user", "content": "overflow inbound"},
+        lambda transcript: {"role": "assistant", "content": "must not run"},
+    )
+
+    rejected_result = rejected.result(timeout=2)
+    assert rejected_result.status is RunStatus.FAILED
+    assert rejected_result.error == "conversation turn queue is full"
+
+    release_first_handler.set()
+    assert active.result(timeout=2).status is RunStatus.SUCCEEDED
+    assert supervisor._turn_queues == {}
+
+
 def test_supervisor_process_turn_releases_lock_and_preserves_raw_error_when_handler_raises():
     backend = _FakeRemoteSessionBackend()
     audit = LocalAuditBackend()

@@ -24,6 +24,7 @@ from __future__ import annotations
 import re
 import threading
 import uuid
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
@@ -130,6 +131,31 @@ def _execute_run(
 TurnHandler = Callable[[list[Any]], Mapping[str, Any] | Iterable[Mapping[str, Any]] | None]
 
 
+@dataclass(slots=True)
+class _QueuedTurn:
+    queue_key: tuple[str | None, ...]
+    context: RuntimeContext
+    message: Mapping[str, Any]
+    handler: TurnHandler
+    lock_ttl_seconds: float
+    future: Future
+    executor_future: Future | None = None
+
+
+def _turn_queue_key(context: RuntimeContext) -> tuple[str | None, ...]:
+    """Return the worker-local sequential-turn queue key for a context."""
+
+    return (
+        context.mode,
+        context.org_id,
+        context.workspace_id,
+        context.user_id,
+        context.agent_profile_id,
+        context.project_id,
+        context.conversation_id or context.run_id,
+    )
+
+
 def _normalize_outbound(outbound: Any) -> list[dict[str, Any]]:
     """Coerce a handler result into a list of message mappings to append."""
 
@@ -219,16 +245,22 @@ class LocalRunSupervisor:
         max_concurrent_runs: int = 1,
         registry: RuntimeBackendRegistry | None = None,
         capabilities: Iterable[str] | None = None,
+        max_queued_turns_per_conversation: int = 64,
     ) -> None:
         if max_concurrent_runs < 1:
             raise ValueError("max_concurrent_runs must be >= 1")
+        if max_queued_turns_per_conversation < 1:
+            raise ValueError("max_queued_turns_per_conversation must be >= 1")
         self.worker_id = worker_id
         self.max_concurrent_runs = max_concurrent_runs
+        self.max_queued_turns_per_conversation = max_queued_turns_per_conversation
         self.capabilities = tuple(capabilities or ("conversation", "event", "cron", "manual"))
         self._registry = registry
         self._lock = threading.RLock()
         self._executor: ThreadPoolExecutor | None = None
         self._draining = False
+        self._shutting_down = False
+        self._turn_queues: dict[tuple[str | None, ...], deque[_QueuedTurn]] = {}
         self._register_worker()
 
     @property
@@ -270,6 +302,8 @@ class LocalRunSupervisor:
         with self._lock:
             if self._draining:
                 return self._failed_handle(context, "worker is draining and cannot accept new runs")
+            if self._shutting_down:
+                return self._failed_handle(context, "worker is shutting down and cannot accept new runs")
             executor = self._ensure_executor()
             future = executor.submit(_execute_run, self._registry, context, self.worker_id, fn)
         return RunHandle(context=context, _future=future)
@@ -285,6 +319,8 @@ class LocalRunSupervisor:
         with self._lock:
             if self._draining:
                 return RunResult(status=RunStatus.FAILED, context=context, error="worker is draining and cannot accept new runs")
+            if self._shutting_down:
+                return RunResult(status=RunStatus.FAILED, context=context, error="worker is shutting down and cannot accept new runs")
         return _execute_run(self._registry, context, self.worker_id, fn)
 
     def process_turn(
@@ -308,6 +344,8 @@ class LocalRunSupervisor:
         with self._lock:
             if self._draining:
                 return RunResult(status=RunStatus.FAILED, context=context, error="worker is draining and cannot accept new runs")
+            if self._shutting_down:
+                return RunResult(status=RunStatus.FAILED, context=context, error="worker is shutting down and cannot accept new runs")
         return _execute_turn(
             self._registry,
             context,
@@ -316,6 +354,111 @@ class LocalRunSupervisor:
             handler,
             lock_ttl_seconds=lock_ttl_seconds,
         )
+
+    def submit_turn(
+        self,
+        context: RuntimeContext,
+        message: Mapping[str, Any],
+        handler: TurnHandler,
+        *,
+        lock_ttl_seconds: float = 300.0,
+    ) -> RunHandle:
+        """Queue one scoped conversation turn on the worker pool.
+
+        Unlike :meth:`process_turn`, which is an immediate/synchronous helper,
+        this method serializes turns for the same conversation before scheduling
+        the next same-conversation turn onto the bounded executor. A hot
+        conversation backlog therefore cannot consume all worker slots while it
+        waits, and different conversations can still run independently.
+        """
+
+        future: Future = Future()
+        with self._lock:
+            if self._draining:
+                future.set_result(RunResult(status=RunStatus.FAILED, context=context, error="worker is draining and cannot accept new runs"))
+                return RunHandle(context=context, _future=future)
+            if self._shutting_down:
+                future.set_result(RunResult(status=RunStatus.FAILED, context=context, error="worker is shutting down and cannot accept new runs"))
+                return RunHandle(context=context, _future=future)
+            queue_key = _turn_queue_key(context)
+            queue = self._turn_queues.setdefault(queue_key, deque())
+            if len(queue) >= self.max_queued_turns_per_conversation:
+                future.set_result(RunResult(status=RunStatus.FAILED, context=context, error="conversation turn queue is full"))
+                return RunHandle(context=context, _future=future)
+            queued = _QueuedTurn(queue_key, context, dict(message), handler, lock_ttl_seconds, future)
+            should_schedule = not queue
+            queue.append(queued)
+            if should_schedule:
+                self._schedule_queued_turn(queued)
+        return RunHandle(context=context, _future=future)
+
+    def _schedule_queued_turn(self, queued: _QueuedTurn) -> None:
+        if self._draining or self._shutting_down:
+            queued.future.set_result(
+                RunResult(status=RunStatus.FAILED, context=queued.context, error="worker is draining and cannot accept queued turn")
+            )
+            self._finish_queued_turn(queued)
+            return
+        executor = self._ensure_executor()
+        queued.executor_future = executor.submit(self._execute_queued_turn, queued)
+
+    def _execute_queued_turn(self, queued: _QueuedTurn) -> None:
+        result = _execute_turn(
+            self._registry,
+            queued.context,
+            self.worker_id,
+            queued.message,
+            queued.handler,
+            lock_ttl_seconds=queued.lock_ttl_seconds,
+        )
+        self._finish_queued_turn(queued)
+        queued.future.set_result(result)
+
+    def _finish_queued_turn(self, queued: _QueuedTurn) -> None:
+        with self._lock:
+            queue = self._turn_queues.get(queued.queue_key)
+            if not queue:
+                return
+            completed = queue.popleft()
+            if completed is not queued:
+                completed.future.set_result(
+                    RunResult(
+                        status=RunStatus.FAILED,
+                        context=completed.context,
+                        error="conversation turn queue ordering was corrupted",
+                    )
+                )
+                self._turn_queues.pop(queued.queue_key, None)
+                return
+            if queue:
+                self._schedule_queued_turn(queue[0])
+            else:
+                self._turn_queues.pop(queued.queue_key, None)
+
+    def _fail_pending_queued_turns_locked(self, error: str) -> None:
+        """Fail queued-but-not-active turns while preserving active heads."""
+
+        for queue_key, queue in list(self._turn_queues.items()):
+            if len(queue) <= 1:
+                continue
+            active = queue.popleft()
+            while queue:
+                pending = queue.popleft()
+                pending.future.set_result(RunResult(status=RunStatus.FAILED, context=pending.context, error=error))
+            self._turn_queues[queue_key] = deque([active])
+
+    def _cancel_unstarted_queued_heads_locked(self, error: str) -> None:
+        """Cancel queued head tasks that are scheduled but not yet running."""
+
+        for queue_key, queue in list(self._turn_queues.items()):
+            if not queue:
+                self._turn_queues.pop(queue_key, None)
+                continue
+            queued = queue[0]
+            executor_future = queued.executor_future
+            if executor_future is not None and executor_future.cancel():
+                queued.future.set_result(RunResult(status=RunStatus.FAILED, context=queued.context, error=error))
+                self._turn_queues.pop(queue_key, None)
 
     def request_drain(self) -> RunResult:
         """Stop accepting new work and mark the worker draining in the registry.
@@ -328,6 +471,8 @@ class LocalRunSupervisor:
 
         with self._lock:
             self._draining = True
+            self._fail_pending_queued_turns_locked("worker is draining and cannot accept queued turn")
+            self._cancel_unstarted_queued_heads_locked("worker is draining and cannot accept queued turn")
             if self._registry is not None:
                 try:
                     workers = self._registry.get(BackendCapability.WORKER_REGISTRY, None)
@@ -342,6 +487,9 @@ class LocalRunSupervisor:
 
     def shutdown(self, *, wait: bool = True) -> None:
         with self._lock:
+            self._shutting_down = True
+            self._fail_pending_queued_turns_locked("worker is shutting down and cannot accept queued turn")
+            self._cancel_unstarted_queued_heads_locked("worker is shutting down and cannot accept queued turn")
             executor, self._executor = self._executor, None
         if executor is not None:
             executor.shutdown(wait=wait)
