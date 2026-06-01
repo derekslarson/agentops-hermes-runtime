@@ -122,6 +122,29 @@ def test_malformed_next_run_at_fails_closed_without_crashing_claim_loop():
     assert malformed is not None
     assert malformed["state"] == "needs_schedule"
     assert "next_run_at_error" in malformed
+    secret_malformed_id = backend.create(
+        context, {"prompt": "secret", "schedule": "30m", "next_run_at": "token=secret-sentinel"}
+    )
+    backend.claim_due(context, owner="worker-b", now=160.0)
+    secret_malformed = backend.get_job(context, secret_malformed_id)
+    assert secret_malformed is not None
+    assert "secret-sentinel" not in secret_malformed["next_run_at_error"]
+
+    delivery_id = backend.create(context, {"prompt": "delivery", "schedule": "30m", "next_run_at": 170.0})
+    failure_id = backend.create(context, {"prompt": "failure", "schedule": "30m", "next_run_at": 170.0})
+    backend.claim_due(context, owner="worker-c", now=170.0, limit=2)
+    backend.complete_run(
+        context,
+        delivery_id,
+        owner="worker-c",
+        output="out",
+        delivery_error="failed token=delivery-secret-sentinel",
+        now=171.0,
+    )
+    backend.fail_run(context, failure_id, owner="worker-c", error="api_key=failure-secret-sentinel", now=172.0)
+    persisted = repr(backend.run_history(context, delivery_id)) + repr(backend.run_history(context, failure_id))
+    assert "delivery-secret-sentinel" not in persisted
+    assert "failure-secret-sentinel" not in persisted
 
 
 def test_created_job_records_context_binding_and_delivery_without_secret_refs():

@@ -34,7 +34,7 @@ import urllib.parse
 import urllib.request
 from typing import TYPE_CHECKING, Any, Mapping
 
-from agent.runtime_backends import BackendCapability
+from agent.runtime_backends import BackendCapability, _redact_audit_text
 
 if TYPE_CHECKING:
     from agent.runtime_backends import RuntimeBackendRegistry
@@ -188,7 +188,7 @@ class HttpCronBackend:
                 "context": self._scope_payload(context),
                 "owner": owner,
                 "output": output,
-                "delivery_error": delivery_error,
+                "delivery_error": _redact_audit_text(delivery_error) if delivery_error is not None else None,
                 "now": now,
                 "next_run_at": next_run_at,
             },
@@ -207,7 +207,7 @@ class HttpCronBackend:
         return self._request_json(
             "POST",
             f"/cron/jobs/{self._quote_id(job_id)}/fail",
-            {"context": self._scope_payload(context), "owner": owner, "error": error, "now": now, "next_run_at": next_run_at},
+            {"context": self._scope_payload(context), "owner": owner, "error": _redact_audit_text(error), "now": now, "next_run_at": next_run_at},
         )
 
     @staticmethod
@@ -236,6 +236,7 @@ class HttpCronBackend:
         sanitized = cls._sanitize_value(dict(job))
         if not isinstance(sanitized, dict):
             return {}
+        sanitized.pop("binding", None)
         return sanitized
 
     @classmethod

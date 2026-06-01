@@ -1240,3 +1240,464 @@ def test_local_supervisor_preserves_existing_inline_local_behavior_by_default():
     assert result.context == context
     assert result.value == context
     assert supervisor.max_concurrent_runs == 1
+
+
+def _job_context(run_id: str, *, job_id: str | None = None, run_type: str = "manual", conversation_id: str = "cron-thread") -> RuntimeContext:
+    return RuntimeContext(
+        mode="agentops",
+        org_id="org-m11",
+        workspace_id="workspace-m11",
+        user_id="derek",
+        conversation_id=conversation_id,
+        agent_profile_id="default",
+        project_id="runtime",
+        run_id=run_id,
+        run_type=run_type,
+        job_id=job_id,
+        backend_profile="local",
+    )
+
+
+def _audit_scope(context: RuntimeContext) -> tuple[Any, ...]:
+    return (
+        context.mode,
+        context.org_id,
+        context.workspace_id,
+        context.user_id,
+        context.conversation_id,
+        context.agent_profile_id,
+        context.project_id,
+        context.run_id,
+        context.job_id,
+    )
+
+
+def test_run_to_completion_claims_per_job_lease_runs_records_success_and_releases():
+    registry = RuntimeBackendRegistry()
+    supervisor = LocalRunSupervisor(worker_id="worker-rtc", registry=registry)
+    context = _job_context("run-rtc", job_id="job-rtc")
+    lease_context = RuntimeContext(**{**context.to_dict(), "run_id": None})
+    lease = registry.get(BackendCapability.RUN_LEASE, lease_context)
+    observed: dict[str, Any] = {}
+
+    def builder():
+        # While the run executes, the per-job lease is held: a different owner
+        # cannot claim the same durable job/firing even if the executing run has
+        # a replacement run_id.
+        observed["lease_held"] = lease.claim(lease_context, "job-rtc", owner="intruder") is False
+        current = get_current_runtime_context()
+        observed["run_id"] = current.run_id if current else None
+        return "built"
+
+    result = supervisor.run_to_completion(context, builder)
+
+    assert result.status is RunStatus.SUCCEEDED
+    assert result.value == "built"
+    assert observed["lease_held"] is True
+    assert observed["run_id"] == "run-rtc"
+    # Lease is released after completion, so the same job is claimable again.
+    assert lease.claim(lease_context, "job-rtc", owner="next-owner") is True
+
+    audit = registry.get(BackendCapability.AUDIT, context)
+    events = audit._events[_audit_scope(context)]
+    assert [event["status"] for event in events if "status" in event] == ["started", "succeeded"]
+
+
+def test_run_to_completion_records_failure_releases_lease_and_sanitizes_audit():
+    registry = RuntimeBackendRegistry()
+    supervisor = LocalRunSupervisor(worker_id="worker-rtc-fail", registry=registry)
+    context = _job_context("run-rtc-fail", job_id="job-rtc-fail")
+    lease_context = RuntimeContext(**{**context.to_dict(), "run_id": None})
+    lease = registry.get(BackendCapability.RUN_LEASE, lease_context)
+
+    def boom():
+        raise RuntimeError("token=sentinel-secret build crashed")
+
+    result = supervisor.run_to_completion(context, boom)
+
+    assert result.status is RunStatus.FAILED
+    assert "build crashed" in result.error
+    assert "sentinel-secret" in result.error
+    # The lease is released even when the callable raises.
+    assert lease.claim(lease_context, "job-rtc-fail", owner="next-owner") is True
+
+    audit = registry.get(BackendCapability.AUDIT, context)
+    events = audit._events[_audit_scope(context)]
+    failed_event = [event for event in events if event.get("status") == "failed"][0]
+    assert "sentinel-secret" not in failed_event["error"]
+    assert "token=[REDACTED]" in failed_event["error"]
+
+
+def test_run_to_completion_fails_if_job_lease_expires_before_completion():
+    registry = RuntimeBackendRegistry()
+    supervisor = LocalRunSupervisor(worker_id="worker-rtc-expired", registry=registry)
+    context = _job_context("run-rtc-expired", job_id="job-rtc-expired")
+    times = iter([0.0, 2.0])
+
+    result = supervisor.run_to_completion(context, lambda: "too-late", lease_seconds=1.0, clock=lambda: next(times))
+
+    assert result.status is RunStatus.FAILED
+    assert result.error == "run lease 'job-rtc-expired' was lost before completion"
+    audit = registry.get(BackendCapability.AUDIT, context)
+    assert [event["status"] for event in audit._events[_audit_scope(context)] if "status" in event] == [
+        "started",
+        "failed",
+    ]
+
+
+def test_run_to_completion_refuses_when_job_lease_already_held():
+    registry = RuntimeBackendRegistry()
+    supervisor = LocalRunSupervisor(worker_id="worker-rtc-dup", registry=registry)
+    context = _job_context("run-rtc-dup", job_id="job-rtc-dup")
+    lease = registry.get(BackendCapability.RUN_LEASE, RuntimeContext(**{**context.to_dict(), "run_id": None}))
+    assert lease.claim(
+        RuntimeContext(**{**context.to_dict(), "run_id": None}),
+        "job-rtc-dup",
+        owner="other-worker",
+        lease_seconds=300.0,
+    ) is True
+    called: list[int] = []
+
+    result = supervisor.run_to_completion(context, lambda: called.append(1))
+
+    assert result.status is RunStatus.FAILED
+    assert "lease" in result.error.lower()
+    assert called == []
+
+
+def test_run_to_completion_refuses_same_job_lease_across_replacement_run_ids():
+    registry = RuntimeBackendRegistry()
+    first_worker = LocalRunSupervisor(worker_id="worker-rtc-first", registry=registry)
+    second_worker = LocalRunSupervisor(worker_id="worker-rtc-second", registry=registry)
+    first_context = _job_context("run-original", job_id="durable-job")
+    replacement_context = _job_context("run-replacement", job_id="durable-job")
+    first_started = threading.Event()
+    release_first = threading.Event()
+    second_called: list[int] = []
+
+    def slow_first():
+        first_started.set()
+        release_first.wait(timeout=2)
+        return "first done"
+
+    first = first_worker.submit_run_to_completion(first_context, slow_first, lease_seconds=300.0)
+    assert first_started.wait(timeout=2)
+
+    second = second_worker.run_to_completion(replacement_context, lambda: second_called.append(1), lease_seconds=300.0)
+
+    release_first.set()
+    assert second.status is RunStatus.FAILED
+    assert "lease" in second.error.lower()
+    assert second_called == []
+    assert first.result(timeout=2).status is RunStatus.SUCCEEDED
+
+
+def test_submit_run_to_completion_runs_independent_jobs_on_the_pool():
+    registry = RuntimeBackendRegistry()
+    supervisor = LocalRunSupervisor(worker_id="worker-rtc-pool", max_concurrent_runs=2, registry=registry)
+    ctx_a = _job_context("run-pool-a", job_id="job-pool-a")
+    ctx_b = _job_context("run-pool-b", job_id="job-pool-b", conversation_id="cron-thread-b")
+
+    handle_a = supervisor.submit_run_to_completion(ctx_a, lambda: "a-done")
+    handle_b = supervisor.submit_run_to_completion(ctx_b, lambda: "b-done")
+
+    result_a = handle_a.result(timeout=2)
+    result_b = handle_b.result(timeout=2)
+    assert result_a.status is RunStatus.SUCCEEDED
+    assert result_b.status is RunStatus.SUCCEEDED
+    assert {result_a.value, result_b.value} == {"a-done", "b-done"}
+
+
+def test_run_to_completion_drain_refuses_new_but_lets_active_submitted_work_finish():
+    registry = RuntimeBackendRegistry()
+    supervisor = LocalRunSupervisor(worker_id="worker-rtc-drain", max_concurrent_runs=2, registry=registry)
+    active_ctx = _job_context("run-rtc-active", job_id="job-active")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def active_run():
+        entered.set()
+        release.wait(timeout=2)
+        return "finished-before-drain"
+
+    handle = supervisor.submit_run_to_completion(active_ctx, active_run)
+    assert entered.wait(timeout=2)
+
+    supervisor.request_drain()
+    blocked_sync = supervisor.run_to_completion(
+        _job_context("run-rtc-blocked", job_id="job-blocked"), lambda: "must not run"
+    )
+    blocked_async = supervisor.submit_run_to_completion(
+        _job_context("run-rtc-blocked-2", job_id="job-blocked-2"), lambda: "must not run"
+    )
+
+    assert blocked_sync.status is RunStatus.FAILED
+    assert blocked_sync.error == "worker is draining and cannot accept new runs"
+    assert blocked_async.result(timeout=2).status is RunStatus.FAILED
+    assert blocked_async.result(timeout=2).error == "worker is draining and cannot accept new runs"
+
+    release.set()
+    result = handle.result(timeout=2)
+    assert result.status is RunStatus.SUCCEEDED
+    assert result.value == "finished-before-drain"
+
+
+def test_run_due_cron_once_runs_unrelated_watchdog_while_builder_lease_is_held():
+    registry = RuntimeBackendRegistry()
+    supervisor = LocalRunSupervisor(worker_id="worker-cron", max_concurrent_runs=2, registry=registry)
+    context = RuntimeContext(**{**_job_context("run-cron", run_type="cron").to_dict(), "delivery_ref": "job-home"})
+    polling_context = RuntimeContext(**{**context.to_dict(), "run_id": "run-cron-poller", "delivery_ref": "scheduler-home"})
+    cron = registry.get(BackendCapability.CRON, context)
+    builder_id = cron.create(context, {"name": "builder"})
+    watchdog_id = cron.create(context, {"name": "watchdog", "next_run_at": 200.0})
+
+    # A long-running builder firing is claimed by another worker and stays
+    # running (never completed); its per-job lease is live for a long time.
+    builder_claims = cron.claim_due(context, owner="builder-worker", now=100.0, lease_seconds=600.0)
+    assert [job["id"] for job in builder_claims] == [builder_id]
+
+    seen: list[str] = []
+
+    def handler(job):
+        seen.append(job["name"])
+        return f"ran {job['name']}"
+
+    results = supervisor.run_due_cron_once(polling_context, handler, now=200.0, lease_seconds=60.0, clock=lambda: 200.0)
+
+    # The watchdog ran and completed even though the builder lease is still held;
+    # it was not blocked by the long builder firing or any global run lock.
+    assert seen == ["watchdog"]
+    assert [result.status for result in results] == [RunStatus.SUCCEEDED]
+    assert results[0].value == "ran watchdog"
+    assert results[0].context.job_id == watchdog_id
+    assert results[0].context.run_id == f"run-cron-poller:{watchdog_id}"
+    assert results[0].context.delivery_ref == "job-home"
+    assert cron.run_history(context, watchdog_id)[-1]["status"] == "success"
+    delivery = registry.get(BackendCapability.DELIVERY, results[0].context)
+    assert delivery._delivered[_audit_scope(results[0].context)] == [
+        {
+            "kind": "cron_result",
+            "job_id": watchdog_id,
+            "delivery_ref": "job-home",
+            "deliver": "local",
+            "content": "ran watchdog",
+            "binding": cron.get_job(context, watchdog_id)["binding"],
+        }
+    ]
+    # The builder firing remains claimed/running and untouched.
+    assert cron.get_job(context, builder_id)["state"] == "running"
+    assert cron.run_history(context, builder_id) == []
+
+    # A duplicate claim for the same builder firing is prevented while its lease
+    # is live, and the just-completed watchdog is no longer due, so no firing is
+    # delivered twice on a second poll.
+    assert cron.claim_due(context, owner="intruder", now=200.0) == []
+    assert supervisor.run_due_cron_once(context, handler, now=200.0, clock=lambda: 200.0) == []
+    assert seen == ["watchdog"]
+
+
+def test_run_due_cron_once_executes_unrelated_due_jobs_concurrently():
+    registry = RuntimeBackendRegistry()
+    supervisor = LocalRunSupervisor(worker_id="worker-cron-parallel", max_concurrent_runs=2, registry=registry)
+    context = _job_context("run-cron-parallel", run_type="cron")
+    cron = registry.get(BackendCapability.CRON, context)
+    cron.create(context, {"name": "builder", "next_run_at": 100.0})
+    cron.create(context, {"name": "watchdog", "next_run_at": 100.0})
+    builder_started = threading.Event()
+    watchdog_done = threading.Event()
+    builder_saw_watchdog_done: list[bool] = []
+
+    def handler(job):
+        if job["name"] == "builder":
+            builder_started.set()
+            builder_saw_watchdog_done.append(watchdog_done.wait(timeout=1.0))
+            return "builder done"
+        assert builder_started.wait(timeout=1.0)
+        watchdog_done.set()
+        return "watchdog done"
+
+    results = supervisor.run_due_cron_once(context, handler, now=100.0, clock=lambda: 100.0)
+
+    assert [result.status for result in results] == [RunStatus.SUCCEEDED, RunStatus.SUCCEEDED]
+    assert builder_saw_watchdog_done == [True]
+
+
+def test_run_due_cron_once_skips_delivery_for_silent_output():
+    registry = RuntimeBackendRegistry()
+    supervisor = LocalRunSupervisor(worker_id="worker-cron-silent", max_concurrent_runs=3, registry=registry)
+    context = _job_context("run-cron-silent", run_type="cron")
+    cron = registry.get(BackendCapability.CRON, context)
+    blank_id = cron.create(context, {"name": "blank"})
+    marker_id = cron.create(context, {"name": "marker"})
+    none_id = cron.create(context, {"name": "none"})
+
+    outputs = {"blank": "   ", "marker": "[SILENT]", "none": None}
+    results = supervisor.run_due_cron_once(context, lambda job: outputs[job["name"]], now=100.0, clock=lambda: 100.0)
+
+    assert [result.status for result in results] == [RunStatus.SUCCEEDED] * 3
+    delivery = registry.get(BackendCapability.DELIVERY, context)
+    assert delivery._delivered == {}
+    for job_id in (blank_id, marker_id, none_id):
+        entry = cron.run_history(context, job_id)[-1]
+        assert entry["status"] == "success"
+        assert entry["silent"] is True
+        assert entry["delivery"] == "skipped_silent"
+
+
+def test_run_due_cron_once_records_delivery_failure_and_sanitizes_error():
+    registry = RuntimeBackendRegistry()
+    supervisor = LocalRunSupervisor(worker_id="worker-cron-delivery-fail", registry=registry)
+    context = _job_context("run-cron-delivery-fail", run_type="cron")
+    cron = registry.get(BackendCapability.CRON, context)
+    job_id = cron.create(context, {"name": "deliver-me", "next_run_at": 100.0})
+    delivery = registry.get(BackendCapability.DELIVERY, context)
+
+    def fail_delivery(_context, _message):
+        raise RuntimeError("token=sentinel-secret delivery failed")
+
+    delivery.deliver = fail_delivery
+
+    results = supervisor.run_due_cron_once(context, lambda _job: "notify", now=100.0, next_run_at=300.0, clock=lambda: 100.0)
+
+    assert [result.status for result in results] == [RunStatus.FAILED]
+    assert results[0].error == "RuntimeError"
+    history = cron.run_history(context, job_id)
+    assert len(history) == 1
+    assert history[0]["status"] == "delivery_error"
+    assert history[0]["delivery"] == "error"
+    assert "sentinel-secret" not in history[0]["error"]
+    assert cron.get_job(context, job_id)["state"] == "scheduled"
+    assert cron.get_job(context, job_id)["next_run_at"] == 300.0
+
+
+def test_run_due_cron_once_ignores_untrusted_binding_fields():
+    registry = RuntimeBackendRegistry()
+    supervisor = LocalRunSupervisor(worker_id="worker-cron-binding", registry=registry)
+    creation_context = RuntimeContext(
+        **{
+            **_job_context("run-cron-binding", run_type="cron").to_dict(),
+            "delivery_ref": "trusted-delivery",
+        }
+    )
+    polling_context = RuntimeContext(
+        **{
+            **creation_context.to_dict(),
+            "run_id": "poller-run",
+            "backend_profile": "local",
+            "permissions_ref": "poller-permissions",
+            "delivery_ref": "poller-delivery",
+        }
+    )
+    cron = registry.get(BackendCapability.CRON, creation_context)
+    job_id = cron.create(creation_context, {"name": "binding"})
+    cron.update(
+        creation_context,
+        job_id,
+        {
+            "binding": {
+                "mode": "agentops",
+                "org_id": "org-m11",
+                "workspace_id": "workspace-m11",
+                "user_id": "derek",
+                "conversation_id": "cron-thread",
+                "agent_profile_id": "default",
+                "project_id": "runtime",
+                "run_type": "cron",
+                "delivery_ref": "trusted-delivery",
+                "permissions_ref": "evil-permissions",
+                "backend_profile": "evil-backend",
+                "metadata": {"secret": "evil"},
+                "run_id": "evil-run",
+            }
+        },
+    )
+    observed: dict[str, RuntimeContext] = {}
+
+    def handler(_job):
+        current = get_current_runtime_context()
+        assert current is not None
+        observed["context"] = current
+        return "ok"
+
+    results = supervisor.run_due_cron_once(polling_context, handler, now=100.0, clock=lambda: 100.0)
+
+    assert [result.status for result in results] == [RunStatus.SUCCEEDED]
+    run_context = observed["context"]
+    assert run_context.delivery_ref == "trusted-delivery"
+    assert run_context.run_id == f"poller-run:{job_id}"
+    assert run_context.permissions_ref == "poller-permissions"
+    assert run_context.backend_profile == "local"
+    assert run_context.metadata == {}
+    delivery = registry.get(BackendCapability.DELIVERY, run_context)
+    delivered_binding = delivery._delivered[_audit_scope(run_context)][0]["binding"]
+    assert delivered_binding["delivery_ref"] == "trusted-delivery"
+    assert "permissions_ref" not in delivered_binding
+    assert "backend_profile" not in delivered_binding
+    assert "metadata" not in delivered_binding
+    assert "run_id" not in delivered_binding
+
+
+def test_run_due_cron_once_does_not_deliver_or_complete_after_lease_expiry():
+    registry = RuntimeBackendRegistry()
+    supervisor = LocalRunSupervisor(worker_id="worker-cron-expired", registry=registry)
+    context = _job_context("run-cron-expired", run_type="cron")
+    cron = registry.get(BackendCapability.CRON, context)
+    job_id = cron.create(context, {"name": "expired", "next_run_at": 100.0})
+    delivery = registry.get(BackendCapability.DELIVERY, context)
+    times = iter([200.0])
+
+    results = supervisor.run_due_cron_once(
+        context,
+        lambda _job: "must not deliver",
+        now=100.0,
+        lease_seconds=60.0,
+        clock=lambda: next(times),
+    )
+
+    assert [result.status for result in results] == [RunStatus.FAILED]
+    assert "lease lost" in results[0].error
+    assert delivery._delivered == {}
+    assert cron.run_history(context, job_id) == []
+    assert cron.get_job(context, job_id)["state"] == "running"
+
+
+def test_run_due_cron_once_records_failure_via_fail_run_without_blocking_other_jobs():
+    registry = RuntimeBackendRegistry()
+    supervisor = LocalRunSupervisor(worker_id="worker-cron-fail", max_concurrent_runs=2, registry=registry)
+    context = _job_context("run-cron-fail", run_type="cron")
+    cron = registry.get(BackendCapability.CRON, context)
+    flaky_id = cron.create(context, {"name": "flaky"})
+    healthy_id = cron.create(context, {"name": "healthy"})
+
+    def handler(job):
+        if job["name"] == "flaky":
+            raise RuntimeError("token=sentinel-secret cron boom")
+        return "healthy output"
+
+    results = supervisor.run_due_cron_once(context, handler, now=100.0, clock=lambda: 100.0)
+
+    by_job = {result.context.job_id: result for result in results}
+    assert by_job[flaky_id].status is RunStatus.FAILED
+    assert "cron boom" in by_job[flaky_id].error
+    assert by_job[healthy_id].status is RunStatus.SUCCEEDED
+    flaky_history = cron.run_history(context, flaky_id)[-1]
+    assert flaky_history["status"] == "error"
+    assert "sentinel-secret" not in flaky_history["error"]
+    assert cron.run_history(context, healthy_id)[-1]["status"] == "success"
+
+
+def test_run_due_cron_once_refuses_to_claim_jobs_while_draining():
+    registry = RuntimeBackendRegistry()
+    supervisor = LocalRunSupervisor(worker_id="worker-cron-drain", max_concurrent_runs=2, registry=registry)
+    context = _job_context("run-cron-drain", run_type="cron")
+    cron = registry.get(BackendCapability.CRON, context)
+    cron.create(context, {"name": "should-not-run"})
+    handler_called: list[str] = []
+
+    supervisor.request_drain()
+    results = supervisor.run_due_cron_once(
+        context, lambda job: handler_called.append(job["name"]) or "out", now=100.0, clock=lambda: 100.0
+    )
+
+    assert results == []
+    assert handler_called == []

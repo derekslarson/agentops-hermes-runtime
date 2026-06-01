@@ -166,14 +166,21 @@ def test_http_cron_backend_round_trips_contract_methods_with_secret_safe_scope(c
     assert job_id == "remote-job-1"
     assert backend.list_jobs(context)[0]["binding"]["org_id"] == "acme"
     assert backend.get_job(context, job_id)["id"] == job_id
-    backend.update(context, job_id, {"prompt": "p2"})
+    backend.update(context, job_id, {"prompt": "p2", "binding": {"conversation_id": "evil", "delivery_ref": "evil"}})
     backend.pause(context, job_id)
     backend.resume(context, job_id)
     assert backend.claim_due(context, owner="worker-a", now=150.0, lease_seconds=60.0)[0]["owner"] == "worker-a"
     assert backend.renew_lease(context, job_id, owner="worker-a", now=151.0, lease_seconds=60.0) is True
     backend.release_lease(context, job_id, owner="worker-a")
-    assert backend.complete_run(context, job_id, owner="worker-a", output="[SILENT]", now=160.0)["silent"] is True
-    assert backend.fail_run(context, job_id, owner="worker-a", error="boom", now=170.0)["delivery"] == "error_alert"
+    assert backend.complete_run(
+        context,
+        job_id,
+        owner="worker-a",
+        output="[SILENT]",
+        delivery_error="failed token=delivery-secret-sentinel",
+        now=160.0,
+    )["silent"] is True
+    assert backend.fail_run(context, job_id, owner="worker-a", error="boom token=failure-secret-sentinel", now=170.0)["delivery"] == "error_alert"
     assert backend.run_history(context, job_id)[0]["status"] == "success"
     backend.remove(context, job_id)
 
@@ -185,7 +192,13 @@ def test_http_cron_backend_round_trips_contract_methods_with_secret_safe_scope(c
     assert all("nested-sentinel-password" not in repr(body) for body in bodies)
     assert all("secret:nope" not in repr(body) for body in bodies)
     assert all("perm-ref-should-not-leak" not in repr(body) for body in bodies)
+    assert all("delivery-secret-sentinel" not in repr(body) for body in bodies)
+    assert all("failure-secret-sentinel" not in repr(body) for body in bodies)
     assert any(body.get("context", {}).get("delivery_ref") == "delivery:telegram:home" for body in bodies)
+    job_bodies = [body.get("job", {}) for method, _path, _auth, body in cron_server.requests if method in {"POST", "PATCH"} and body and "job" in body]
+    assert job_bodies
+    assert all("binding" not in job for job in job_bodies)
+    assert all("evil" not in repr(job) for job in job_bodies)
     assert all(auth in {"Bearer sentinel-token", None} for _method, _path, auth, _body in cron_server.requests)
     assert all("?" not in path for method, path, _auth, _body in cron_server.requests if method in {"GET", "DELETE"})
 

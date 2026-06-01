@@ -31,8 +31,22 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Iterable, Mapping
 
-from agent.runtime_backends import BackendCapability, RuntimeBackendRegistry
+from agent.runtime_backends import BackendCapability, CronLeaseError, RuntimeBackendRegistry, _cron_output_is_silent
 from agent.runtime_context import RuntimeContext, use_runtime_context
+
+_CRON_BINDING_FIELDS = frozenset(
+    {
+        "mode",
+        "org_id",
+        "workspace_id",
+        "user_id",
+        "conversation_id",
+        "agent_profile_id",
+        "project_id",
+        "run_type",
+        "delivery_ref",
+    }
+)
 
 _SECRET_VALUE_PATTERNS = (
     re.compile(r"(?i)((?:api[_-]?key|token|secret|password|credential)\s*[:=]\s*)[^\s,;]+"),
@@ -130,6 +144,89 @@ def _execute_run(
 
 
 TurnHandler = Callable[[list[Any]], Mapping[str, Any] | Iterable[Mapping[str, Any]] | None]
+
+CronJobHandler = Callable[[Mapping[str, Any]], str | None]
+
+
+def _cron_run_context(context: RuntimeContext, job: Mapping[str, Any]) -> RuntimeContext:
+    """Return a per-firing run context bound to a claimed cron job.
+
+    The durable cron job's sanitized binding restores tenant/user/project/
+    conversation/delivery scope, while the polling context supplies the firing
+    ``run_id`` prefix. ``job_id`` and the final firing-specific ``run_id`` are
+    bound so native surfaces and audit observe the individual occurrence rather
+    than a shared worker-wide identity.
+    """
+
+    job_id = str(job.get("id"))
+    data = context.to_dict()
+    binding = job.get("binding")
+    if isinstance(binding, Mapping):
+        data.update({key: value for key, value in binding.items() if key in _CRON_BINDING_FIELDS})
+    data["job_id"] = job_id
+    data["run_type"] = "cron"
+    base_run_id = context.run_id or data.get("run_id") or "cron"
+    data["run_id"] = f"{base_run_id}:{job_id}"
+    return RuntimeContext(**data)
+
+
+def _run_lease_context(context: RuntimeContext, lease_key: str) -> RuntimeContext:
+    """Return the scope used for run-to-completion leases.
+
+    Durable job leases intentionally exclude per-execution ``run_id`` so a
+    replacement run for the same job/firing cannot bypass the live owner. Runs
+    without a durable ``job_id`` keep their run-scoped lease behavior.
+    """
+
+    if context.job_id and lease_key == context.job_id:
+        data = context.to_dict()
+        data["run_id"] = None
+        return RuntimeContext(**data)
+    return context
+
+
+def _cron_delivery_binding(context: RuntimeContext) -> dict[str, Any]:
+    data = context.to_dict()
+    return {key: data.get(key) for key in _CRON_BINDING_FIELDS if data.get(key) is not None}
+
+
+class _LeaseRenewer:
+    """Best-effort background lease renewal while a callable is executing."""
+
+    def __init__(
+        self,
+        renew: Callable[[float], bool],
+        *,
+        clock: Callable[[], float],
+        lease_seconds: float | None,
+    ) -> None:
+        self._renew = renew
+        self._clock = clock
+        self._lease_seconds = lease_seconds
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> "_LeaseRenewer":
+        if self._lease_seconds is None or self._lease_seconds <= 0:
+            return self
+        interval = max(min(self._lease_seconds / 2, 30.0), 0.1)
+
+        def loop() -> None:
+            while not self._stop.wait(interval):
+                try:
+                    if not self._renew(self._clock()):
+                        return
+                except Exception:
+                    return
+
+        self._thread = threading.Thread(target=loop, name="hermes-run-lease-renewer", daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
 
 
 @dataclass(slots=True)
@@ -345,6 +442,260 @@ class LocalRunSupervisor:
             if self._shutting_down:
                 return RunResult(status=RunStatus.FAILED, context=context, error="worker is shutting down and cannot accept new runs")
         return _execute_run(self._registry, context, self.worker_id, fn)
+
+    def run_to_completion(
+        self,
+        context: RuntimeContext,
+        fn: Callable[[], Any],
+        *,
+        lease_key: str | None = None,
+        lease_seconds: float = 300.0,
+        now: float | None = None,
+        clock: Callable[[], float] | None = None,
+    ) -> RunResult:
+        """Run an event/manual/cron callable once under a per-run/job lease.
+
+        A :class:`RunLeaseBackend` lease keyed by ``lease_key`` (defaulting to the
+        context's ``job_id``/``run_id`` identity) is claimed before the callable
+        executes, so a single run/firing has exactly one live owner and a
+        duplicate claim is refused while the lease is held. The lease is released
+        whether the callable succeeds or fails, and lifecycle status is recorded
+        through the audit backend exactly like :meth:`run_sync`.
+        """
+
+        with self._lock:
+            if self._draining:
+                return RunResult(status=RunStatus.FAILED, context=context, error="worker is draining and cannot accept new runs")
+            if self._shutting_down:
+                return RunResult(status=RunStatus.FAILED, context=context, error="worker is shutting down and cannot accept new runs")
+        return self._run_to_completion(context, fn, lease_key=lease_key, lease_seconds=lease_seconds, now=now, clock=clock)
+
+    def submit_run_to_completion(
+        self,
+        context: RuntimeContext,
+        fn: Callable[[], Any],
+        *,
+        lease_key: str | None = None,
+        lease_seconds: float = 300.0,
+        now: float | None = None,
+        clock: Callable[[], float] | None = None,
+    ) -> RunHandle:
+        """Schedule a leased run-to-completion callable on the bounded pool."""
+
+        with self._lock:
+            if self._draining:
+                return self._failed_handle(context, "worker is draining and cannot accept new runs")
+            if self._shutting_down:
+                return self._failed_handle(context, "worker is shutting down and cannot accept new runs")
+            executor = self._ensure_executor()
+            future = executor.submit(
+                self._run_to_completion, context, fn, lease_key=lease_key, lease_seconds=lease_seconds, now=now, clock=clock
+            )
+        return RunHandle(context=context, _future=future)
+
+    def _run_to_completion(
+        self,
+        context: RuntimeContext,
+        fn: Callable[[], Any],
+        *,
+        lease_key: str | None,
+        lease_seconds: float,
+        now: float | None,
+        clock: Callable[[], float] | None,
+    ) -> RunResult:
+        if self._registry is None:
+            return RunResult(
+                status=RunStatus.FAILED,
+                context=context,
+                error="run_to_completion requires a configured backend registry",
+            )
+        key = lease_key or context.job_id or context.run_id or "run"
+        lease_context = _run_lease_context(context, key)
+        owner = f"{self.worker_id}:{uuid.uuid4().hex}"
+        lease = self._registry.get(BackendCapability.RUN_LEASE, lease_context)
+        lease_clock = clock or time.time
+        claim_now = now if now is not None else lease_clock()
+        if not lease.claim(lease_context, key, owner=owner, now=claim_now, lease_seconds=lease_seconds):
+            return RunResult(
+                status=RunStatus.FAILED,
+                context=context,
+                error=f"run lease {key!r} is held by another owner",
+            )
+        try:
+            _record_audit(self._registry, context, self.worker_id, RunStatus.STARTED)
+            with _LeaseRenewer(
+                lambda at: lease.renew(lease_context, key, owner=owner, now=at, lease_seconds=lease_seconds),
+                clock=lease_clock,
+                lease_seconds=lease_seconds,
+            ):
+                with use_runtime_context(context):
+                    try:
+                        value = fn()
+                    except Exception as exc:  # one run crashing must not corrupt others
+                        error = f"{type(exc).__name__}: {exc}"
+                        audit_error = f"{type(exc).__name__}: {_sanitize_error_for_audit(str(exc))}"
+                        _record_audit(self._registry, context, self.worker_id, RunStatus.FAILED, error=audit_error)
+                        return RunResult(status=RunStatus.FAILED, context=context, error=error)
+            if not lease.renew(lease_context, key, owner=owner, now=lease_clock(), lease_seconds=lease_seconds):
+                error = f"run lease {key!r} was lost before completion"
+                _record_audit(self._registry, context, self.worker_id, RunStatus.FAILED, error=error)
+                return RunResult(status=RunStatus.FAILED, context=context, error=error)
+            _record_audit(self._registry, context, self.worker_id, RunStatus.SUCCEEDED)
+            return RunResult(status=RunStatus.SUCCEEDED, context=context, value=value)
+        finally:
+            try:
+                lease.release(lease_context, key, owner=owner)
+            except Exception:
+                pass
+
+    def run_due_cron_once(
+        self,
+        context: RuntimeContext,
+        handler: CronJobHandler,
+        *,
+        now: float | None = None,
+        lease_seconds: float = 60.0,
+        limit: int | None = None,
+        next_run_at: float | None = None,
+        clock: Callable[[], float] | None = None,
+    ) -> list[RunResult]:
+        """Claim and run every currently-due cron job under per-job leases.
+
+        Each due firing is claimed through :class:`CronBackend` ``claim_due``,
+        which leases jobs per job/firing rather than under one global lock, so a
+        job whose lease is already held (for example a long autonomous builder
+        run) is skipped while unrelated jobs that become due are still claimed,
+        executed, and recorded here. ``complete_run``/``fail_run`` advance the
+        durable run history for each firing. While draining or shutting down no
+        new firings are claimed.
+        """
+
+        with self._lock:
+            draining = self._draining or self._shutting_down
+        if self._registry is None or draining:
+            return []
+        cron = self._registry.get(BackendCapability.CRON, context)
+        owner = f"{self.worker_id}:{uuid.uuid4().hex}"
+        run_clock = clock or time.time
+        effective_limit = self.max_concurrent_runs if limit is None else min(limit, self.max_concurrent_runs)
+        claimed = cron.claim_due(
+            context,
+            owner=owner,
+            now=now,
+            lease_seconds=lease_seconds,
+            draining=draining,
+            limit=effective_limit,
+        )
+        if not claimed:
+            return []
+        with ThreadPoolExecutor(max_workers=len(claimed), thread_name_prefix="hermes-cron-once") as executor:
+            futures = [
+                executor.submit(
+                    self._run_claimed_cron_job,
+                    context,
+                    cron,
+                    owner,
+                    handler,
+                    job,
+                    clock=run_clock,
+                    now=now,
+                    next_run_at=next_run_at,
+                    lease_seconds=lease_seconds,
+                )
+                for job in claimed
+            ]
+            return [future.result() for future in futures]
+
+    def _run_claimed_cron_job(
+        self,
+        context: RuntimeContext,
+        cron: Any,
+        owner: str,
+        handler: CronJobHandler,
+        job: Mapping[str, Any],
+        *,
+        clock: Callable[[], float],
+        now: float | None,
+        next_run_at: float | None,
+        lease_seconds: float,
+    ) -> RunResult:
+        job_id = str(job.get("id"))
+        run_context = _cron_run_context(context, job)
+        _record_audit(self._registry, run_context, self.worker_id, RunStatus.STARTED)
+        output: str | None
+        delivery_error: str | None = None
+        try:
+            with _LeaseRenewer(
+                lambda at: cron.renew_lease(context, job_id, owner=owner, now=at, lease_seconds=lease_seconds),
+                clock=clock,
+                lease_seconds=lease_seconds,
+            ):
+                try:
+                    first_boundary = clock()
+                    if not cron.renew_lease(context, job_id, owner=owner, now=first_boundary, lease_seconds=lease_seconds):
+                        raise CronLeaseError("cron lease lost before handler")
+                    with use_runtime_context(run_context):
+                        output = handler(job)
+                except Exception as exc:  # one firing crashing must not corrupt others
+                    if isinstance(exc, CronLeaseError):
+                        raise
+                    error = f"{type(exc).__name__}: {exc}"
+                    audit_error = type(exc).__name__
+                    _record_audit(self._registry, run_context, self.worker_id, RunStatus.FAILED, error=audit_error)
+                    try:
+                        cron.fail_run(context, job_id, owner=owner, error=audit_error, now=clock(), next_run_at=next_run_at)
+                    except Exception:
+                        pass
+                    return RunResult(status=RunStatus.FAILED, context=run_context, error=error)
+                pre_delivery_boundary = clock()
+                if not cron.renew_lease(
+                    context, job_id, owner=owner, now=pre_delivery_boundary, lease_seconds=lease_seconds
+                ):
+                    raise CronLeaseError("cron lease lost before delivery")
+                if not _cron_output_is_silent(output):
+                    try:
+                        delivery = self._registry.get(BackendCapability.DELIVERY, run_context)
+                        delivery.deliver(
+                            run_context,
+                            {
+                                "kind": "cron_result",
+                                "job_id": job_id,
+                                "delivery_ref": run_context.delivery_ref,
+                                "deliver": job.get("deliver"),
+                                "content": output,
+                                "binding": _cron_delivery_binding(run_context),
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001 - record sanitized delivery failure via cron history
+                        delivery_error = type(exc).__name__
+                finish_boundary = clock()
+                if not cron.renew_lease(context, job_id, owner=owner, now=finish_boundary, lease_seconds=lease_seconds):
+                    raise CronLeaseError("cron lease lost before completion")
+                entry = cron.complete_run(
+                    context,
+                    job_id,
+                    owner=owner,
+                    output=output,
+                    delivery_error=delivery_error,
+                    now=finish_boundary,
+                    next_run_at=next_run_at,
+                )
+        except CronLeaseError as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            _record_audit(self._registry, run_context, self.worker_id, RunStatus.FAILED, error=error)
+            return RunResult(status=RunStatus.FAILED, context=run_context, error=error)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            _record_audit(
+                self._registry, run_context, self.worker_id, RunStatus.FAILED, error=_sanitize_error_for_audit(error)
+            )
+            return RunResult(status=RunStatus.FAILED, context=run_context, error=error)
+        if delivery_error is not None or entry.get("status") == "delivery_error":
+            error = delivery_error or str(entry.get("error") or "cron delivery failed")
+            _record_audit(self._registry, run_context, self.worker_id, RunStatus.FAILED, error=error)
+            return RunResult(status=RunStatus.FAILED, context=run_context, value=output, error=error)
+        _record_audit(self._registry, run_context, self.worker_id, RunStatus.SUCCEEDED)
+        return RunResult(status=RunStatus.SUCCEEDED, context=run_context, value=output)
 
     def process_turn(
         self,

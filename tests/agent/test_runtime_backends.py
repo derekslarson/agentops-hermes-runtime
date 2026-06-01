@@ -151,6 +151,44 @@ def test_runtime_context_backend_profile_selects_registered_profile():
     assert isinstance(local_backend, LocalMemoryBackend)
 
 
+def test_local_cron_update_preserves_backend_owned_binding():
+    context = RuntimeContext(
+        mode="agentops",
+        org_id="org-a",
+        workspace_id="ws-a",
+        user_id="user-a",
+        conversation_id="trusted-thread",
+        agent_profile_id="default",
+        project_id="proj",
+        run_type="cron",
+        delivery_ref="trusted-delivery",
+    )
+    backend = LocalCronBackend()
+    job_id = backend.create(context, {"name": "cron", "next_run_at": 1.0})
+
+    backend.update(
+        context,
+        job_id,
+        {
+            "name": "updated",
+            "binding": {
+                "conversation_id": "evil-thread",
+                "delivery_ref": "evil-delivery",
+                "metadata": {"secret": "***"},
+                "run_id": "evil-run",
+            },
+        },
+    )
+
+    job = backend.get_job(context, job_id)
+    assert job is not None
+    assert job["name"] == "updated"
+    assert job["binding"]["conversation_id"] == "trusted-thread"
+    assert job["binding"]["delivery_ref"] == "trusted-delivery"
+    assert "metadata" not in job["binding"]
+    assert "run_id" not in job["binding"]
+
+
 def test_config_default_profile_drives_selection():
     class FakeQueueBackend:
         def enqueue(self, context, payload, *, idempotency_key=None):

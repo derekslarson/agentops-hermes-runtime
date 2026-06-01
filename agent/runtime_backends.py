@@ -929,7 +929,9 @@ class LocalCronBackend:
         with self._lock:
             record = self._jobs.get(_cron_scope_key(context), {}).get(job_id)
             if record is not None:
-                record.update(copy.deepcopy(dict(job)))
+                updates = copy.deepcopy(dict(job))
+                updates.pop("binding", None)
+                record.update(updates)
 
     def get_job(self, context: RuntimeContext | None, job_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -1002,7 +1004,7 @@ class LocalCronBackend:
         except (TypeError, ValueError, OverflowError) as exc:
             if isinstance(record, dict):
                 record["state"] = "needs_schedule"
-                record["next_run_at_error"] = str(exc)
+                record["next_run_at_error"] = _redact_audit_text(str(exc))
             return False
 
     def claim_due(
@@ -1114,6 +1116,7 @@ class LocalCronBackend:
         clock = time.time() if now is None else now
         silent = _cron_output_is_silent(output)
         if delivery_error:
+            delivery_error = _redact_audit_text(delivery_error)
             status, delivery, error = "delivery_error", "error", delivery_error
         elif silent:
             status, delivery, error = "success", "skipped_silent", None
@@ -1148,7 +1151,7 @@ class LocalCronBackend:
             "output_empty": True,
             "silent": False,
             "delivery": "error_alert",
-            "error": error,
+            "error": _redact_audit_text(error),
             "at": clock,
         }
         with self._lock:
