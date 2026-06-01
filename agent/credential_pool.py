@@ -446,9 +446,10 @@ DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL = 1
 
 
 class CredentialPool:
-    def __init__(self, provider: str, entries: List[PooledCredential]):
+    def __init__(self, provider: str, entries: List[PooledCredential], *, persist: bool = True):
         self.provider = provider
         self._entries = sorted(entries, key=lambda entry: entry.priority)
+        self._persist_enabled = persist
         self._current_id: Optional[str] = None
         self._strategy = get_pool_strategy(provider)
         self._lock = threading.Lock()
@@ -478,6 +479,8 @@ class CredentialPool:
                 return
 
     def _persist(self) -> None:
+        if not self._persist_enabled:
+            return
         write_credential_pool(
             self.provider,
             [entry.to_dict() for entry in self._entries],
@@ -2059,6 +2062,78 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
     return changed, active_sources
 
 
+def _runtime_base_url_for_provider(provider: str) -> str:
+    if provider == "openrouter":
+        return OPENROUTER_BASE_URL
+    pconfig = PROVIDER_REGISTRY.get(provider)
+    return pconfig.inference_base_url if pconfig else ""
+
+
+def _runtime_auth_type_for_provider(provider: str, token: str) -> str:
+    if provider == "anthropic" and token and not token.startswith("sk-ant-api"):
+        return AUTH_TYPE_OAUTH
+    pconfig = PROVIDER_REGISTRY.get(provider)
+    return pconfig.auth_type if pconfig else AUTH_TYPE_API_KEY
+
+
+def _agentops_credential_context_and_broker() -> tuple[Any | None, Any | None]:
+    try:
+        from agent.runtime_backends import RuntimeBackendRegistry
+        from agent.runtime_context import get_runtime_context_for_surface
+        from agent.runtime_credentials import RuntimeCredentialBroker, get_active_credential_broker
+    except Exception:
+        return None, None
+
+    context = get_runtime_context_for_surface("credential_resolution")
+    if getattr(context, "mode", None) != "agentops":
+        return None, None
+    broker = get_active_credential_broker(context)
+    if broker is None:
+        try:
+            from hermes_cli.config import load_config
+
+            broker = RuntimeCredentialBroker(RuntimeBackendRegistry(load_config()))
+        except Exception:
+            broker = RuntimeCredentialBroker()
+    return context, broker
+
+
+def _seed_from_runtime_broker(provider: str, entries: List[PooledCredential]) -> Set[str]:
+    """Add runtime-broker credentials to the in-memory pool without persisting secrets."""
+
+    try:
+        from agent.runtime_credentials import CredentialResolutionError
+    except Exception:
+        return set()
+
+    context, broker = _agentops_credential_context_and_broker()
+    if context is None or broker is None:
+        return set()
+
+    capability = f"model:{provider}"
+    ref = "default"
+    try:
+        handle = broker.resolve(context, capability=capability, ref=ref)
+    except CredentialResolutionError:
+        return set()
+
+    source = f"runtime:{capability}/{ref}"
+    _upsert_entry(
+        entries,
+        provider,
+        source,
+        {
+            "source": source,
+            "auth_type": _runtime_auth_type_for_provider(provider, handle.reveal()),
+            "access_token": handle.reveal(),
+            "base_url": _runtime_base_url_for_provider(provider),
+            "label": source,
+            "secret_source": handle.secret_ref,
+        },
+    )
+    return {source}
+
+
 def _prune_stale_seeded_entries(entries: List[PooledCredential], active_sources: Set[str]) -> bool:
     retained = [
         entry
@@ -2153,10 +2228,16 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
 
 
 def load_pool(provider: str) -> CredentialPool:
-    from agent.runtime_context import get_runtime_context_for_surface
-    get_runtime_context_for_surface("credential_resolution")
-
     provider = (provider or "").strip().lower()
+
+    # AgentOps mode must not inspect or mutate local env/profile/auth sources.
+    # RuntimeContext + broker/registry are the only credential boundary here.
+    runtime_context, _runtime_broker = _agentops_credential_context_and_broker()
+    if runtime_context is not None:
+        runtime_entries: List[PooledCredential] = []
+        _seed_from_runtime_broker(provider, runtime_entries)
+        return CredentialPool(provider, runtime_entries, persist=False)
+
     raw_entries = read_credential_pool(provider)
     raw_needs_sanitization = any(
         isinstance(payload, dict)
@@ -2182,4 +2263,9 @@ def load_pool(provider: str) -> CredentialPool:
             provider,
             [entry.to_dict() for entry in sorted(entries, key=lambda item: item.priority)],
         )
+
+    # Runtime-broker entries are deliberately appended after persistence so raw
+    # AgentOps secrets can feed the existing provider path without being copied
+    # into the local profile auth store.
+    _seed_from_runtime_broker(provider, entries)
     return CredentialPool(provider, entries)

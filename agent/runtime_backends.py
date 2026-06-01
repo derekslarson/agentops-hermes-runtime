@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import threading
 import time
 from datetime import datetime
@@ -118,7 +119,73 @@ def _credential_scope_key(context: RuntimeContext | None) -> tuple[Any, ...]:
         context.user_id,
         context.agent_profile_id,
         context.project_id,
+        context.permissions_ref,
+        context.backend_profile,
     )
+
+
+def _provider_from_credential_request(ref: str) -> str | None:
+    """Extract the provider name from a logical model credential request."""
+
+    prefix = "model:"
+    suffix = "/default"
+    if not ref.startswith(prefix) or not ref.endswith(suffix):
+        return None
+    provider = ref[len(prefix) : -len(suffix)].strip().lower()
+    return provider or None
+
+
+def _local_provider_env_vars(provider: str) -> tuple[str, ...]:
+    if provider == "openrouter":
+        return ("OPENROUTER_API_KEY",)
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY
+    except Exception:
+        return ()
+
+    pconfig = PROVIDER_REGISTRY.get(provider)
+    if not pconfig:
+        return ()
+    return tuple(str(name) for name in pconfig.api_key_env_vars)
+
+
+def _load_local_env_file() -> Mapping[str, str]:
+    try:
+        from hermes_cli.config import load_env
+
+        return load_env()
+    except Exception:
+        return {}
+
+
+def _load_local_auth_store() -> Mapping[str, Any]:
+    try:
+        from hermes_cli.auth import _load_auth_store
+
+        return _load_auth_store()
+    except Exception:
+        return {}
+
+
+def _local_auth_provider_payload(provider: str) -> Mapping[str, Any] | None:
+    store = _load_local_auth_store()
+    payload = store.get(provider)
+    if not isinstance(payload, Mapping):
+        providers = store.get("providers")
+        if isinstance(providers, Mapping):
+            payload = providers.get(provider)
+    return payload if isinstance(payload, Mapping) else None
+
+
+def _local_provider_profile_secret(provider: str) -> str | None:
+    payload = _local_auth_provider_payload(provider)
+    if payload is None:
+        return None
+    for key in ("api_key", "access_token", "token"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return key
+    return None
 
 
 def _session_scope_key(context: RuntimeContext | None) -> tuple[Any, ...]:
@@ -1000,7 +1067,21 @@ class LocalCredentialResolver:
 
     def resolve(self, context: RuntimeContext | None, ref: str) -> str | None:
         with self._lock:
-            return self._refs.get(_credential_scope_key(context), {}).get(ref)
+            explicit = self._refs.get(_credential_scope_key(context), {}).get(ref)
+        if explicit:
+            return explicit
+
+        provider = _provider_from_credential_request(ref)
+        if provider is None or getattr(context, "mode", None) == "agentops":
+            return None
+        env_file = _load_local_env_file()
+        for env_var in _local_provider_env_vars(provider):
+            if env_file.get(env_var) or os.environ.get(env_var):
+                return f"env:{env_var}"
+        profile_key = _local_provider_profile_secret(provider)
+        if profile_key:
+            return f"profile:{provider}:{profile_key}"
+        return None
 
 
 class LocalSecretStore:
@@ -1009,6 +1090,21 @@ class LocalSecretStore:
         self._lock = threading.RLock()
 
     def get_secret(self, context: RuntimeContext | None, ref: str) -> str | None:
+        if ref.startswith("env:"):
+            if getattr(context, "mode", None) == "agentops":
+                return None
+            env_var = ref.split(":", 1)[1]
+            value = _load_local_env_file().get(env_var) or os.environ.get(env_var)
+            return value.strip() if isinstance(value, str) and value.strip() else None
+        if ref.startswith("profile:"):
+            if getattr(context, "mode", None) == "agentops":
+                return None
+            _, provider, key = ref.split(":", 2)
+            payload = _local_auth_provider_payload(provider)
+            if isinstance(payload, Mapping):
+                value = payload.get(key)
+                return value.strip() if isinstance(value, str) and value.strip() else None
+            return None
         with self._lock:
             return self._secrets.get(_credential_scope_key(context), {}).get(ref)
 

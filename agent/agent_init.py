@@ -34,6 +34,20 @@ from agent.context_compressor import ContextCompressor
 from agent.iteration_budget import IterationBudget
 
 
+def _bind_agentops_credential_broker(agent: Any, config: Dict[str, Any]) -> None:
+    """Bind the runtime credential broker selected by RuntimeContext/config."""
+
+    credential_runtime_context = getattr(agent, "runtime_context", None)
+    if getattr(credential_runtime_context, "mode", None) != "agentops":
+        return
+
+    from agent.runtime_backends import RuntimeBackendRegistry
+    from agent.runtime_credentials import RuntimeCredentialBroker, set_active_credential_broker
+
+    broker = RuntimeCredentialBroker(RuntimeBackendRegistry(config))
+    set_active_credential_broker(broker, context=credential_runtime_context)
+
+
 def _bind_agentops_skill_backend(agent: Any, config: Dict[str, Any]) -> None:
     """Bind a configured AgentOps skill backend, failing closed for mutations.
 
@@ -386,6 +400,14 @@ def init_agent(
             thread_id=thread_id,
             parent_session_id=parent_session_id,
         )
+    # Credential backend selection (M9). Bind immediately after RuntimeContext
+    # resolution so provider/client construction cannot fall back to ambient
+    # local credentials in AgentOps mode.
+    try:
+        _bind_agentops_credential_broker(agent, _runtime_cfg or {})
+    except Exception as _credential_init_err:
+        logger.warning("Failed to initialize AgentOps credential broker: %s", _credential_init_err)
+
     # Pluggable print function — CLI replaces this with _cprint so that
     # raw ANSI status lines are routed through prompt_toolkit's renderer
     # instead of going directly to stdout where patch_stdout's StdoutProxy

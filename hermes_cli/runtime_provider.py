@@ -38,6 +38,33 @@ def _normalize_custom_provider_name(value: str) -> str:
     return value.strip().lower().replace(" ", "-")
 
 
+def _agentops_runtime_context():
+    try:
+        from agent.runtime_context import get_current_runtime_context, resolve_runtime_context
+
+        context = get_current_runtime_context()
+        if context is None:
+            try:
+                context = resolve_runtime_context(config=load_config())
+            except Exception:
+                context = None
+    except Exception:
+        return None
+    return context if getattr(context, "mode", None) == "agentops" else None
+
+
+def _current_runtime_context_is_agentops() -> bool:
+    return _agentops_runtime_context() is not None
+
+
+def _agentops_missing_runtime_credential_error(provider: str) -> AuthError:
+    return AuthError(
+        "AgentOps runtime credential is not available for the requested provider",
+        provider=provider,
+        code="agentops_runtime_credential_missing",
+    )
+
+
 def _loopback_hostname(host: str) -> bool:
     h = (host or "").lower().rstrip(".")
     return h in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
@@ -1221,13 +1248,17 @@ def resolve_runtime_provider(
     behavior (api_mode derived from config).
     """
     requested_provider = resolve_requested_provider(requested)
+    agentops_context = _agentops_runtime_context()
+    agentops_runtime = agentops_context is not None
+    if agentops_runtime and (explicit_api_key or explicit_base_url):
+        raise _agentops_missing_runtime_credential_error(requested_provider)
 
     # Azure Anthropic short-circuit: when explicitly targeting an Azure endpoint
     # with provider="anthropic", bypass _resolve_named_custom_runtime (which would
     # return provider="custom" with chat_completions api_mode and no valid key).
     # Instead, use the Azure key directly with anthropic_messages api_mode.
     _eff_base = (explicit_base_url or "").strip()
-    if requested_provider == "anthropic" and "azure.com" in _eff_base:
+    if not agentops_runtime and requested_provider == "anthropic" and "azure.com" in _eff_base:
         _azure_key = (
             (explicit_api_key or "").strip()
             or os.getenv("AZURE_ANTHROPIC_KEY", "").strip()
@@ -1247,7 +1278,7 @@ def resolve_runtime_provider(
     # Resolve before the custom-runtime / pool / generic paths so Azure
     # config is always picked up from model.base_url + model.api_mode,
     # regardless of whether the caller passed explicit_* args.
-    if requested_provider == "azure-foundry":
+    if not agentops_runtime and requested_provider == "azure-foundry":
         azure_runtime = _resolve_azure_foundry_runtime(
             requested_provider=requested_provider,
             model_cfg=_get_model_config(),
@@ -1257,7 +1288,7 @@ def resolve_runtime_provider(
         )
         return azure_runtime
 
-    custom_runtime = _resolve_named_custom_runtime(
+    custom_runtime = None if agentops_runtime else _resolve_named_custom_runtime(
         requested_provider=requested_provider,
         explicit_api_key=explicit_api_key,
         explicit_base_url=explicit_base_url,
@@ -1266,13 +1297,20 @@ def resolve_runtime_provider(
         custom_runtime["requested_provider"] = requested_provider
         return custom_runtime
 
-    provider = resolve_provider(
-        requested_provider,
-        explicit_api_key=explicit_api_key,
-        explicit_base_url=explicit_base_url,
-    )
     model_cfg = _get_model_config()
-    explicit_runtime = _resolve_explicit_runtime(
+    if agentops_runtime:
+        configured_provider = str(model_cfg.get("provider") or "").strip().lower()
+        provider_request = configured_provider if requested_provider == "auto" else requested_provider
+        if not provider_request or provider_request == "auto":
+            raise _agentops_missing_runtime_credential_error(requested_provider)
+        provider = resolve_provider(provider_request)
+    else:
+        provider = resolve_provider(
+            requested_provider,
+            explicit_api_key=explicit_api_key,
+            explicit_base_url=explicit_base_url,
+        )
+    explicit_runtime = None if agentops_runtime else _resolve_explicit_runtime(
         provider=provider,
         requested_provider=requested_provider,
         model_cfg=model_cfg,
@@ -1282,8 +1320,8 @@ def resolve_runtime_provider(
     if explicit_runtime:
         return explicit_runtime
 
-    should_use_pool = provider != "openrouter"
-    if provider == "openrouter":
+    should_use_pool = True if agentops_runtime else provider != "openrouter"
+    if provider == "openrouter" and not agentops_runtime:
         cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
         cfg_base_url = str(model_cfg.get("base_url") or "").strip()
         env_openai_base_url = os.getenv("OPENAI_BASE_URL", "").strip()
@@ -1303,7 +1341,16 @@ def resolve_runtime_provider(
         )
 
     try:
-        pool = load_pool(provider) if should_use_pool else None
+        if should_use_pool:
+            if agentops_context is not None:
+                from agent.runtime_context import use_runtime_context
+
+                with use_runtime_context(agentops_context):
+                    pool = load_pool(provider)
+            else:
+                pool = load_pool(provider)
+        else:
+            pool = None
     except Exception:
         pool = None
     if pool and pool.has_credentials():
@@ -1339,6 +1386,9 @@ def resolve_runtime_provider(
                 pool=pool,
                 target_model=target_model,
             )
+
+    if agentops_runtime:
+        raise _agentops_missing_runtime_credential_error(provider)
 
     if provider == "nous":
         try:

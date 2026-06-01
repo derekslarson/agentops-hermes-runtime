@@ -12,10 +12,46 @@ from __future__ import annotations
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Iterator, Mapping
+from typing import Any, Iterator, Mapping
 
 from agent.runtime_backends import BackendCapability, RuntimeBackendRegistry
 from agent.runtime_context import RuntimeContext
+
+
+def _context_key(context: RuntimeContext | None) -> tuple[Any, ...] | None:
+    if context is None:
+        return None
+    return (
+        context.mode,
+        context.org_id,
+        context.workspace_id,
+        context.user_id,
+        context.agent_profile_id,
+        context.project_id,
+        context.permissions_ref,
+        context.backend_profile,
+    )
+
+
+_ACTIVE_CREDENTIAL_BROKERS: dict[tuple[Any, ...] | None, "RuntimeCredentialBroker"] = {}
+
+
+def set_active_credential_broker(
+    broker: "RuntimeCredentialBroker | None",
+    *,
+    context: RuntimeContext | None = None,
+) -> None:
+    """Bind a RuntimeCredentialBroker for native credential call paths."""
+
+    key = _context_key(context)
+    if broker is None:
+        _ACTIVE_CREDENTIAL_BROKERS.pop(key, None)
+    else:
+        _ACTIVE_CREDENTIAL_BROKERS[key] = broker
+
+
+def get_active_credential_broker(context: RuntimeContext | None = None) -> "RuntimeCredentialBroker | None":
+    return _ACTIVE_CREDENTIAL_BROKERS.get(_context_key(context)) or _ACTIVE_CREDENTIAL_BROKERS.get(None)
 
 
 class CredentialResolutionError(RuntimeError):
