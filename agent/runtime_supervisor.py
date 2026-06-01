@@ -61,6 +61,7 @@ class RunStatus(str, Enum):
     STARTED = "started"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,6 +195,25 @@ def _run_lease_context(context: RuntimeContext, lease_key: str) -> RuntimeContex
         data["run_id"] = None
         return RuntimeContext(**data)
     return context
+
+
+def _run_control_key(context: RuntimeContext, lease_key: str) -> tuple[Any, ...]:
+    """Return the durable in-process control key for cancellation state."""
+
+    lease_context = _run_lease_context(context, lease_key)
+    return (
+        lease_context.mode,
+        lease_context.org_id,
+        lease_context.workspace_id,
+        lease_context.user_id,
+        lease_context.conversation_id,
+        lease_context.agent_profile_id,
+        lease_context.project_id,
+        lease_context.run_id,
+        lease_context.job_id,
+        lease_context.backend_profile,
+        lease_key,
+    )
 
 
 def _cron_delivery_binding(context: RuntimeContext) -> dict[str, Any]:
@@ -397,6 +417,7 @@ class LocalRunSupervisor:
         self._shutting_down = False
         self._turn_queues: dict[tuple[str | None, ...], deque[_QueuedTurn]] = {}
         self._warm_conversations: dict[tuple[str | None, ...], _WarmConversation] = {}
+        self._cancelled_runs: set[tuple[Any, ...]] = set()
         self._register_worker()
 
     @property
@@ -478,6 +499,22 @@ class LocalRunSupervisor:
                 return RunResult(status=RunStatus.FAILED, context=context, error="worker is shutting down and cannot accept new runs")
         return _execute_run(self._registry, context, self.worker_id, fn)
 
+    def cancel_run(self, context: RuntimeContext, *, lease_key: str | None = None) -> RunResult:
+        """Request cooperative cancellation for a leased run-to-completion job.
+
+        Threads cannot be forcibly killed safely, so cancellation is recorded
+        against the durable run/job key. A run that has not entered user code is
+        refused before execution; a currently active run observes the request at
+        the next lifecycle boundary and reports ``CANCELLED`` instead of
+        successful completion.
+        """
+
+        key = lease_key or context.job_id or context.run_id or "run"
+        with self._lock:
+            self._cancelled_runs.add(_run_control_key(context, key))
+        _record_audit(self._registry, context, self.worker_id, RunStatus.CANCELLED, error="run cancellation requested")
+        return RunResult(status=RunStatus.CANCELLED, context=context, error="run cancellation requested")
+
     def run_to_completion(
         self,
         context: RuntimeContext,
@@ -487,6 +524,7 @@ class LocalRunSupervisor:
         lease_seconds: float = 300.0,
         now: float | None = None,
         clock: Callable[[], float] | None = None,
+        max_runtime_seconds: float | None = None,
     ) -> RunResult:
         """Run an event/manual/cron callable once under a per-run/job lease.
 
@@ -503,7 +541,15 @@ class LocalRunSupervisor:
                 return RunResult(status=RunStatus.FAILED, context=context, error="worker is draining and cannot accept new runs")
             if self._shutting_down:
                 return RunResult(status=RunStatus.FAILED, context=context, error="worker is shutting down and cannot accept new runs")
-        return self._run_to_completion(context, fn, lease_key=lease_key, lease_seconds=lease_seconds, now=now, clock=clock)
+        return self._run_to_completion(
+            context,
+            fn,
+            lease_key=lease_key,
+            lease_seconds=lease_seconds,
+            now=now,
+            clock=clock,
+            max_runtime_seconds=max_runtime_seconds,
+        )
 
     def submit_run_to_completion(
         self,
@@ -514,6 +560,7 @@ class LocalRunSupervisor:
         lease_seconds: float = 300.0,
         now: float | None = None,
         clock: Callable[[], float] | None = None,
+        max_runtime_seconds: float | None = None,
     ) -> RunHandle:
         """Schedule a leased run-to-completion callable on the bounded pool."""
 
@@ -524,7 +571,14 @@ class LocalRunSupervisor:
                 return self._failed_handle(context, "worker is shutting down and cannot accept new runs")
             executor = self._ensure_executor()
             future = executor.submit(
-                self._run_to_completion, context, fn, lease_key=lease_key, lease_seconds=lease_seconds, now=now, clock=clock
+                self._run_to_completion,
+                context,
+                fn,
+                lease_key=lease_key,
+                lease_seconds=lease_seconds,
+                now=now,
+                clock=clock,
+                max_runtime_seconds=max_runtime_seconds,
             )
         return RunHandle(context=context, _future=future)
 
@@ -537,6 +591,7 @@ class LocalRunSupervisor:
         lease_seconds: float,
         now: float | None,
         clock: Callable[[], float] | None,
+        max_runtime_seconds: float | None,
     ) -> RunResult:
         if self._registry is None:
             return RunResult(
@@ -545,6 +600,7 @@ class LocalRunSupervisor:
                 error="run_to_completion requires a configured backend registry",
             )
         key = lease_key or context.job_id or context.run_id or "run"
+        cancel_key = _run_control_key(context, key)
         lease_context = _run_lease_context(context, key)
         owner = f"{self.worker_id}:{uuid.uuid4().hex}"
         lease = self._registry.get(BackendCapability.RUN_LEASE, lease_context)
@@ -556,6 +612,16 @@ class LocalRunSupervisor:
                 context=context,
                 error=f"run lease {key!r} is held by another owner",
             )
+        with self._lock:
+            if cancel_key in self._cancelled_runs:
+                self._cancelled_runs.discard(cancel_key)
+                try:
+                    lease.release(lease_context, key, owner=owner)
+                except Exception:
+                    pass
+                _record_audit(self._registry, context, self.worker_id, RunStatus.CANCELLED, error="run was cancelled")
+                return RunResult(status=RunStatus.CANCELLED, context=context, error="run was cancelled")
+        start_time = claim_now
         try:
             _record_audit(self._registry, context, self.worker_id, RunStatus.STARTED)
             with _LeaseRenewer(
@@ -567,11 +633,24 @@ class LocalRunSupervisor:
                     try:
                         value = fn()
                     except Exception as exc:  # one run crashing must not corrupt others
+                        with self._lock:
+                            self._cancelled_runs.discard(cancel_key)
                         error = f"{type(exc).__name__}: {exc}"
                         audit_error = f"{type(exc).__name__}: {_sanitize_error_for_audit(str(exc))}"
                         _record_audit(self._registry, context, self.worker_id, RunStatus.FAILED, error=audit_error)
                         return RunResult(status=RunStatus.FAILED, context=context, error=error)
-            if not lease.renew(lease_context, key, owner=owner, now=lease_clock(), lease_seconds=lease_seconds):
+            with self._lock:
+                was_cancelled = cancel_key in self._cancelled_runs
+                self._cancelled_runs.discard(cancel_key)
+            if was_cancelled:
+                _record_audit(self._registry, context, self.worker_id, RunStatus.CANCELLED, error="run was cancelled")
+                return RunResult(status=RunStatus.CANCELLED, context=context, error="run was cancelled")
+            finish_time = lease_clock()
+            if max_runtime_seconds is not None and finish_time - start_time > max_runtime_seconds:
+                error = f"run exceeded max runtime of {max_runtime_seconds} seconds"
+                _record_audit(self._registry, context, self.worker_id, RunStatus.FAILED, error=error)
+                return RunResult(status=RunStatus.FAILED, context=context, error=error)
+            if not lease.renew(lease_context, key, owner=owner, now=finish_time, lease_seconds=lease_seconds):
                 error = f"run lease {key!r} was lost before completion"
                 _record_audit(self._registry, context, self.worker_id, RunStatus.FAILED, error=error)
                 return RunResult(status=RunStatus.FAILED, context=context, error=error)

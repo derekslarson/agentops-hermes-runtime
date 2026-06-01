@@ -8,7 +8,7 @@ import threading
 import time
 from typing import Any, Mapping
 
-from agent.runtime_backends import BackendCapability, LocalAuditBackend, RuntimeBackendRegistry
+from agent.runtime_backends import BackendCapability, LocalAuditBackend, LocalRunLeaseBackend, RuntimeBackendRegistry
 from agent.runtime_context import RuntimeContext, get_current_runtime_context
 from agent.runtime_sessions import LocalSQLiteSessionBackend
 from agent.runtime_supervisor import LocalRunSupervisor, RunResult, RunStatus
@@ -1379,6 +1379,74 @@ def test_run_to_completion_fails_if_job_lease_expires_before_completion():
         "started",
         "failed",
     ]
+
+
+def test_run_to_completion_marks_run_failed_when_max_runtime_exceeded():
+    registry = RuntimeBackendRegistry()
+    supervisor = LocalRunSupervisor(worker_id="worker-rtc-max-runtime", registry=registry)
+    context = _job_context("run-rtc-max-runtime", job_id="job-rtc-max-runtime")
+    times = iter([0.0, 7.0])
+
+    result = supervisor.run_to_completion(
+        context,
+        lambda: "finished-too-late",
+        lease_seconds=30.0,
+        max_runtime_seconds=5.0,
+        clock=lambda: next(times),
+    )
+
+    assert result.status is RunStatus.FAILED
+    assert result.error == "run exceeded max runtime of 5.0 seconds"
+    audit = registry.get(BackendCapability.AUDIT, context)
+    assert [event["status"] for event in audit._events[_audit_scope(context)] if "status" in event] == [
+        "started",
+        "failed",
+    ]
+
+
+def test_run_to_completion_reports_cancel_requested_while_active():
+    registry = RuntimeBackendRegistry()
+    supervisor = LocalRunSupervisor(worker_id="worker-rtc-cancel", registry=registry)
+    context = _job_context("run-rtc-cancel", job_id="job-rtc-cancel")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def active_run():
+        entered.set()
+        release.wait(timeout=2)
+        return "would-have-finished"
+
+    handle = supervisor.submit_run_to_completion(context, active_run, lease_seconds=30.0)
+    assert entered.wait(timeout=2)
+
+    cancel_result = supervisor.cancel_run(context)
+    release.set()
+    result = handle.result(timeout=2)
+
+    assert cancel_result.status is RunStatus.CANCELLED
+    assert result.status is RunStatus.CANCELLED
+    assert result.error == "run was cancelled"
+
+
+def test_run_to_completion_lifecycle_uses_selected_backends_across_deployment_profiles():
+    registry = RuntimeBackendRegistry()
+    profiles = ("local-multi", "compose-self-hosted", "aws-managed")
+    for profile in profiles:
+        registry.register(BackendCapability.RUN_LEASE, lambda options: LocalRunLeaseBackend(), profile=profile)
+        registry.register(BackendCapability.AUDIT, lambda options: LocalAuditBackend(), profile=profile)
+    supervisor = LocalRunSupervisor(worker_id="worker-rtc-profiles", registry=registry)
+
+    for profile in profiles:
+        context = RuntimeContext(**{**_job_context(f"run-{profile}", job_id=f"job-{profile}").to_dict(), "backend_profile": profile})
+        result = supervisor.run_to_completion(context, lambda profile=profile: f"done-{profile}")
+
+        assert result.status is RunStatus.SUCCEEDED
+        assert result.value == f"done-{profile}"
+        audit = registry.get(BackendCapability.AUDIT, context)
+        assert [event["status"] for event in audit._events[_audit_scope(context)] if "status" in event] == [
+            "started",
+            "succeeded",
+        ]
 
 
 def test_run_to_completion_refuses_when_job_lease_already_held():
