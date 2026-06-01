@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import os
 import threading
 import time
 from typing import Any, Mapping
@@ -26,6 +27,28 @@ def _context(run_id: str, user_id: str) -> RuntimeContext:
         run_type="manual",
         backend_profile="local",
     )
+
+
+def _subprocess_pid_and_context() -> dict[str, str | int | None]:
+    current = get_current_runtime_context()
+    return {
+        "pid": os.getpid(),
+        "run_id": current.run_id if current else None,
+        "user_id": current.user_id if current else None,
+    }
+
+
+def test_local_supervisor_can_isolate_submitted_runs_in_child_processes():
+    supervisor = LocalRunSupervisor(worker_id="worker-process", max_concurrent_runs=1, run_isolation="process")
+    ctx = _context("run-process", "derek")
+
+    result = supervisor.submit(ctx, _subprocess_pid_and_context).result(timeout=5)
+
+    assert result.status == RunStatus.SUCCEEDED
+    assert result.value["run_id"] == "run-process"
+    assert result.value["user_id"] == "derek"
+    assert result.value["pid"] != os.getpid()
+    supervisor.shutdown()
 
 
 def test_local_supervisor_runs_two_scoped_runs_concurrently():
@@ -1270,6 +1293,19 @@ def _audit_scope(context: RuntimeContext) -> tuple[Any, ...]:
         context.run_id,
         context.job_id,
     )
+
+
+def test_process_isolation_keeps_run_to_completion_on_worker_thread_pool():
+    registry = RuntimeBackendRegistry()
+    supervisor = LocalRunSupervisor(worker_id="worker-process-rtc", registry=registry, run_isolation="process")
+    context = _job_context("run-process-rtc", job_id="job-process-rtc")
+
+    handle = supervisor.submit_run_to_completion(context, lambda: "done")
+    result = handle.result(timeout=5)
+
+    assert result.status is RunStatus.SUCCEEDED
+    assert result.value == "done"
+    supervisor.shutdown()
 
 
 def test_run_to_completion_claims_per_job_lease_runs_records_success_and_releases():

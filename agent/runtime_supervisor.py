@@ -26,7 +26,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Iterable, Mapping
@@ -141,6 +141,17 @@ def _execute_run(
             return RunResult(status=RunStatus.FAILED, context=context, error=error)
     _record_audit(registry, context, worker_id, RunStatus.SUCCEEDED)
     return RunResult(status=RunStatus.SUCCEEDED, context=context, value=value)
+
+
+def _execute_run_from_context_data(
+    registry: RuntimeBackendRegistry | None,
+    context_data: Mapping[str, Any],
+    worker_id: str,
+    fn: Callable[[], Any],
+) -> RunResult:
+    """Process-pool friendly run executor using serialized context data."""
+
+    return _execute_run(registry, RuntimeContext(**dict(context_data)), worker_id, fn)
 
 
 TurnHandler = Callable[[list[Any]], Mapping[str, Any] | Iterable[Mapping[str, Any]] | None]
@@ -365,18 +376,23 @@ class LocalRunSupervisor:
         registry: RuntimeBackendRegistry | None = None,
         capabilities: Iterable[str] | None = None,
         max_queued_turns_per_conversation: int = 64,
+        run_isolation: str = "thread",
     ) -> None:
         if max_concurrent_runs < 1:
             raise ValueError("max_concurrent_runs must be >= 1")
         if max_queued_turns_per_conversation < 1:
             raise ValueError("max_queued_turns_per_conversation must be >= 1")
+        if run_isolation not in {"thread", "process"}:
+            raise ValueError("run_isolation must be 'thread' or 'process'")
         self.worker_id = worker_id
         self.max_concurrent_runs = max_concurrent_runs
         self.max_queued_turns_per_conversation = max_queued_turns_per_conversation
+        self.run_isolation = run_isolation
         self.capabilities = tuple(capabilities or ("conversation", "event", "cron", "manual"))
         self._registry = registry
         self._lock = threading.RLock()
         self._executor: ThreadPoolExecutor | None = None
+        self._process_executor: ProcessPoolExecutor | None = None
         self._draining = False
         self._shutting_down = False
         self._turn_queues: dict[tuple[str | None, ...], deque[_QueuedTurn]] = {}
@@ -416,6 +432,12 @@ class LocalRunSupervisor:
                 )
             return self._executor
 
+    def _ensure_process_executor(self) -> ProcessPoolExecutor:
+        with self._lock:
+            if self._process_executor is None:
+                self._process_executor = ProcessPoolExecutor(max_workers=self.max_concurrent_runs)
+            return self._process_executor
+
     def submit(self, context: RuntimeContext, fn: Callable[[], Any]) -> RunHandle:
         """Schedule a scoped run on the bounded pool and return a handle."""
 
@@ -424,8 +446,21 @@ class LocalRunSupervisor:
                 return self._failed_handle(context, "worker is draining and cannot accept new runs")
             if self._shutting_down:
                 return self._failed_handle(context, "worker is shutting down and cannot accept new runs")
-            executor = self._ensure_executor()
-            future = executor.submit(_execute_run, self._registry, context, self.worker_id, fn)
+            executor = self._ensure_process_executor() if self.run_isolation == "process" else self._ensure_executor()
+            if self.run_isolation == "process":
+                # RuntimeBackendRegistry instances are mutable in-process
+                # selectors and may contain locks or local backends that are
+                # not pickle-safe. The child process receives the bound
+                # RuntimeContext and can resolve its own backends if needed.
+                future = executor.submit(
+                    _execute_run_from_context_data,
+                    None,
+                    context.to_dict(),
+                    self.worker_id,
+                    fn,
+                )
+            else:
+                future = executor.submit(_execute_run, self._registry, context, self.worker_id, fn)
         return RunHandle(context=context, _future=future)
 
     def _failed_handle(self, context: RuntimeContext, error: str) -> RunHandle:
@@ -927,5 +962,8 @@ class LocalRunSupervisor:
             self._fail_pending_queued_turns_locked("worker is shutting down and cannot accept queued turn")
             self._cancel_unstarted_queued_heads_locked("worker is shutting down and cannot accept queued turn")
             executor, self._executor = self._executor, None
+            process_executor, self._process_executor = self._process_executor, None
         if executor is not None:
             executor.shutdown(wait=wait)
+        if process_executor is not None:
+            process_executor.shutdown(wait=wait)

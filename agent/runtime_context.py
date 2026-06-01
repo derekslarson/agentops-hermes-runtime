@@ -146,6 +146,11 @@ class RuntimeContext:
             "metadata": _thaw_jsonish(self.metadata),
         }
 
+    def __reduce__(self) -> tuple[Any, tuple[dict[str, Any]]]:
+        """Make frozen metadata safe for multiprocessing/pickle boundaries."""
+
+        return (self.from_mapping, (self.to_dict(),))
+
 
 def build_local_runtime_context(
     *,
