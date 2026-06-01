@@ -587,7 +587,9 @@ Required semantics:
 
 ### M9. Credential/secret resolver abstraction
 
-**Status:** Pending
+**Status:** Started
+
+**Autonomous run note (2026-06-01):** Began the credential/secret resolver slice with `agent/runtime_credentials.py`, a `RuntimeCredentialBroker` that resolves capability/ref requests through the pluggable `CredentialResolver` + `SecretStore` contracts, returns redacted `CredentialHandle` objects, exposes secrets to legacy provider/tool paths only inside a scoped environment-variable context manager, and records audit metadata containing refs/status rather than raw values. `LocalCredentialResolver` now supports explicit logical-ref bindings and both local credential/secret stores use a stable tenant/user/profile/project scope so worker run-id changes can still resolve the same credential while other users remain isolated. Focused tests cover ref-based resolution, cross-user isolation, run-id-stable lookup, audit redaction, scoped env restoration, and fail-closed missing refs. Remaining before M9 can be marked Done: wire the broker into real provider/tool credential call paths, represent local env/profile file compatibility through the contract layer, add remote broker/adapter coverage for non-local profiles, and document/verify compose/cloud profile selection without hard-coding cloud-specific logic into core.
 
 **Goal:** Decouple provider/tool credentials from local `.env` without exposing raw secrets to prompts/transcripts.
 

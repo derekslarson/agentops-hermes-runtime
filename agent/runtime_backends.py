@@ -100,6 +100,27 @@ def _runtime_scope_key(context: RuntimeContext | None) -> tuple[Any, ...]:
     )
 
 
+def _credential_scope_key(context: RuntimeContext | None) -> tuple[Any, ...]:
+    """Return the stable tenant/user/project scope for credential state.
+
+    Credentials are durable bindings, not per-run scratch data. A worker restart
+    or warm-run replacement must be able to resolve the same logical credential
+    reference with a new ``run_id`` while another user/org/project remains
+    isolated.
+    """
+
+    if context is None:
+        return (_DEFAULT_PROFILE,)
+    return (
+        context.mode,
+        context.org_id,
+        context.workspace_id,
+        context.user_id,
+        context.agent_profile_id,
+        context.project_id,
+    )
+
+
 def _session_scope_key(context: RuntimeContext | None) -> tuple[Any, ...]:
     """Return the local session/conversation scope for transcript state.
 
@@ -139,7 +160,7 @@ def _redact_audit_value(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {
             str(key): "[REDACTED]"
-            if any(marker in str(key).lower() for marker in _SENSITIVE_EVENT_KEYS)
+            if any(marker in str(key).lower() for marker in _SENSITIVE_EVENT_KEYS) and item is not None
             else _redact_audit_value(item)
             for key, item in value.items()
         }
@@ -971,9 +992,15 @@ class LocalCredentialResolver:
         self._refs: dict[tuple[Any, ...], dict[str, str]] = {}
         self._lock = threading.RLock()
 
+    def put_ref(self, context: RuntimeContext | None, ref: str, secret_ref: str) -> None:
+        """Bind a logical credential request ref to an opaque secret ref."""
+
+        with self._lock:
+            self._refs.setdefault(_credential_scope_key(context), {})[ref] = secret_ref
+
     def resolve(self, context: RuntimeContext | None, ref: str) -> str | None:
         with self._lock:
-            return self._refs.get(_runtime_scope_key(context), {}).get(ref)
+            return self._refs.get(_credential_scope_key(context), {}).get(ref)
 
 
 class LocalSecretStore:
@@ -983,11 +1010,11 @@ class LocalSecretStore:
 
     def get_secret(self, context: RuntimeContext | None, ref: str) -> str | None:
         with self._lock:
-            return self._secrets.get(_runtime_scope_key(context), {}).get(ref)
+            return self._secrets.get(_credential_scope_key(context), {}).get(ref)
 
     def put_secret(self, context: RuntimeContext | None, ref: str, value: str) -> None:
         with self._lock:
-            self._secrets.setdefault(_runtime_scope_key(context), {})[ref] = value
+            self._secrets.setdefault(_credential_scope_key(context), {})[ref] = value
 
 
 class LocalQueueBackend:
