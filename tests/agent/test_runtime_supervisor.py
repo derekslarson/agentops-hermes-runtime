@@ -38,6 +38,19 @@ def _subprocess_pid_and_context() -> dict[str, str | int | None]:
     }
 
 
+def _sleep_past_process_max_runtime() -> str:
+    time.sleep(1.0)
+    return "finished-too-late"
+
+
+def _return_unpickleable_value() -> Any:
+    return lambda: "not pickleable"
+
+
+def _return_large_process_value() -> bytes:
+    return b"x" * (2 * 1024 * 1024)
+
+
 def test_local_supervisor_can_isolate_submitted_runs_in_child_processes():
     supervisor = LocalRunSupervisor(worker_id="worker-process", max_concurrent_runs=1, run_isolation="process")
     ctx = _context("run-process", "derek")
@@ -1402,6 +1415,98 @@ def test_run_to_completion_marks_run_failed_when_max_runtime_exceeded():
         "started",
         "failed",
     ]
+
+
+def test_process_isolated_run_to_completion_terminates_when_max_runtime_expires():
+    registry = RuntimeBackendRegistry()
+    supervisor = LocalRunSupervisor(worker_id="worker-rtc-process-timeout", registry=registry, run_isolation="process")
+    context = _job_context("run-rtc-process-timeout", job_id="job-rtc-process-timeout")
+
+    started = time.monotonic()
+    result = supervisor.run_to_completion(
+        context,
+        _sleep_past_process_max_runtime,
+        lease_seconds=30.0,
+        max_runtime_seconds=0.2,
+    )
+    elapsed = time.monotonic() - started
+
+    assert result.status is RunStatus.FAILED
+    assert result.error == "run exceeded max runtime of 0.2 seconds"
+    assert result.value is None
+    assert elapsed < 0.75
+    lease = registry.get(BackendCapability.RUN_LEASE, RuntimeContext(**{**context.to_dict(), "run_id": None}))
+    assert lease.claim(RuntimeContext(**{**context.to_dict(), "run_id": None}), "job-rtc-process-timeout", owner="next") is True
+    audit = registry.get(BackendCapability.AUDIT, context)
+    assert [event["status"] for event in audit._events[_audit_scope(context)] if "status" in event] == [
+        "started",
+        "failed",
+    ]
+    supervisor.shutdown()
+
+
+def test_process_isolated_run_to_completion_fails_when_result_cannot_cross_process_boundary():
+    registry = RuntimeBackendRegistry()
+    supervisor = LocalRunSupervisor(worker_id="worker-rtc-process-unpickleable", registry=registry, run_isolation="process")
+    context = _job_context("run-rtc-process-unpickleable", job_id="job-rtc-process-unpickleable")
+
+    result = supervisor.run_to_completion(
+        context,
+        _return_unpickleable_value,
+        lease_seconds=30.0,
+        max_runtime_seconds=2.0,
+    )
+
+    assert result.status is RunStatus.FAILED
+    assert result.error is not None
+    assert "could not serialize run result" in result.error
+    assert result.value is None
+    audit = registry.get(BackendCapability.AUDIT, context)
+    assert [event["status"] for event in audit._events[_audit_scope(context)] if "status" in event] == [
+        "started",
+        "failed",
+    ]
+    supervisor.shutdown()
+
+
+def test_process_isolated_run_to_completion_returns_large_values_without_false_timeout():
+    registry = RuntimeBackendRegistry()
+    supervisor = LocalRunSupervisor(worker_id="worker-rtc-process-large", registry=registry, run_isolation="process")
+    context = _job_context("run-rtc-process-large", job_id="job-rtc-process-large")
+
+    result = supervisor.run_to_completion(
+        context,
+        _return_large_process_value,
+        lease_seconds=30.0,
+        max_runtime_seconds=2.0,
+    )
+
+    assert result.status is RunStatus.SUCCEEDED
+    assert result.value == b"x" * (2 * 1024 * 1024)
+    supervisor.shutdown()
+
+
+def test_process_isolated_run_to_completion_returns_failed_result_when_child_cannot_start():
+    registry = RuntimeBackendRegistry()
+    supervisor = LocalRunSupervisor(worker_id="worker-rtc-process-start-fails", registry=registry, run_isolation="process")
+    context = _job_context("run-rtc-process-start-fails", job_id="job-rtc-process-start-fails")
+
+    result = supervisor.run_to_completion(
+        context,
+        lambda: "local functions cannot be pickled for spawn",
+        lease_seconds=30.0,
+        max_runtime_seconds=2.0,
+    )
+
+    assert result.status is RunStatus.FAILED
+    assert result.error is not None
+    assert "could not start child process" in result.error
+    audit = registry.get(BackendCapability.AUDIT, context)
+    assert [event["status"] for event in audit._events[_audit_scope(context)] if "status" in event] == [
+        "started",
+        "failed",
+    ]
+    supervisor.shutdown()
 
 
 def test_run_to_completion_reports_cancel_requested_while_active():

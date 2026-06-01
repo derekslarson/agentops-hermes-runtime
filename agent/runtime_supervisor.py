@@ -21,7 +21,11 @@ Design notes:
 
 from __future__ import annotations
 
+import multiprocessing
+import os
+import pickle
 import re
+import tempfile
 import threading
 import time
 import uuid
@@ -153,6 +157,25 @@ def _execute_run_from_context_data(
     """Process-pool friendly run executor using serialized context data."""
 
     return _execute_run(registry, RuntimeContext(**dict(context_data)), worker_id, fn)
+
+
+def _execute_fn_to_result_file(context_data: Mapping[str, Any], fn: Callable[[], Any], result_path: str) -> None:
+    """Execute a user callable in a standalone process and pickle a small outcome tuple."""
+
+    context = RuntimeContext(**dict(context_data))
+    try:
+        with use_runtime_context(context):
+            value = fn()
+        outcome = ("ok", value)
+    except Exception as exc:  # noqa: BLE001 - serialize user-code failure to parent
+        outcome = ("error", type(exc).__name__, str(exc))
+    try:
+        with open(result_path, "wb") as handle:
+            pickle.dump(outcome, handle)
+    except Exception as exc:  # noqa: BLE001 - result transport failure is a run failure
+        fallback = ("error", "RuntimeError", f"could not serialize run result: {type(exc).__name__}: {exc}")
+        with open(result_path, "wb") as handle:
+            pickle.dump(fallback, handle)
 
 
 TurnHandler = Callable[[list[Any]], Mapping[str, Any] | Iterable[Mapping[str, Any]] | None]
@@ -489,6 +512,76 @@ class LocalRunSupervisor:
         future.set_result(RunResult(status=RunStatus.FAILED, context=context, error=error))
         return RunHandle(context=context, _future=future)
 
+    def _run_callable_in_process_until_timeout(
+        self,
+        context: RuntimeContext,
+        fn: Callable[[], Any],
+        *,
+        max_runtime_seconds: float,
+    ) -> tuple[str, Any | None, str | None]:
+        """Run user code in a child process and terminate it at max runtime.
+
+        This path is intentionally limited to the user callable. The parent keeps
+        ownership of durable leases/audit so local in-process backends are not
+        shared across a process boundary.
+        """
+
+        mp_context = multiprocessing.get_context("spawn")
+        fd, result_path = tempfile.mkstemp(prefix="hermes-run-result-", suffix=".pickle")
+        os.close(fd)
+        try:
+            os.unlink(result_path)
+        except FileNotFoundError:
+            pass
+        process = mp_context.Process(
+            target=_execute_fn_to_result_file,
+            args=(context.to_dict(), fn, result_path),
+            name=f"hermes-run-{self.worker_id}-{context.run_id or 'runtime'}",
+        )
+        try:
+            process.start()
+        except Exception as exc:  # noqa: BLE001 - fail closed when spawn cannot serialize/start
+            try:
+                os.unlink(result_path)
+            except FileNotFoundError:
+                pass
+            return ("error", None, f"could not start child process: {type(exc).__name__}: {exc}")
+        process.join(timeout=max_runtime_seconds)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=1.0)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=1.0)
+            try:
+                os.unlink(result_path)
+            except FileNotFoundError:
+                pass
+            return ("timeout", None, f"run exceeded max runtime of {max_runtime_seconds} seconds")
+        try:
+            with open(result_path, "rb") as handle:
+                outcome = pickle.load(handle)
+        except FileNotFoundError:
+            if process.exitcode == 0:
+                return ("error", None, "child process exited without returning a result")
+            return ("error", None, f"child process exited with code {process.exitcode}")
+        except Exception as exc:  # noqa: BLE001 - corrupt transport file is a run failure
+            return ("error", None, f"could not read run result: {type(exc).__name__}: {exc}")
+        finally:
+            try:
+                os.unlink(result_path)
+            except FileNotFoundError:
+                pass
+        if not isinstance(outcome, tuple) or not outcome:
+            return ("error", None, "child process returned an invalid result")
+        if outcome[0] == "ok":
+            return ("ok", outcome[1] if len(outcome) > 1 else None, None)
+        if outcome[0] == "error":
+            exc_type = str(outcome[1]) if len(outcome) > 1 else "Exception"
+            exc_message = str(outcome[2]) if len(outcome) > 2 else ""
+            return ("error", None, f"{exc_type}: {exc_message}")
+        return ("error", None, "child process returned an unknown result")
+
     def run_sync(self, context: RuntimeContext, fn: Callable[[], Any]) -> RunResult:
         """Run a scoped callable inline on the calling thread (local default)."""
 
@@ -629,16 +722,29 @@ class LocalRunSupervisor:
                 clock=lease_clock,
                 lease_seconds=lease_seconds,
             ):
-                with use_runtime_context(context):
-                    try:
-                        value = fn()
-                    except Exception as exc:  # one run crashing must not corrupt others
+                if self.run_isolation == "process" and max_runtime_seconds is not None:
+                    outcome, value, child_error = self._run_callable_in_process_until_timeout(
+                        context,
+                        fn,
+                        max_runtime_seconds=max_runtime_seconds,
+                    )
+                    if outcome != "ok":
                         with self._lock:
                             self._cancelled_runs.discard(cancel_key)
-                        error = f"{type(exc).__name__}: {exc}"
-                        audit_error = f"{type(exc).__name__}: {_sanitize_error_for_audit(str(exc))}"
+                        audit_error = _sanitize_error_for_audit(child_error or "run failed")
                         _record_audit(self._registry, context, self.worker_id, RunStatus.FAILED, error=audit_error)
-                        return RunResult(status=RunStatus.FAILED, context=context, error=error)
+                        return RunResult(status=RunStatus.FAILED, context=context, error=child_error or "run failed")
+                else:
+                    with use_runtime_context(context):
+                        try:
+                            value = fn()
+                        except Exception as exc:  # one run crashing must not corrupt others
+                            with self._lock:
+                                self._cancelled_runs.discard(cancel_key)
+                            error = f"{type(exc).__name__}: {exc}"
+                            audit_error = f"{type(exc).__name__}: {_sanitize_error_for_audit(str(exc))}"
+                            _record_audit(self._registry, context, self.worker_id, RunStatus.FAILED, error=audit_error)
+                            return RunResult(status=RunStatus.FAILED, context=context, error=error)
             with self._lock:
                 was_cancelled = cancel_key in self._cancelled_runs
                 self._cancelled_runs.discard(cancel_key)
