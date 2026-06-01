@@ -318,7 +318,7 @@ _AUDITED_BACKEND_METHODS: dict[BackendCapability, tuple[str, ...]] = {
     BackendCapability.QUEUE: ("enqueue", "claim", "ack", "nack", "extend_lease"),
     BackendCapability.RUN_LEASE: ("claim", "renew", "release", "expire_stale"),
     BackendCapability.CONVERSATION_ROUTER: ("resolve_conversation", "find_active_run", "route_turn"),
-    BackendCapability.WORKER_REGISTRY: ("register", "heartbeat", "mark_draining", "recover_expired"),
+    BackendCapability.WORKER_REGISTRY: ("register", "heartbeat", "mark_draining", "recover_expired", "list_workers"),
     BackendCapability.ARTIFACT: ("put", "get", "list_artifacts"),
     BackendCapability.DELIVERY: ("deliver",),
 }
@@ -590,13 +590,29 @@ class QueueBackend(Protocol):
 class RunLeaseBackend(Protocol):
     """One active owner per run/job/conversation turn."""
 
-    def claim(self, context: RuntimeContext | None, key: str, *, owner: str) -> bool: ...
+    def claim(
+        self,
+        context: RuntimeContext | None,
+        key: str,
+        *,
+        owner: str,
+        now: float | None = None,
+        lease_seconds: float | None = None,
+    ) -> bool: ...
 
-    def renew(self, context: RuntimeContext | None, key: str, *, owner: str) -> bool: ...
+    def renew(
+        self,
+        context: RuntimeContext | None,
+        key: str,
+        *,
+        owner: str,
+        now: float | None = None,
+        lease_seconds: float | None = None,
+    ) -> bool: ...
 
     def release(self, context: RuntimeContext | None, key: str, *, owner: str) -> None: ...
 
-    def expire_stale(self, context: RuntimeContext | None) -> int: ...
+    def expire_stale(self, context: RuntimeContext | None, *, now: float | None = None) -> int: ...
 
 
 @runtime_checkable
@@ -614,13 +630,30 @@ class ConversationRouter(Protocol):
 class WorkerRegistry(Protocol):
     """Tracks fleet capacity and lifecycle."""
 
-    def register(self, context: RuntimeContext | None, worker: Mapping[str, Any]) -> str: ...
+    def register(
+        self,
+        context: RuntimeContext | None,
+        worker: Mapping[str, Any],
+        *,
+        now: float | None = None,
+        ttl_seconds: float | None = None,
+    ) -> str: ...
 
-    def heartbeat(self, context: RuntimeContext | None, worker_id: str, *, slots: Mapping[str, Any]) -> None: ...
+    def heartbeat(
+        self,
+        context: RuntimeContext | None,
+        worker_id: str,
+        *,
+        slots: Mapping[str, Any],
+        now: float | None = None,
+        ttl_seconds: float | None = None,
+    ) -> None: ...
 
     def mark_draining(self, context: RuntimeContext | None, worker_id: str) -> None: ...
 
-    def recover_expired(self, context: RuntimeContext | None) -> list[str]: ...
+    def recover_expired(self, context: RuntimeContext | None, *, now: float | None = None) -> list[str]: ...
+
+    def list_workers(self, context: RuntimeContext | None) -> list[Mapping[str, Any]]: ...
 
 
 @runtime_checkable
@@ -1226,30 +1259,68 @@ class LocalQueueBackend:
 
 class LocalRunLeaseBackend:
     def __init__(self) -> None:
-        self._owners: dict[tuple[Any, ...], dict[str, str]] = {}
+        self._owners: dict[tuple[Any, ...], dict[str, tuple[str, float | None]]] = {}
         self._lock = threading.RLock()
 
-    def claim(self, context: RuntimeContext | None, key: str, *, owner: str) -> bool:
+    def claim(
+        self,
+        context: RuntimeContext | None,
+        key: str,
+        *,
+        owner: str,
+        now: float | None = None,
+        lease_seconds: float | None = None,
+    ) -> bool:
+        clock = time.time() if now is None else now
+        expires_at = None if lease_seconds is None else clock + lease_seconds
         with self._lock:
             owners = self._owners.setdefault(_runtime_scope_key(context), {})
             current = owners.get(key)
-            if current is not None and current != owner:
-                return False
-            owners[key] = owner
+            if current is not None:
+                current_owner, current_expires_at = current
+                if current_expires_at is not None and current_expires_at <= clock:
+                    owners.pop(key, None)
+                elif current_owner != owner:
+                    return False
+            owners[key] = (owner, expires_at)
             return True
 
-    def renew(self, context: RuntimeContext | None, key: str, *, owner: str) -> bool:
+    def renew(
+        self,
+        context: RuntimeContext | None,
+        key: str,
+        *,
+        owner: str,
+        now: float | None = None,
+        lease_seconds: float | None = None,
+    ) -> bool:
+        clock = time.time() if now is None else now
         with self._lock:
-            return self._owners.get(_runtime_scope_key(context), {}).get(key) == owner
+            current = self._owners.get(_runtime_scope_key(context), {}).get(key)
+            if current is None:
+                return False
+            current_owner, current_expires_at = current
+            if current_owner != owner or (current_expires_at is not None and current_expires_at <= clock):
+                return False
+            next_expires_at = current_expires_at if lease_seconds is None else clock + lease_seconds
+            self._owners.setdefault(_runtime_scope_key(context), {})[key] = (owner, next_expires_at)
+            return True
 
     def release(self, context: RuntimeContext | None, key: str, *, owner: str) -> None:
         with self._lock:
             owners = self._owners.get(_runtime_scope_key(context), {})
-            if owners.get(key) == owner:
+            current = owners.get(key)
+            if current is not None and current[0] == owner:
                 owners.pop(key, None)
 
-    def expire_stale(self, context: RuntimeContext | None) -> int:
-        return 0
+    def expire_stale(self, context: RuntimeContext | None, *, now: float | None = None) -> int:
+        clock = time.time() if now is None else now
+        with self._lock:
+            owners = self._owners.get(_runtime_scope_key(context), {})
+            stale = [key for key, (_owner, expires_at) in owners.items() if expires_at is not None and expires_at <= clock]
+            for key in stale:
+                owners.pop(key, None)
+            return len(stale)
 
 
 class LocalConversationRouter:
@@ -1284,23 +1355,75 @@ class LocalWorkerRegistry:
         self._counter = 0
         self._lock = threading.RLock()
 
-    def register(self, context: RuntimeContext | None, worker: Mapping[str, Any]) -> str:
+    def register(
+        self,
+        context: RuntimeContext | None,
+        worker: Mapping[str, Any],
+        *,
+        now: float | None = None,
+        ttl_seconds: float | None = None,
+    ) -> str:
+        clock = time.time() if now is None else now
+        expires_at = None if ttl_seconds is None else clock + ttl_seconds
         with self._lock:
             self._counter += 1
             worker_id = str(worker.get("id") or self._counter)
-            self._workers.setdefault(_runtime_scope_key(context), {})[worker_id] = {**dict(worker), "draining": False}
+            record = copy.deepcopy(dict(worker))
+            record.update(
+                {
+                    "id": worker_id,
+                    "draining": False,
+                    "last_heartbeat": clock,
+                    "expires_at": expires_at,
+                }
+            )
+            self._workers.setdefault(_runtime_scope_key(context), {})[worker_id] = record
             return worker_id
 
-    def heartbeat(self, context: RuntimeContext | None, worker_id: str, *, slots: Mapping[str, Any]) -> None:
+    def heartbeat(
+        self,
+        context: RuntimeContext | None,
+        worker_id: str,
+        *,
+        slots: Mapping[str, Any],
+        now: float | None = None,
+        ttl_seconds: float | None = None,
+    ) -> None:
+        clock = time.time() if now is None else now
+        expires_at = None if ttl_seconds is None else clock + ttl_seconds
         with self._lock:
-            self._workers.setdefault(_runtime_scope_key(context), {}).setdefault(worker_id, {})["slots"] = dict(slots)
+            workers = self._workers.setdefault(_runtime_scope_key(context), {})
+            if worker_id not in workers:
+                raise KeyError(f"worker {worker_id} is not registered")
+            worker = workers[worker_id]
+            worker["slots"] = copy.deepcopy(dict(slots))
+            worker["last_heartbeat"] = clock
+            worker["expires_at"] = expires_at
 
     def mark_draining(self, context: RuntimeContext | None, worker_id: str) -> None:
         with self._lock:
-            self._workers.setdefault(_runtime_scope_key(context), {}).setdefault(worker_id, {})["draining"] = True
+            workers = self._workers.setdefault(_runtime_scope_key(context), {})
+            if worker_id not in workers:
+                raise KeyError(f"worker {worker_id} is not registered")
+            workers[worker_id]["draining"] = True
 
-    def recover_expired(self, context: RuntimeContext | None) -> list[str]:
-        return []
+    def recover_expired(self, context: RuntimeContext | None, *, now: float | None = None) -> list[str]:
+        clock = time.time() if now is None else now
+        with self._lock:
+            workers = self._workers.setdefault(_runtime_scope_key(context), {})
+            expired = [
+                worker_id
+                for worker_id, worker in workers.items()
+                if worker.get("expires_at") is not None and worker["expires_at"] <= clock
+            ]
+            for worker_id in expired:
+                workers.pop(worker_id, None)
+            return sorted(expired)
+
+    def list_workers(self, context: RuntimeContext | None) -> list[Mapping[str, Any]]:
+        with self._lock:
+            workers = self._workers.get(_runtime_scope_key(context), {})
+            return [copy.deepcopy(workers[worker_id]) for worker_id in sorted(workers)]
 
 
 class LocalArtifactBackend:

@@ -218,22 +218,40 @@ class LocalRunSupervisor:
         worker_id: str = "local",
         max_concurrent_runs: int = 1,
         registry: RuntimeBackendRegistry | None = None,
+        capabilities: Iterable[str] | None = None,
     ) -> None:
         if max_concurrent_runs < 1:
             raise ValueError("max_concurrent_runs must be >= 1")
         self.worker_id = worker_id
         self.max_concurrent_runs = max_concurrent_runs
+        self.capabilities = tuple(capabilities or ("conversation", "event", "cron", "manual"))
         self._registry = registry
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._executor: ThreadPoolExecutor | None = None
+        self._draining = False
         self._register_worker()
+
+    @property
+    def draining(self) -> bool:
+        """Whether this worker is refusing new run claims/submissions."""
+
+        return self._draining
 
     def _register_worker(self) -> None:
         if self._registry is None:
             return
         try:
             workers = self._registry.get(BackendCapability.WORKER_REGISTRY, None)
-            workers.register(None, {"id": self.worker_id, "max_concurrent_runs": self.max_concurrent_runs})
+            workers.register(
+                None,
+                {
+                    "id": self.worker_id,
+                    "capacity": self.max_concurrent_runs,
+                    "max_concurrent_runs": self.max_concurrent_runs,
+                    "capabilities": list(self.capabilities),
+                    "slots": {"active": 0, "available": self.max_concurrent_runs},
+                },
+            )
         except Exception:
             pass
 
@@ -249,13 +267,24 @@ class LocalRunSupervisor:
     def submit(self, context: RuntimeContext, fn: Callable[[], Any]) -> RunHandle:
         """Schedule a scoped run on the bounded pool and return a handle."""
 
-        executor = self._ensure_executor()
-        future = executor.submit(_execute_run, self._registry, context, self.worker_id, fn)
+        with self._lock:
+            if self._draining:
+                return self._failed_handle(context, "worker is draining and cannot accept new runs")
+            executor = self._ensure_executor()
+            future = executor.submit(_execute_run, self._registry, context, self.worker_id, fn)
+        return RunHandle(context=context, _future=future)
+
+    def _failed_handle(self, context: RuntimeContext, error: str) -> RunHandle:
+        future: Future = Future()
+        future.set_result(RunResult(status=RunStatus.FAILED, context=context, error=error))
         return RunHandle(context=context, _future=future)
 
     def run_sync(self, context: RuntimeContext, fn: Callable[[], Any]) -> RunResult:
         """Run a scoped callable inline on the calling thread (local default)."""
 
+        with self._lock:
+            if self._draining:
+                return RunResult(status=RunStatus.FAILED, context=context, error="worker is draining and cannot accept new runs")
         return _execute_run(self._registry, context, self.worker_id, fn)
 
     def process_turn(
@@ -276,6 +305,9 @@ class LocalRunSupervisor:
         ``FAILED`` :class:`RunResult` and mutates no state.
         """
 
+        with self._lock:
+            if self._draining:
+                return RunResult(status=RunStatus.FAILED, context=context, error="worker is draining and cannot accept new runs")
         return _execute_turn(
             self._registry,
             context,
@@ -284,6 +316,29 @@ class LocalRunSupervisor:
             handler,
             lock_ttl_seconds=lock_ttl_seconds,
         )
+
+    def request_drain(self) -> RunResult:
+        """Stop accepting new work and mark the worker draining in the registry.
+
+        In-flight futures are left alone so they can finish or be shut down by
+        the caller. This mirrors distributed worker drain semantics: the worker
+        stops new claims first, then releases active slots through normal
+        completion/shutdown paths.
+        """
+
+        with self._lock:
+            self._draining = True
+            if self._registry is not None:
+                try:
+                    workers = self._registry.get(BackendCapability.WORKER_REGISTRY, None)
+                    workers.mark_draining(None, self.worker_id)
+                except Exception as exc:
+                    return RunResult(
+                        status=RunStatus.FAILED,
+                        context=RuntimeContext(),
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+        return RunResult(status=RunStatus.SUCCEEDED, context=RuntimeContext())
 
     def shutdown(self, *, wait: bool = True) -> None:
         with self._lock:

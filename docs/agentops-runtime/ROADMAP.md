@@ -634,7 +634,9 @@ Required semantics:
 
 ### M11. Worker fleet and run lifecycle
 
-**Status:** Pending
+**Status:** Started
+
+**Autonomous run note (2026-06-01):** Started the worker fleet/run lifecycle slice by hardening the local contract implementations that distributed workers will rely on. `LocalRunLeaseBackend` now supports expiring leases with deterministic `now`/`lease_seconds` arguments so a different worker can recover a run/job/conversation lease after owner death. `LocalWorkerRegistry` now records capacity/capabilities, heartbeat timestamps, expiry, slot snapshots, drain state, `list_workers(...)`, and expired-worker recovery. `LocalRunSupervisor` now has an explicit drain request path: it marks the worker draining through the registry, refuses new run/turn submissions with failed `RunResult`s, and lets in-flight runs finish through normal shutdown. This is partial M11 groundwork only; remaining work includes subprocess-per-run execution, warm conversation idle timeout/routing, event/manual run-to-completion orchestration, queued busy-turn semantics, and proving the same lifecycle across local-multi, compose-self-hosted, and AWS adapter profiles.
 
 **Goal:** Support Derek’s production-style model: scale worker tasks up/down, each task hosting zero to N concurrent Hermes runs, with warm conversations and run-to-completion jobs.
 

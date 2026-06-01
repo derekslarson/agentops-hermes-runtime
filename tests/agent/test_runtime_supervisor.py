@@ -649,6 +649,95 @@ def test_supervisor_process_turn_with_none_handler_result_appends_only_inbound()
     assert backend.locks == {}
 
 
+def test_local_supervisor_drain_prevents_new_runs_and_finishes_active_runs():
+    registry = RuntimeBackendRegistry()
+    supervisor = LocalRunSupervisor(worker_id="worker-drain", max_concurrent_runs=1, registry=registry)
+    context = _context("run-drain", "derek")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def run_until_released():
+        entered.set()
+        release.wait(timeout=2)
+        return "finished-before-drain"
+
+    handle = supervisor.submit(context, run_until_released)
+    assert entered.wait(timeout=2)
+
+    supervisor.request_drain()
+    release.set()
+    supervisor.shutdown(wait=True)
+
+    result = handle.result(timeout=2)
+    assert result.status is RunStatus.SUCCEEDED
+    assert result.value == "finished-before-drain"
+    assert supervisor.draining is True
+    worker_registry = registry.get(BackendCapability.WORKER_REGISTRY, None)
+    assert worker_registry.list_workers(None)[0]["draining"] is True
+
+    blocked = supervisor.submit(context, lambda: "must not start")
+    blocked_result = blocked.result(timeout=2)
+    assert blocked_result.status is RunStatus.FAILED
+    assert blocked_result.error == "worker is draining and cannot accept new runs"
+
+
+def test_local_supervisor_registers_capacity_capabilities_and_idle_slots():
+    registry = RuntimeBackendRegistry()
+    LocalRunSupervisor(
+        worker_id="worker-capacity",
+        max_concurrent_runs=3,
+        registry=registry,
+        capabilities=("conversation", "cron"),
+    )
+
+    workers = registry.get(BackendCapability.WORKER_REGISTRY, None).list_workers(None)
+    assert workers == [
+        {
+            "id": "worker-capacity",
+            "capacity": 3,
+            "max_concurrent_runs": 3,
+            "capabilities": ["conversation", "cron"],
+            "draining": False,
+            "slots": {"active": 0, "available": 3},
+            "last_heartbeat": workers[0]["last_heartbeat"],
+            "expires_at": workers[0]["expires_at"],
+        }
+    ]
+
+
+def test_local_supervisor_request_drain_fails_closed_when_registry_rejects_drain():
+    class FailingWorkerRegistry:
+        def register(self, context, worker, *, now=None, ttl_seconds=None):
+            return str(worker["id"])
+
+        def heartbeat(self, context, worker_id, *, slots, now=None, ttl_seconds=None):
+            return None
+
+        def mark_draining(self, context, worker_id):
+            raise RuntimeError("registry unavailable")
+
+        def recover_expired(self, context, *, now=None):
+            return []
+
+        def list_workers(self, context):
+            return []
+
+    registry = RuntimeBackendRegistry()
+    registry.register(BackendCapability.WORKER_REGISTRY, lambda options: FailingWorkerRegistry(), profile="local")
+    supervisor = LocalRunSupervisor(worker_id="worker-fail-drain", registry=registry)
+
+    result = supervisor.request_drain()
+
+    assert result.status is RunStatus.FAILED
+    assert result.error == "RuntimeError: registry unavailable"
+    assert supervisor.draining is True
+
+    blocked = supervisor.submit(_context("run-after-failed-drain", "derek"), lambda: "must not start")
+    blocked_result = blocked.result(timeout=2)
+    assert blocked_result.status is RunStatus.FAILED
+    assert blocked_result.error == "worker is draining and cannot accept new runs"
+
+
 def test_local_supervisor_preserves_existing_inline_local_behavior_by_default():
     registry = RuntimeBackendRegistry()
     supervisor = LocalRunSupervisor(registry=registry)

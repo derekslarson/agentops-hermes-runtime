@@ -296,6 +296,65 @@ def test_local_backends_partition_state_by_runtime_context():
     assert artifacts.get(alex, "result") == b"alex"
 
 
+def test_local_run_lease_expiry_allows_recovery_after_worker_death():
+    registry = RuntimeBackendRegistry()
+    context = RuntimeContext(mode="agentops", org_id="acme", conversation_id="lease-recovery")
+    leases = registry.get(BackendCapability.RUN_LEASE, context)
+
+    assert leases.claim(context, "run:conversation-1", owner="worker-a", now=10.0, lease_seconds=1.0) is True
+    assert leases.claim(context, "run:conversation-1", owner="worker-b", now=10.5, lease_seconds=1.0) is False
+
+    assert leases.expire_stale(context, now=11.0) == 1
+    assert leases.claim(context, "run:conversation-1", owner="worker-b", now=11.0, lease_seconds=1.0) is True
+
+
+def test_local_worker_registry_tracks_capacity_draining_and_expired_recovery():
+    registry = RuntimeBackendRegistry()
+    context = RuntimeContext(mode="agentops", org_id="acme", workspace_id="runtime", conversation_id="workers")
+    workers = registry.get(BackendCapability.WORKER_REGISTRY, context)
+
+    worker_id = workers.register(
+        context,
+        {"id": "worker-a", "capacity": 4, "max_concurrent_runs": 4, "capabilities": ["conversation", "cron"]},
+        now=20.0,
+        ttl_seconds=5.0,
+    )
+    workers.heartbeat(context, worker_id, slots={"active": 2, "available": 2}, now=21.0, ttl_seconds=5.0)
+    workers.mark_draining(context, worker_id)
+
+    snapshot = workers.list_workers(context)
+    assert snapshot == [
+        {
+            "id": "worker-a",
+            "capacity": 4,
+            "max_concurrent_runs": 4,
+            "capabilities": ["conversation", "cron"],
+            "draining": True,
+            "slots": {"active": 2, "available": 2},
+            "last_heartbeat": 21.0,
+            "expires_at": 26.0,
+        }
+    ]
+
+    assert workers.recover_expired(context, now=25.9) == []
+    assert workers.recover_expired(context, now=26.0) == ["worker-a"]
+    assert workers.list_workers(context) == []
+
+
+def test_local_worker_registry_rejects_unregistered_lifecycle_updates():
+    registry = RuntimeBackendRegistry()
+    context = RuntimeContext(mode="agentops", org_id="org-a", user_id="derek", backend_profile="local")
+    workers = registry.get(BackendCapability.WORKER_REGISTRY, context)
+
+    with pytest.raises(KeyError, match="worker ghost is not registered"):
+        workers.heartbeat(context, "ghost", slots={"active": 0}, now=1.0)
+
+    with pytest.raises(KeyError, match="worker ghost is not registered"):
+        workers.mark_draining(context, "ghost")
+
+    assert workers.list_workers(context) == []
+
+
 def test_local_audit_backend_redacts_sensitive_event_keys():
     registry = RuntimeBackendRegistry()
     context = RuntimeContext(mode="agentops", org_id="acme", conversation_id="audit")
