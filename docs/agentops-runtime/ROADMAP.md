@@ -2,11 +2,11 @@
 
 ## North star
 
-Make Hermes a distributed, multi-tenant business runtime without losing what makes Hermes useful: the same agent loop, same native `memory` tool, same skills semantics, same cron/autonomous jobs, same tool-calling ergonomics, and same ability to run fully local.
+Make Hermes a distributed, multi-tenant business runtime without losing what makes Hermes useful: the same agent loop, same native `memory` tool, same local/deep-memory recall semantics, same skills semantics, same cron/autonomous jobs, same tool-calling ergonomics, and same ability to run fully local.
 
 The MVP proves one thing:
 
-> Multiple scoped Hermes runs can execute concurrently across a local process, Docker Compose worker fleet, or cloud-managed worker fleet while native Hermes memory, skills, sessions, cron jobs, credentials, artifacts, audit, and delivery routes are selected by `RuntimeContext` and backed by cloud/database/secret-store-agnostic adapters.
+> Multiple scoped Hermes runs can execute concurrently across a local process, Docker Compose worker fleet, or cloud-managed worker fleet while native Hermes curated memory, deep-memory record recall, skills, sessions, cron jobs, credentials, artifacts, audit, and delivery routes are selected by `RuntimeContext` and backed by cloud/database/secret-store-agnostic adapters.
 
 This is not a wrapper that injects memory around Hermes. The native Hermes surfaces remain the interface. The backing stores become pluggable and context-scoped.
 
@@ -16,16 +16,17 @@ This is not a wrapper that injects memory around Hermes. The native Hermes surfa
 2. **Local remains first-class.** Existing local behavior is not legacy; it is the reference implementation and dev mode.
 3. **Local is not single-process.** Local mode must still support multiple concurrent Hermes runs with scoped memory/sessions/skills/cron and safe locking.
 4. **Native tools, remote backing.** Do not build sidecar memory/skills/cron that bypass Hermes. Native Hermes surfaces call pluggable backends.
-5. **Runtime context is load-bearing.** Every backend decision is scoped by `RuntimeContext`: org, workspace, user, conversation/thread, project, agent profile, run, and execution mode.
-6. **Cloud agnostic.** AWS is likely the first production adapter, but no core interface should name ECS, SQS, DynamoDB, Secrets Manager, etc.
-7. **DB agnostic at the contract level, optimized at the adapter level.** Do not force lowest-common-denominator data modeling; Postgres, SQLite, DynamoDB, etc. can implement the same contracts differently.
-8. **Secret-store agnostic.** Local env files, encrypted local stores, AWS Secrets Manager, GCP Secret Manager, Vault, and future stores are implementations of a credential/secret resolver contract.
-9. **Remote cron is mandatory.** Cron/autonomous jobs are part of Hermes’s identity; they need remote storage, leases, delivery targeting, worker execution, and local fallback. Cron locking must be per job/run/lease, not one global scheduler-execution lock: a long-running autonomous coding job may prevent another run of that same job, but must not starve unrelated lightweight watchdog/script jobs that are due on their own schedules.
-10. **Tenant isolation beats convenience.** Cross-user/org/project/thread memory, skill, credential, cron, or session leakage is an MVP blocker.
-11. **Warm workers are an optimization, remote state is authoritative.** Conversation runs may stay warm until idle timeout, but all durable state must survive worker death.
-12. **Infrastructure provisioning is separate from application activation.** Terraform/OpenTofu should create inert cloud resources and output URLs/refs; a bootstrap UI/CLI should store integration secrets, configure policies, run migrations, and prove the system works.
-13. **Secrets stay out of Terraform state.** Terraform may create secret containers/placeholders and IAM access, but Slack/GitHub/Linear/Jira/model-provider secret values should be written by bootstrap directly into the configured secret backend.
-14. **Small fork deltas.** Prefer modular seams that could be upstreamed or maintained as a small patch stack.
+5. **Curated memory and deep memory are separate.** `memory(target=user|memory, ...)` remains the compact curated fact tool; deep memory is the larger historical record layer that ingests completed turns, injects compact recall hints, and exposes lazy full-record fetch tools. Do not collapse either tier into the other or into session search.
+6. **Runtime context is load-bearing.** Every backend decision is scoped by `RuntimeContext`: org, workspace, user, conversation/thread, project, agent profile, run, and execution mode.
+7. **Cloud agnostic.** AWS is likely the first production adapter, but no core interface should name ECS, SQS, DynamoDB, Secrets Manager, etc.
+8. **DB agnostic at the contract level, optimized at the adapter level.** Do not force lowest-common-denominator data modeling; Postgres, SQLite, DynamoDB, etc. can implement the same contracts differently.
+9. **Secret-store agnostic.** Local env files, encrypted local stores, AWS Secrets Manager, GCP Secret Manager, Vault, and future stores are implementations of a credential/secret resolver contract.
+10. **Remote cron is mandatory.** Cron/autonomous jobs are part of Hermes’s identity; they need remote storage, leases, delivery targeting, worker execution, and local fallback. Cron locking must be per job/run/lease, not one global scheduler-execution lock: a long-running autonomous coding job may prevent another run of that same job, but must not starve unrelated lightweight watchdog/script jobs that are due on their own schedules.
+11. **Tenant isolation beats convenience.** Cross-user/org/project/thread memory, skill, credential, cron, or session leakage is an MVP blocker.
+12. **Warm workers are an optimization, remote state is authoritative.** Conversation runs may stay warm until idle timeout, but all durable state must survive worker death.
+13. **Infrastructure provisioning is separate from application activation.** Terraform/OpenTofu should create inert cloud resources and output URLs/refs; a bootstrap UI/CLI should store integration secrets, configure policies, run migrations, and prove the system works.
+14. **Secrets stay out of Terraform state.** Terraform may create secret containers/placeholders and IAM access, but Slack/GitHub/Linear/Jira/model-provider secret values should be written by bootstrap directly into the configured secret backend.
+15. **Small fork deltas.** Prefer modular seams that could be upstreamed or maintained as a small patch stack.
 
 ## Required deployment profiles
 
@@ -334,6 +335,7 @@ Selects concrete implementations by config + RuntimeContext.
 Minimum contracts:
 
 - `MemoryBackend`
+- `DeepMemoryBackend` / `MemoryRecordBackend`
 - `SkillBackend`
 - `SessionBackend`
 - `CronBackend`
@@ -346,6 +348,22 @@ Minimum contracts:
 - `ArtifactBackend`
 - `AuditBackend`
 - `DeliveryBackend`
+
+### DeepMemoryBackend / MemoryRecordBackend
+
+For the new local deep-memory system already running in Derek's local Hermes, but made `RuntimeContext`-scoped and remote-capable for AgentOps.
+
+Required semantics:
+
+- store completed user+assistant turns as verbatim historical records after secret redaction;
+- keep curated `MEMORY.md` / `USER.md` facts separate from historical deep-memory records;
+- expose compact automatic prefetch hints at API-call time without mutating persisted transcripts;
+- expose lazy full-record fetch by stable `mem_...` IDs through native tools such as `memory_record_search`, `memory_record_get`, and `memory_record_get_many`;
+- support vector + keyword/BM25 + deterministic extracted-signal retrieval, with adapter-specific implementations allowed;
+- scope search, prefetch, imports, and full-record fetches by `RuntimeContext` so user/org/project/thread records cannot leak across tenants;
+- ingest only successful completed turns by default, with cron/subagent/review/internal traces excluded unless policy explicitly opts them in;
+- preserve source URI, session/platform metadata, provenance, record IDs, and idempotent import behavior;
+- treat summaries as optional local/async metadata: verbatim records remain source of truth and summary failure must not block record persistence.
 
 ### QueueBackend
 
@@ -509,6 +527,37 @@ Required semantics:
 - No raw memory from another user/org/thread appears in prompt or tool output.
 - Local fallback remains available.
 - Same memory contract works in local-multi and compose-self-hosted profiles.
+
+### M5A. Local flat deep-memory provider + scoped record recall
+
+**Status:** Pending
+
+**Goal:** Port the new local Hermes deep-memory system into the AgentOps fork and make it distributed-runtime native instead of a single-profile Chroma sidecar.
+
+**Source system to port from Derek's local Hermes:**
+
+- `agent/local_memory/store.py`: MemPalace-shaped but flat record store using persistent Chroma collections, ONNX `all-MiniLM-L6-v2` embeddings, cosine HNSW, hybrid vector/BM25 search, and extracted-signal rank boosts.
+- `agent/local_memory/provider.py`: `LocalDeepMemoryProvider` with completed-turn ingestion, scoped prefetch hints, fenced full-record fetch tools, redaction fail-closed behavior, background ingest/summarization, and `sync_platforms` defaults that avoid cron/subagent/review/internal pollution.
+- `plugins/memory/local/`: bundled provider registration.
+- `scripts/local_memory_import.py`: idempotent transcript/session import preserving source/provenance.
+- `tests/agent/test_local_memory.py` and config defaults under `deep_memory`.
+
+**Why this is a separate roadmap item from M4/M5:**
+
+M4/M5 made the native curated `memory` tool backend-scoped. This item covers the second memory tier: historical completed-turn recall and lazy record fetch. AgentOps needs both tiers. The model should keep using the same native surfaces (`memory` for curated facts; automatic deep-memory hints + `memory_record_*` tools for historical records), while storage and retrieval scope are selected by `RuntimeContext`.
+
+**Acceptance criteria:**
+
+- The AgentOps fork includes the local flat deep-memory provider, config, plugin registration, import script, and focused tests from the local Hermes implementation.
+- `deep_memory.enabled` can default on for local-compatible profiles when dependencies are available/lazily installable, while AgentOps/remote profiles fail closed rather than silently falling back to an unscoped local Chroma store.
+- Completed-turn ingestion stores only successful user-facing turns by default, redacts secrets before persistence/summarization, skips interrupted turns, and excludes cron/subagent/review/internal traces unless policy opts them in.
+- Prefetch injects bounded historical hints only into the API-call copy of the current message; persisted session transcripts remain unchanged.
+- `memory_record_search`, `memory_record_get`, and `memory_record_get_many` return scoped historical data/fenced records and cannot fetch another tenant/user/thread's record by ID.
+- Local single-user mode preserves the current `$HERMES_HOME/deep-memory` behavior; local-multi mode partitions record storage/search by RuntimeContext; compose/cloud profiles can register remote or durable adapters behind the same `DeepMemoryBackend` contract.
+- Search behavior preserves the useful local semantics: stable record IDs, source/provenance metadata, vector/BM25 union search, deterministic extracted-signal boosts, metadata filters, bounded excerpts, and optional local summary metadata with verbatim fallback.
+- Imports remain idempotent and source-preserving, and import tools require an explicit target scope/profile so bulk history cannot contaminate the wrong org/user/project.
+- Tests prove cross-user/thread isolation for automatic prefetch and explicit full-record fetch, not just curated `memory` tool writes.
+- Documentation clearly distinguishes curated memory, deep memory, and session search so future implementation work does not collapse them into one abstraction.
 
 ### M6. Session/conversation backend abstraction
 
@@ -843,7 +892,7 @@ Required semantics:
 - Bootstrap stores model provider, Slack, GitHub, Linear, Jira, and future integration secrets directly into the configured secret backend.
 - Bootstrap configures RuntimeContext defaults, worker/run policy, memory scope policy, approval policy, allowed tools, cron enablement, and delivery defaults.
 - Bootstrap shows per-integration readiness checks and verifies webhook/signing secrets where possible.
-- Smoke test verifies API health, worker registration/heartbeat, queue claim, scoped memory read/write, session append/read, cron create/claim, secret resolution, artifact write/read, and at least one integration event-to-response loop.
+- Smoke test verifies API health, worker registration/heartbeat, queue claim, scoped curated memory read/write, scoped deep-memory ingest/prefetch/fetch, session append/read, cron create/claim, secret resolution, artifact write/read, and at least one integration event-to-response loop.
 - Customer can complete the intended path: run Terraform/OpenTofu, open bootstrap UI or run bootstrap CLI, paste integration credentials, click/run OK, see green checks, then send a first Slack/GitHub/Linear/Jira event.
 
 ## Initial implementation order
@@ -854,15 +903,16 @@ Required semantics:
 4. M3 local multi-run concurrency baseline.
 5. M4 native memory backend abstraction.
 6. M5 fake/HTTP remote memory adapter.
-7. M8 cron backend abstraction early, because remote cron is not optional.
-8. M6 sessions and M7 skills.
-9. M9 credentials.
-10. M11 worker fleet/run lifecycle.
-11. M12 Compose self-hosted distributed MVP.
-12. M13 Slack smoke.
-13. M14 AWS adapter spike.
-14. M15 managed cloud Terraform/OpenTofu packaging.
-15. M16 bootstrap UI/CLI and activation smoke test.
+7. M5A local flat deep-memory provider + scoped record recall.
+8. M8 cron backend abstraction early, because remote cron is not optional.
+9. M6 sessions and M7 skills.
+10. M9 credentials.
+11. M11 worker fleet/run lifecycle.
+12. M12 Compose self-hosted distributed MVP.
+13. M13 Slack smoke.
+14. M14 AWS adapter spike.
+15. M15 managed cloud Terraform/OpenTofu packaging.
+16. M16 bootstrap UI/CLI and activation smoke test.
 
 ## Reference MVP proof
 
@@ -888,6 +938,13 @@ Hermes native memory tool in B writes:
 Next turn:
   A sees Derek memory only.
   B sees Alex memory only.
+
+Deep-memory recall proof:
+  A's completed turns are ingested as historical records scoped to Derek/thread=1.
+  B's completed turns are ingested as historical records scoped to Alex/thread=2.
+  A receives only A-scoped automatic hints and can fetch A records by mem_... ID.
+  B cannot receive or fetch A records, even if a record ID is guessed.
+  Session search remains a transcript lookup, not the deep-memory source of truth.
 
 Create org skill:
   "Use Acme engineering style"
@@ -926,6 +983,7 @@ This proof must work first in local-multi and compose-self-hosted profiles befor
 - Removing local mode.
 - Locking architecture to AWS, GCP, Postgres, DynamoDB, RDS, SQS, Secrets Manager, Cloud Run, or any one provider/service.
 - Treating remote memory as prompt injection around Hermes instead of native `memory` tool storage.
+- Treating deep memory as an unscoped global Chroma/local store in AgentOps mode.
 
 ## Open questions
 
@@ -935,6 +993,8 @@ This proof must work first in local-multi and compose-self-hosted profiles befor
 - Should shared skill mutations be impossible from an agent by default, or allowed with approval gates?
 - What is the smallest safe credential grant model that still supports useful tools?
 - Should the first durable distributed backend be Postgres everywhere, or should AWS-native DynamoDB be developed early as a separate adapter?
+- Should deep-memory records live behind a separate `DeepMemoryBackend` contract, or be folded into a broader `MemoryBackend` with distinct curated-vs-record methods?
+- What is the recommended durable remote retrieval stack for deep memory: Postgres + pgvector/FTS, dedicated vector DB, Chroma per tenant, or adapter-specific choices?
 - Should warm conversation runs be subprocesses for isolation from the start, or can some local profiles safely run multiple agents in-process?
 - Should the recommended AWS path use Terraform, OpenTofu, or a wrapper CLI that can drive both?
 - Should bootstrap be primarily a CLI, a hosted web UI, or both from the beginning?
