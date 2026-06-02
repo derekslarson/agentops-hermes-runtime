@@ -66,6 +66,8 @@ def test_compose_profile_documents_scale_and_smoke_commands_without_raw_secrets(
     assert "AGENTOPS_WORKER_MAX_CONCURRENT_RUNS=" in env_text
     assert "docker compose --scale worker=3" in readme_text
     assert "docker compose up" in readme_text
+    assert "python -m agentops_runtime.compose_health_smoke" in readme_text
+    assert "-f deploy/compose/docker-compose.yml" not in readme_text
     assert "raw app/integration secrets" in readme_text
     assert "SLACK_BOT_TOKEN=" not in env_text
     assert "OPENAI_API_KEY=" not in env_text

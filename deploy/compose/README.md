@@ -13,6 +13,26 @@ docker compose up --build
 
 The API health endpoint is published on `http://127.0.0.1:${AGENTOPS_API_PORT:-8710}/healthz`.
 
+## Smoke-check the running services
+
+Once the stack is up, run the packaged smoke surface against the live services. It
+probes `/healthz` and `/readyz` for `api`, `worker`, and `scheduler`, and `/healthz`
+for `local-secrets`, and prints a structured JSON report. It exits non-zero (fails
+closed) if any service is unreachable, returns a non-200 status, or reports
+`"ok": false`:
+
+```bash
+docker compose up --build -d
+docker compose exec api \
+  python -m agentops_runtime.compose_health_smoke
+```
+
+The check runs inside the Compose network, so it reaches `worker` and `scheduler`
+by their service DNS names even though those services publish no host ports.
+Service URLs default to the in-network Compose names and can be overridden via
+`AGENTOPS_API_URL`, `AGENTOPS_WORKER_URL`, `AGENTOPS_SCHEDULER_URL`, and
+`AGENTOPS_SECRET_STORE_URL` to run the same check from a sidecar or the host.
+
 ## Scale workers
 
 Workers have no fixed `container_name`, so Compose can scale them horizontally:
@@ -29,7 +49,7 @@ The `.env.example` file contains only local development infrastructure defaults.
 
 ## Current scope
 
-This slice provides the Compose topology and health-checked service entry points for follow-up M12 work:
+This slice provides the Compose topology, backend wiring, distributed-semantics contract smoke tests, and health-checked service entry points:
 
 - `api` / control-plane service
 - `worker` fleet service, scalable with `--scale worker=N`
@@ -39,4 +59,4 @@ This slice provides the Compose topology and health-checked service entry points
 - `minio` artifact store
 - `local-secrets` development secret-store surface
 
-Follow-up M12 slices still need to wire the durable Compose adapters through the existing RuntimeBackendRegistry contracts and run the full distributed isolation/restart/lease proof.
+The only remaining M12 closure step is to capture a live green `docker compose up` health transcript plus a passing `python -m agentops_runtime.compose_health_smoke` run on a host with Docker daemon access.
