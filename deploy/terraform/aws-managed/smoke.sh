@@ -100,3 +100,22 @@ echo "API health probe OK — ${API_URL}/healthz responded healthy"
 echo "Apply complete — smoke hints/outputs:"
 "$TF" output agentops_api_url
 "$TF" output smoke_test_hints
+
+# --- post-apply non-secret smoke transcript ----------------------------------
+# Write a module-local, non-secret transcript an operator can attach to the
+# still-pending M15 live-smoke evidence before marking the milestone Done. It
+# records the provider/profile, a UTC timestamp, the effective agentops_api_url,
+# the /healthz success, and the smoke_test_hints output — all non-secret values
+# already surfaced above. It never writes a raw app/integration secret value, but
+# review it for secrets before sharing regardless.
+TRANSCRIPT="smoke-transcript-$(date -u +%Y%m%dT%H%M%SZ).log"
+{
+  echo "provider/profile: aws-managed"
+  echo "timestamp (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "agentops_api_url: ${API_URL}"
+  echo "healthz probe: OK — ${API_URL}/healthz responded healthy"
+  echo "smoke_test_hints:"
+  "$TF" output smoke_test_hints
+} >"$TRANSCRIPT"
+echo "Wrote non-secret smoke transcript: ${TRANSCRIPT}"
+echo "Attach it to M15 evidence after reviewing it for secrets before sharing."

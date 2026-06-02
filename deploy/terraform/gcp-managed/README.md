@@ -88,6 +88,16 @@ Before a `PLAN_ONLY=0` apply/smoke you must replace the placeholder
 `scheduler_image`) with real image references — the apply path inspects the
 effective image values and fails closed if any placeholder remains.
 
+On the `PLAN_ONLY=0` apply path, after a healthy `/healthz` probe, the helper
+also writes a module-local **non-secret smoke transcript** (`smoke-transcript-<UTC
+timestamp>.log`) recording the provider/profile, a UTC timestamp, the effective
+`agentops_api_url`, the `/healthz` success, and the `smoke_test_hints` output. The
+helper prints the transcript path so you can attach it to the still-pending M15
+live-smoke evidence before marking the milestone Done. The transcript is produced
+**only** after a `PLAN_ONLY=0` apply with a healthy `/healthz` probe — never in
+the plan-only default. Although the script writes only non-secret outputs,
+**review the transcript for secrets before sharing it**.
+
 Honest caveat: this module is still scaffold-level (see the parity gaps below),
 so **no live GCP apply/smoke is captured** — a successful plan is not a captured
 live deployment. The helper never accepts or echoes raw integration secret

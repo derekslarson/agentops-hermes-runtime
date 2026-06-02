@@ -1667,3 +1667,114 @@ def test_readmes_document_apply_requires_replacing_placeholder_images():
         assert "replace" in lowered, (
             f"{module_dir.name}: smoke-helper section does not state placeholder images must be replaced before apply/smoke"
         )
+
+
+# --- post-apply non-secret smoke transcript artifact (M15 slice) ------------
+#
+# On the opt-in apply path (PLAN_ONLY=0), AFTER the /healthz probe succeeds, both
+# smoke helpers write a module-local, non-secret transcript an operator can attach
+# to the still-pending M15 live-smoke evidence before marking the milestone Done.
+# The transcript records the provider/profile, a UTC timestamp, the effective
+# agentops_api_url, the /healthz success, and the smoke_test_hints output — never a
+# raw app/integration secret value. The helper prints the transcript path. The
+# transcript is apply-path only (it must not run in the plan-only default) and is
+# written only after the probe. Both READMEs document the artifact, that it is
+# produced only after a PLAN_ONLY=0 apply + healthy /healthz, and that it should be
+# reviewed for secrets before sharing.
+
+
+def _transcript_region(text: str) -> str:
+    # Everything from the transcript-filename reference onward — the block that
+    # builds and prints the transcript artifact.
+    idx = text.find("smoke-transcript-")
+    return text[idx:] if idx != -1 else ""
+
+
+def _assert_smoke_writes_transcript(script_path: Path, profile: str) -> None:
+    text = _read(script_path)
+    name = script_path.parent.name
+
+    # A module-local, timestamped transcript artifact is written.
+    assert (
+        "smoke-transcript-" in text
+    ), f"{name}: smoke.sh does not write a module-local smoke-transcript artifact"
+    assert "date -u" in text, f"{name}: transcript is not UTC-timestamped (no date -u)"
+
+    region = _transcript_region(text)
+
+    # Records provider/profile, the effective API URL, the /healthz success, and
+    # the smoke_test_hints output.
+    assert profile in region, f"{name}: transcript does not record the {profile} provider/profile"
+    assert "API_URL" in region, f"{name}: transcript does not record the effective agentops_api_url"
+    assert "healthz" in region.lower(), f"{name}: transcript does not record the /healthz success"
+    assert (
+        "output smoke_test_hints" in region
+    ), f"{name}: transcript does not include the smoke_test_hints output"
+
+    # The transcript path is captured in a variable and printed for the operator.
+    assert "TRANSCRIPT=" in text, f"{name}: smoke.sh does not capture the transcript path in a variable"
+    printed = any(
+        ("echo" in line) and ("TRANSCRIPT" in line) and not line.lstrip().startswith("#")
+        for line in region.splitlines()
+    )
+    assert printed, f"{name}: smoke.sh does not print the transcript path for the operator"
+
+    # Apply-path only and after the probe: the transcript is written after the
+    # PLAN_ONLY guard, after apply, and after the executable /healthz probe line.
+    transcript_idx = text.find("smoke-transcript-")
+    guard_idx = text.find('PLAN_ONLY" != "0"')
+    apply_idx = text.find("apply -input=false")
+    health_idx = text.find(_healthz_line(text))
+
+    assert guard_idx != -1 and apply_idx != -1
+    assert transcript_idx > guard_idx, f"{name}: transcript is not gated behind the PLAN_ONLY apply guard"
+    assert transcript_idx > apply_idx, f"{name}: transcript is written before apply"
+    assert transcript_idx > health_idx, f"{name}: transcript is written before the /healthz probe"
+
+
+def test_aws_smoke_script_writes_non_secret_transcript_after_healthz():
+    _assert_smoke_writes_transcript(SMOKE_SCRIPT, "aws-managed")
+
+
+def test_gcp_smoke_script_writes_non_secret_transcript_after_healthz():
+    _assert_smoke_writes_transcript(GCP_SMOKE_SCRIPT, "gcp-managed")
+
+
+def test_smoke_transcript_does_not_reference_raw_secrets():
+    for script in (SMOKE_SCRIPT, GCP_SMOKE_SCRIPT):
+        region = _transcript_region(_read(script)).lower()
+        assert region, f"{script.parent.name}: smoke.sh has no transcript region"
+        for token in RAW_SECRET_TOKENS:
+            assert token not in region, f"{token} referenced in {script.parent.name} transcript"
+
+
+def test_readmes_document_smoke_transcript_artifact():
+    for module_dir in (AWS_DIR, GCP_DIR):
+        section = _smoke_section(_read(module_dir / "README.md"))
+        assert section, f"{module_dir.name}: README has no live-smoke helper section"
+        lowered = section.lower()
+        # The transcript artifact is documented in the smoke-helper section.
+        assert "transcript" in lowered, f"{module_dir.name}: smoke-helper section does not mention the transcript artifact"
+        # Produced only on the apply path after a healthy /healthz probe.
+        assert "plan_only=0" in lowered or "apply" in lowered, f"{module_dir.name}: transcript not tied to the apply path"
+        assert "healthz" in lowered, f"{module_dir.name}: transcript not tied to the healthy /healthz probe"
+        # Review for secrets before sharing, even though only non-secret outputs
+        # are written.
+        assert "secret" in lowered, f"{module_dir.name}: README does not mention reviewing the transcript for secrets"
+        assert "review" in lowered, f"{module_dir.name}: README does not say to review the transcript before sharing"
+        assert "shar" in lowered, f"{module_dir.name}: README does not say to review before sharing"
+
+
+# --- smoke transcript artifacts are git-ignored (M15 slice) -----------------
+#
+# The module-local smoke-transcript-<UTC>.log files are per-operator evidence
+# artifacts written on the apply path. They are not source and must never be
+# accidentally committed, so the root .gitignore must ignore them.
+
+
+def test_root_gitignore_ignores_smoke_transcript_logs():
+    gitignore = _read(REPO_ROOT / ".gitignore")
+    lines = {line.strip() for line in gitignore.splitlines()}
+    assert (
+        "smoke-transcript-*.log" in lines
+    ), "root .gitignore does not ignore smoke-transcript-*.log operator evidence artifacts"
