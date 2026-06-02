@@ -180,6 +180,30 @@ TRANSCRIPT="smoke-transcript-$(date -u +%Y%m%dT%H%M%SZ).log"
 # This keeps operator evidence from being partially committed if `terraform
 # output` errors mid-write.
 TRANSCRIPT_TMP="${TRANSCRIPT}.tmp"
+# Remove the partial temp transcript if the script is interrupted or exits in the
+# window before the atomic mv, so an operator never finds a half-written
+# ${TRANSCRIPT}.tmp left behind. EXIT cleanup returns normally; a trapped signal
+# otherwise REPLACES bash's default terminating behavior, so the HUP/INT/TERM
+# handler must also terminate non-zero (128+signal) to stay fail-closed.
+cleanup_smoke_transcript_tmp() {
+  if [ -n "${TRANSCRIPT_TMP:-}" ]; then
+    rm -f "$TRANSCRIPT_TMP"
+  fi
+}
+on_signal_cleanup_transcript() {
+  cleanup_smoke_transcript_tmp
+  trap - EXIT HUP INT TERM
+  case "$1" in
+    HUP) exit 129 ;;
+    INT) exit 130 ;;
+    TERM) exit 143 ;;
+    *) exit 1 ;;
+  esac
+}
+trap cleanup_smoke_transcript_tmp EXIT
+trap 'on_signal_cleanup_transcript HUP' HUP
+trap 'on_signal_cleanup_transcript INT' INT
+trap 'on_signal_cleanup_transcript TERM' TERM
 if ! {
   echo "provider/profile: aws-managed"
   echo "timestamp (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -193,5 +217,9 @@ if ! {
   exit 1
 fi
 mv "$TRANSCRIPT_TMP" "$TRANSCRIPT"
+# The final transcript is in place; clear the temp path and disable the cleanup
+# trap so the EXIT handler can never remove the operator-facing transcript.
+TRANSCRIPT_TMP=""
+trap - EXIT HUP INT TERM
 echo "Wrote non-secret smoke transcript: ${TRANSCRIPT}"
 echo "Attach it to M15 evidence after reviewing it for secrets before sharing."

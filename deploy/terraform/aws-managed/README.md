@@ -213,9 +213,16 @@ live-smoke evidence before marking the milestone Done. The transcript is produce
 **only** after a `PLAN_ONLY=0` apply with a healthy `/healthz` probe — never in
 the plan-only default. Although the script writes only non-secret outputs,
 **review the transcript for secrets before sharing it**. The transcript is
-written **atomically** — built in a temporary file and renamed into place only
-once fully written, with the temporary file removed on failure — so a partial
-transcript is never committed as evidence if `terraform output` errors mid-write.
+written **atomically** — built in a `${TRANSCRIPT}.tmp` (`smoke-transcript-<UTC
+timestamp>.log.tmp`) temporary file and renamed into place only once fully
+written. The partial `.tmp` file is removed if the transcript build command fails
+**or if the run is interrupted**: the `EXIT` handler removes it on normal exit,
+and the `HUP`/`INT`/`TERM` handlers remove it and then **terminate the run
+non-zero** (128+signal, i.e. 129/130/143) so an interrupted smoke fails closed
+instead of continuing. The final transcript is written **only after** the atomic
+`mv` succeeds (which also clears the cleanup traps), so a partial transcript is
+never left behind or committed as evidence if `terraform output` errors mid-write
+or the run is cancelled.
 
 The helper never accepts or echoes raw app/integration secret values; bootstrap
 (M16) owns those. **No live AWS apply/smoke has been captured for this module

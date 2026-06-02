@@ -2197,6 +2197,150 @@ def test_readmes_document_smoke_transcript_atomic_write():
         )
 
 
+# --- smoke transcript temp file is cleaned up on interruption (M15 slice) ----
+#
+# The atomic write removes the temp file when the build COMMAND fails, but a
+# signal (INT/TERM/HUP) or an unexpected EXIT in the window between creating
+# ${TRANSCRIPT}.tmp and the atomic mv would leave a partial temp file behind.
+# Both helpers must install an EXIT/HUP/INT/TERM cleanup for the temp file once
+# its path is set (BEFORE the temp file is written), and clear or disable that
+# cleanup after the mv succeeds so the final transcript is kept. Both READMEs say
+# the partial .tmp transcript is removed on failure or interruption.
+
+
+def _assert_smoke_transcript_interrupt_cleanup(script_path: Path) -> None:
+    text = _read(script_path)
+    name = script_path.parent.name
+    region = _transcript_region(text)
+    assert region, f"{name}: smoke.sh has no transcript region"
+
+    tmp_idx = region.find('TRANSCRIPT_TMP="${TRANSCRIPT}.tmp"')
+    assert tmp_idx != -1, f"{name}: transcript temp path is not set as ${{TRANSCRIPT}}.tmp"
+
+    # A signal/exit trap protecting the temp file is installed.
+    trap_idx = region.find("trap ")
+    assert (
+        trap_idx != -1
+    ), f"{name}: no trap installed to clean up the transcript temp file on interruption"
+
+    # Normal exit AND every interruption signal is trapped for cleanup. The traps
+    # may be split across multiple `trap` lines (EXIT can return normally while
+    # signals must terminate), so collect installs rather than expecting one line.
+    trapped = set()
+    for line in region.splitlines():
+        stripped = line.lstrip()
+        if not stripped.startswith("trap ") or stripped.startswith("trap -"):
+            continue
+        for signal in ("EXIT", "HUP", "INT", "TERM"):
+            if signal in stripped:
+                trapped.add(signal)
+    for signal in ("EXIT", "HUP", "INT", "TERM"):
+        assert signal in trapped, f"{name}: transcript cleanup trap does not cover {signal}"
+
+    # The cleanup actually removes the temp transcript file.
+    assert (
+        'rm -f "$TRANSCRIPT_TMP"' in region
+    ), f"{name}: transcript cleanup does not rm -f the temp transcript"
+
+    # Cleanup is armed AFTER the temp path is set but BEFORE the temp file is
+    # written, so an interrupt mid-write is covered.
+    write_idx = region.find('"$TRANSCRIPT_TMP"; then')
+    if write_idx == -1:
+        write_idx = region.find('>"$TRANSCRIPT_TMP"')
+    assert write_idx != -1, f"{name}: transcript is not written to the temp file"
+    assert tmp_idx < trap_idx, f"{name}: cleanup trap is installed before the temp path is set"
+    assert trap_idx < write_idx, f"{name}: cleanup trap is installed after the temp file is written"
+
+    # After the atomic mv succeeds, the cleanup is cleared/disabled so the final
+    # transcript is NOT removed on the exit trap.
+    mv_idx = region.find('mv "$TRANSCRIPT_TMP" "$TRANSCRIPT"')
+    assert mv_idx != -1, f"{name}: transcript is not atomically renamed (mv temp -> final)"
+    after_mv = region[mv_idx:]
+    disabled = ("trap -" in after_mv) or ('TRANSCRIPT_TMP=""' in after_mv)
+    assert disabled, (
+        f"{name}: transcript cleanup is not cleared/disabled after the successful mv "
+        "(a stale EXIT trap could remove the final transcript)"
+    )
+
+
+def test_aws_smoke_script_cleans_up_transcript_temp_on_interruption():
+    _assert_smoke_transcript_interrupt_cleanup(SMOKE_SCRIPT)
+
+
+def test_gcp_smoke_script_cleans_up_transcript_temp_on_interruption():
+    _assert_smoke_transcript_interrupt_cleanup(GCP_SMOKE_SCRIPT)
+
+
+# In bash a trapped signal REPLACES the default terminating behavior: after the
+# handler returns the script keeps running. So an HUP/INT/TERM cleanup that only
+# `rm -f`s the temp and returns is not fail-closed — the interrupted run would
+# continue. The signal cleanup must remove the temp AND terminate non-zero with
+# the conventional 128+signal code (HUP=129, INT=130, TERM=143), while the EXIT
+# handler may clean up and return normally.
+
+
+def _assert_smoke_signal_cleanup_fails_closed(script_path: Path) -> None:
+    text = _read(script_path)
+    name = script_path.parent.name
+    region = _transcript_region(text)
+    assert region, f"{name}: smoke.sh has no transcript region"
+
+    # The interruption signals are trapped (not folded into an EXIT-only handler
+    # that would let the script continue after cleanup).
+    for signal in ("HUP", "INT", "TERM"):
+        trapped = any(
+            line.lstrip().startswith("trap ")
+            and not line.lstrip().startswith("trap -")
+            and signal in line
+            for line in region.splitlines()
+        )
+        assert trapped, f"{name}: {signal} is not trapped for fail-closed transcript cleanup"
+
+    # An EXIT handler still exists for the normal-exit cleanup path.
+    exit_trapped = any(
+        line.lstrip().startswith("trap ")
+        and not line.lstrip().startswith("trap -")
+        and "EXIT" in line
+        for line in region.splitlines()
+    )
+    assert exit_trapped, f"{name}: no EXIT cleanup trap installed"
+
+    # The signal cleanup removes the temp file before terminating.
+    assert (
+        'rm -f "$TRANSCRIPT_TMP"' in region
+    ), f"{name}: signal cleanup does not rm -f the temp transcript"
+
+    # ...and then terminates non-zero with the conventional 128+signal exit codes,
+    # so an interrupted run fails closed instead of continuing past the handler.
+    for signal, code in (("HUP", "129"), ("INT", "130"), ("TERM", "143")):
+        assert (
+            f"exit {code}" in region
+        ), f"{name}: {signal} cleanup does not terminate non-zero (no exit {code})"
+
+
+def test_aws_smoke_script_signal_cleanup_fails_closed():
+    _assert_smoke_signal_cleanup_fails_closed(SMOKE_SCRIPT)
+
+
+def test_gcp_smoke_script_signal_cleanup_fails_closed():
+    _assert_smoke_signal_cleanup_fails_closed(GCP_SMOKE_SCRIPT)
+
+
+def test_readmes_document_smoke_transcript_interrupt_cleanup():
+    for module_dir in (AWS_DIR, GCP_DIR):
+        section = _smoke_section(_read(module_dir / "README.md"))
+        assert section, f"{module_dir.name}: README has no live-smoke helper section"
+        lowered = section.lower()
+        # The partial temp transcript is removed on failure OR interruption.
+        assert "interrupt" in lowered, (
+            f"{module_dir.name}: smoke-helper section does not say the temp transcript is "
+            "removed on interruption"
+        )
+        assert ".tmp" in lowered, (
+            f"{module_dir.name}: smoke-helper section does not name the .tmp temp transcript file"
+        )
+
+
 # --- GCP opt-in External HTTPS Load Balancer + DNS (M15 slice) --------------
 #
 # Closes the load-balancer/DNS parity gap with a small, OPT-IN External HTTPS
