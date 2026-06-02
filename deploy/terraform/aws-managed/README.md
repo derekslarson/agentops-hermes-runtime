@@ -110,6 +110,11 @@ cp terraform.tfvars.example terraform.tfvars   # edit account/region/capacity
 PLAN_ONLY=0 ./smoke.sh     # apply, probe ${agentops_api_url}/healthz, print outputs
 ```
 
+Before a `PLAN_ONLY=0` apply/smoke you must replace the placeholder
+`:replace-me` container images (`control_plane_image`, `worker_image`,
+`scheduler_image`) with real image references — the apply path inspects the
+effective image values and fails closed if any placeholder remains.
+
 The helper never accepts or echoes raw app/integration secret values; bootstrap
 (M16) owns those. **No live AWS apply/smoke has been captured for this module
 yet** — treat the first real `PLAN_ONLY=0 ./smoke.sh` against an account as the

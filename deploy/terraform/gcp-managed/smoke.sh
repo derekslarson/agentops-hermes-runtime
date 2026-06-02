@@ -65,6 +65,23 @@ if [ "$PLAN_ONLY" != "0" ]; then
   exit 0
 fi
 
+# --- apply-path preflight: refuse placeholder ':replace-me' images -----------
+# The image variables ship with ':replace-me' placeholder defaults so a plan is
+# exercisable, but an apply built from them can never yield a working deployment.
+# Inspect each effective (tfvars/defaults) image value independently and fail
+# closed BEFORE the apply side effect if any placeholder remains. No raw secret
+# values are touched.
+for image_var in control_plane_image worker_image scheduler_image; do
+  if ! image_value="$(printf 'var.%s\n' "$image_var" | "$TF" console 2>/dev/null)"; then
+    echo "error: could not inspect ${image_var} with ${TF} console before PLAN_ONLY=0 apply/smoke" >&2
+    exit 1
+  fi
+  if printf '%s' "$image_value" | grep -q 'replace-me'; then
+    echo "error: ${image_var} still contains the ':replace-me' placeholder — set a real image reference in terraform.tfvars before PLAN_ONLY=0 apply/smoke" >&2
+    exit 1
+  fi
+done
+
 # --- apply-path prerequisite: curl for the post-apply health probe -----------
 # Required only on the apply path (plan-only never probes). Fail clearly BEFORE
 # the apply side effect if curl is unavailable.

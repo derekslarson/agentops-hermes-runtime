@@ -1564,3 +1564,106 @@ def test_gcp_tfvars_documents_public_invoker_and_optional_custom_domain():
     assert "enable_custom_domain" in tfvars, "tfvars example does not surface enable_custom_domain"
     lowered = tfvars.lower()
     assert "optional" in lowered or "invoker" in lowered, "tfvars does not explain the optional public-endpoint path"
+
+
+# --- apply-path preflight: refuse placeholder ':replace-me' images (M15 slice) -
+#
+# The container-image variables ship with ':replace-me' placeholder defaults so
+# `plan` is exercisable, but an apply built from those placeholders can never yield
+# a working deployment. On the opt-in apply path (PLAN_ONLY=0) both smoke helpers
+# must fail closed BEFORE the apply side effect when any image variable still
+# carries the ':replace-me' placeholder. The check is apply-path only (plan-only
+# may still plan placeholder images) and must not introduce raw app/integration
+# secrets. Both READMEs must document that the apply/smoke path requires replacing
+# the placeholder images first.
+
+
+def _assert_smoke_blocks_placeholder_images(script_path: Path) -> None:
+    text = _read(script_path)
+    name = script_path.parent.name
+
+    # The apply path refuses to proceed while an image variable still carries the
+    # ':replace-me' placeholder — applying those can never yield a working deploy.
+    assert (
+        "replace-me" in text
+    ), f"{name}: smoke.sh has no ':replace-me' placeholder-image preflight before apply"
+
+    placeholder_idx = text.find("replace-me")
+    guard_idx = text.find('PLAN_ONLY" != "0"')
+    apply_idx = text.find("apply -input=false")
+
+    assert guard_idx != -1, f"{name}: smoke.sh has no PLAN_ONLY guard"
+    assert apply_idx != -1, f"{name}: smoke.sh never runs apply"
+
+    # Apply-path only: the placeholder preflight runs after the PLAN_ONLY guard so
+    # plan-only can still plan placeholder images...
+    assert (
+        placeholder_idx > guard_idx
+    ), f"{name}: placeholder-image preflight is not gated behind the PLAN_ONLY apply guard"
+    # ...and BEFORE the apply side effect.
+    assert (
+        placeholder_idx < apply_idx
+    ), f"{name}: placeholder-image preflight does not run before apply"
+
+    # Fails closed (non-zero) before apply when a placeholder image remains.
+    fail_idx = text.find("exit 1", placeholder_idx)
+    assert (
+        fail_idx != -1 and fail_idx < apply_idx
+    ), f"{name}: placeholder-image preflight does not fail closed (exit 1) before apply"
+
+    # Terraform/OpenTofu console only returns the final expression when multiple
+    # expressions are piped at once; check each image variable independently so an
+    # overridden scheduler image cannot mask placeholder control-plane/worker images.
+    assert "for image_var in" in text, f"{name}: image preflight does not iterate image variables"
+    assert "printf 'var.%s" in text, f"{name}: image preflight does not evaluate one Terraform variable per console call"
+    assert "|| true" not in text[placeholder_idx:apply_idx], f"{name}: image preflight can fail open if Terraform console fails"
+    assert "if ! image_value=" in text, f"{name}: image preflight does not fail closed on Terraform console errors"
+    for image_var in ("control_plane_image", "worker_image", "scheduler_image"):
+        assert image_var in text, f"{name}: image preflight does not include {image_var}"
+
+
+def test_aws_smoke_script_blocks_placeholder_images_before_apply():
+    _assert_smoke_blocks_placeholder_images(SMOKE_SCRIPT)
+
+
+def test_gcp_smoke_script_blocks_placeholder_images_before_apply():
+    _assert_smoke_blocks_placeholder_images(GCP_SMOKE_SCRIPT)
+
+
+def test_smoke_placeholder_preflight_does_not_reference_raw_secrets():
+    for script in (SMOKE_SCRIPT, GCP_SMOKE_SCRIPT):
+        lowered = _read(script).lower()
+        for token in RAW_SECRET_TOKENS:
+            assert token not in lowered, f"{token} referenced in {script.parent.name}/smoke.sh"
+
+
+def _smoke_section(readme: str) -> str:
+    # Extract the live-smoke helper section (header contains "smoke.sh`)") up to
+    # the next "## " heading, so the placeholder-image requirement is documented
+    # against the apply/smoke path specifically.
+    start = readme.find("smoke.sh`)")
+    if start == -1:
+        return ""
+    line_start = readme.rfind("\n", 0, start)
+    next_heading = readme.find("\n## ", start)
+    end = next_heading if next_heading != -1 else len(readme)
+    return readme[line_start:end]
+
+
+def test_readmes_document_apply_requires_replacing_placeholder_images():
+    for module_dir in (AWS_DIR, GCP_DIR):
+        section = _smoke_section(_read(module_dir / "README.md"))
+        assert section, f"{module_dir.name}: README has no live-smoke helper section"
+        lowered = section.lower()
+        # The apply/smoke path requires replacing the ':replace-me' placeholder
+        # images first — documented in the smoke-helper section, not buried far
+        # from the apply path.
+        assert "placeholder" in lowered or "replace-me" in section, (
+            f"{module_dir.name}: smoke-helper section does not mention the placeholder images"
+        )
+        assert "image" in lowered, (
+            f"{module_dir.name}: smoke-helper section does not tie the requirement to the container images"
+        )
+        assert "replace" in lowered, (
+            f"{module_dir.name}: smoke-helper section does not state placeholder images must be replaced before apply/smoke"
+        )

@@ -83,6 +83,11 @@ cd deploy/terraform/gcp-managed
 PLAN_ONLY=0 ./smoke.sh  # opt-in apply, probe ${agentops_api_url}/healthz, surface outputs
 ```
 
+Before a `PLAN_ONLY=0` apply/smoke you must replace the placeholder
+`:replace-me` container images (`control_plane_image`, `worker_image`,
+`scheduler_image`) with real image references — the apply path inspects the
+effective image values and fails closed if any placeholder remains.
+
 Honest caveat: this module is still scaffold-level (see the parity gaps below),
 so **no live GCP apply/smoke is captured** — a successful plan is not a captured
 live deployment. The helper never accepts or echoes raw integration secret
