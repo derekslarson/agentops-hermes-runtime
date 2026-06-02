@@ -11,6 +11,12 @@ name_prefix = "agentops"
 region      = "us-east-1"
 domain      = "agentops.example.com"
 
+# Customer-supplied runtime container images (placeholders — override with the
+# images you build/push). These are not secrets.
+control_plane_image = "agentops/hermes-control-plane:replace-me"
+worker_image        = "agentops/hermes-worker:replace-me"
+scheduler_image     = "agentops/hermes-scheduler:replace-me"
+
 # Capacity.
 desired_task_count  = 2
 max_concurrent_runs = 2

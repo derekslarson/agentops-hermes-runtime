@@ -13,11 +13,11 @@
 #   * IAM task/execution roles
 #   * Application Auto Scaling for the worker service
 #
-# Scope/honesty: this is the packaging scaffold. Resource shapes are wired with
-# the variables/outputs contract; some attributes (image, container defs, ALB
-# routing, networking) are left as TODO markers where a real deployment needs
-# site-specific values. It is meant to be edited and applied, not to provision a
-# production-complete stack unattended.
+# Scope/honesty: task definitions and customer-supplied container images are now
+# wired to the services with the non-secret backend env contract. Public ingress
+# (ALB + listener) and DNS for the API/control-plane are still left as a TODO
+# below where a real deployment needs site-specific values, so an apply does not
+# yet yield a reachable, production-complete stack unattended.
 ###############################################################################
 
 terraform {
@@ -63,6 +63,32 @@ locals {
     "model-provider",
     "database",
   ]
+
+  # Effective backend refs the runtime containers read. Bring-your-own values
+  # win when provided; otherwise the module-created resources are used.
+  effective_artifact_bucket = local.create_artifact_store ? aws_s3_bucket.artifacts[0].bucket : var.existing_artifact_bucket
+  effective_secret_prefix   = var.existing_secret_prefix != "" ? var.existing_secret_prefix : local.prefix
+
+  # Non-secret runtime refs shared by all three services. These are container
+  # ENV entries (names + refs), never raw secret values: the database entry
+  # carries the ARN of the Secrets Manager container that bootstrap fills, not a
+  # connection string.
+  runtime_common_env = [
+    { name = "AGENTOPS_RUNTIME_PROFILE", value = "aws-managed" },
+    { name = "AGENTOPS_QUEUE_URL", value = aws_sqs_queue.runs.url },
+    { name = "AGENTOPS_ARTIFACT_BUCKET", value = local.effective_artifact_bucket },
+    { name = "AGENTOPS_SECRET_PREFIX", value = local.effective_secret_prefix },
+    { name = "AGENTOPS_DATABASE_SECRET_ARN", value = aws_secretsmanager_secret.containers["database"].arn },
+  ]
+
+  log_config = {
+    logDriver = "awslogs"
+    options = {
+      "awslogs-group"         = aws_cloudwatch_log_group.this.name
+      "awslogs-region"        = var.region
+      "awslogs-stream-prefix" = "runtime"
+    }
+  }
 }
 
 # --- Networking (bring-your-own-network supported) --------------------------
@@ -124,6 +150,69 @@ resource "aws_iam_role" "task" {
   tags = local.common_tags
 }
 
+# Execution role needs CloudWatch Logs (awslogs driver) and ECR auth/pull for the
+# customer images. The AWS-managed policy grants exactly this minimal set.
+resource "aws_iam_role_policy_attachment" "task_execution" {
+  role       = aws_iam_role.task_execution.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+# ARN of the effective artifact bucket: the module-created one, or the BYO bucket
+# reconstructed from its name (BYO is supplied by name, not ARN).
+locals {
+  effective_artifact_bucket_arn = local.create_artifact_store ? aws_s3_bucket.artifacts[0].arn : "arn:aws:s3:::${local.effective_artifact_bucket}"
+}
+
+# Task role grants runtime tasks scoped access to the backend refs advertised in
+# runtime_common_env: the runs queue, the artifact bucket + objects, and the
+# Secrets Manager containers (read-only; bootstrap owns the raw values).
+resource "aws_iam_role_policy" "task_runtime_backends" {
+  name = "${local.prefix}-task-runtime-backends"
+  role = aws_iam_role.task.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "RunsQueue"
+        Effect = "Allow"
+        Action = [
+          "sqs:SendMessage",
+          "sqs:ReceiveMessage",
+          "sqs:DeleteMessage",
+          "sqs:GetQueueAttributes",
+          "sqs:GetQueueUrl",
+        ]
+        Resource = aws_sqs_queue.runs.arn
+      },
+      {
+        Sid      = "ArtifactBucket"
+        Effect   = "Allow"
+        Action   = ["s3:ListBucket", "s3:GetBucketLocation"]
+        Resource = local.effective_artifact_bucket_arn
+      },
+      {
+        Sid    = "ArtifactObjects"
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:DeleteObject",
+        ]
+        Resource = "${local.effective_artifact_bucket_arn}/*"
+      },
+      {
+        Sid    = "SecretContainers"
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue",
+          "secretsmanager:DescribeSecret",
+        ]
+        Resource = [for s in aws_secretsmanager_secret.containers : s.arn]
+      },
+    ]
+  })
+}
+
 # --- Managed Postgres (RDS) — bring-your-own supported ----------------------
 
 resource "aws_db_instance" "this" {
@@ -176,13 +265,78 @@ resource "aws_ecs_cluster" "this" {
   tags = local.common_tags
 }
 
+# Task definitions. Each runs the customer-supplied runtime image with the
+# shared non-secret backend env; the worker also advertises its run-slot bound.
+resource "aws_ecs_task_definition" "control_plane" {
+  family                   = "${local.prefix}-control-plane"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = "512"
+  memory                   = "1024"
+  execution_role_arn       = aws_iam_role.task_execution.arn
+  task_role_arn            = aws_iam_role.task.arn
+  tags                     = local.common_tags
+
+  container_definitions = jsonencode([{
+    name             = "control-plane"
+    image            = var.control_plane_image
+    essential        = true
+    environment      = local.runtime_common_env
+    logConfiguration = local.log_config
+  }])
+}
+
+resource "aws_ecs_task_definition" "worker" {
+  family                   = "${local.prefix}-worker"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = "512"
+  memory                   = "1024"
+  execution_role_arn       = aws_iam_role.task_execution.arn
+  task_role_arn            = aws_iam_role.task.arn
+  tags                     = local.common_tags
+
+  container_definitions = jsonencode([{
+    name      = "worker"
+    image     = var.worker_image
+    essential = true
+    environment = concat(local.runtime_common_env, [
+      { name = "AGENTOPS_WORKER_MAX_CONCURRENT_RUNS", value = tostring(var.max_concurrent_runs) },
+    ])
+    logConfiguration = local.log_config
+  }])
+}
+
+resource "aws_ecs_task_definition" "scheduler" {
+  family                   = "${local.prefix}-scheduler"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = "512"
+  memory                   = "1024"
+  execution_role_arn       = aws_iam_role.task_execution.arn
+  task_role_arn            = aws_iam_role.task.arn
+  tags                     = local.common_tags
+
+  container_definitions = jsonencode([{
+    name             = "scheduler"
+    image            = var.scheduler_image
+    essential        = true
+    environment      = local.runtime_common_env
+    logConfiguration = local.log_config
+  }])
+}
+
+# TODO(ingress): public ALB + listener and DNS for the control-plane are not yet
+# wired. Until they are, the API/control-plane is not reachable at var.domain and
+# an apply does not yield a working, internet-facing deployment.
+
 # API / control-plane service.
 resource "aws_ecs_service" "control_plane" {
   name            = "${local.prefix}-control-plane"
   cluster         = aws_ecs_cluster.this.id
   desired_count   = 1
   launch_type     = "FARGATE"
-  task_definition = "TODO-control-plane-task-definition" # set after building the API/control-plane image
+  task_definition = aws_ecs_task_definition.control_plane.arn
   tags            = local.common_tags
 
   network_configuration {
@@ -197,7 +351,7 @@ resource "aws_ecs_service" "worker" {
   cluster         = aws_ecs_cluster.this.id
   desired_count   = var.desired_task_count
   launch_type     = "FARGATE"
-  task_definition = "TODO-worker-task-definition" # worker reads AGENTOPS_WORKER_MAX_CONCURRENT_RUNS=${var.max_concurrent_runs}
+  task_definition = aws_ecs_task_definition.worker.arn
   tags            = local.common_tags
 
   network_configuration {
@@ -212,7 +366,7 @@ resource "aws_ecs_service" "scheduler" {
   cluster         = aws_ecs_cluster.this.id
   desired_count   = 1
   launch_type     = "FARGATE"
-  task_definition = "TODO-scheduler-task-definition"
+  task_definition = aws_ecs_task_definition.scheduler.arn
   tags            = local.common_tags
 
   network_configuration {

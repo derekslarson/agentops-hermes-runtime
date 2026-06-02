@@ -275,6 +275,191 @@ def test_readmes_do_not_overstate_apply_completeness_while_todos_remain():
 # --- docs commands run from the module dir ---------------------------------
 
 
+# --- AWS ECS task definitions + container images (M15 slice) ----------------
+
+
+AWS_TASK_DEF_NAMES = ("control_plane", "worker", "scheduler")
+AWS_IMAGE_VARS = ("control_plane_image", "worker_image", "scheduler_image")
+AWS_TODO_TASK_DEF_LITERALS = (
+    "TODO-control-plane-task-definition",
+    "TODO-worker-task-definition",
+    "TODO-scheduler-task-definition",
+)
+
+
+def _resource_block(text: str, resource_type: str, name: str) -> str:
+    import re
+
+    match = re.search(
+        r'resource "'
+        + re.escape(resource_type)
+        + r'" "'
+        + re.escape(name)
+        + r'".*?(?=\nresource "|\ndata "|\noutput "|\Z)',
+        text,
+        re.DOTALL,
+    )
+    return match.group(0) if match else ""
+
+
+def _list_local(text: str, name: str) -> str:
+    start = text.find(name + " = [")
+    if start == -1:
+        start = text.find(name + "= [")
+    if start == -1:
+        return ""
+    bracket_start = text.index("[", start)
+    depth = 0
+    for i in range(bracket_start, len(text)):
+        char = text[i]
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+            if depth == 0:
+                return text[bracket_start : i + 1]
+    return ""
+
+
+def test_aws_defines_ecs_task_definitions_for_all_services():
+    main = _read(AWS_DIR / "main.tf")
+    for name in AWS_TASK_DEF_NAMES:
+        assert (
+            f'resource "aws_ecs_task_definition" "{name}"' in main
+        ), f"missing aws_ecs_task_definition {name}"
+
+
+def test_aws_ecs_services_reference_task_definitions_not_todo_placeholders():
+    main = _read(AWS_DIR / "main.tf")
+
+    # The literal TODO task-definition placeholders must be gone.
+    for todo in AWS_TODO_TASK_DEF_LITERALS:
+        assert todo not in main, f"{todo} still present"
+
+    # Each service's task_definition points at its task-definition resource.
+    for name in AWS_TASK_DEF_NAMES:
+        block = _resource_block(main, "aws_ecs_service", name)
+        assert block, f"missing aws_ecs_service {name}"
+        assert (
+            f"aws_ecs_task_definition.{name}.arn" in block
+        ), f"{name} service does not reference its task definition resource"
+
+
+def test_aws_variables_expose_non_secret_container_image_inputs():
+    variables = _read(AWS_DIR / "variables.tf")
+    for var_name in AWS_IMAGE_VARS:
+        block = _variable_block(variables, var_name)
+        assert block, f"missing image variable {var_name}"
+        # Placeholder default/example is provided so the contract is usable...
+        assert "default" in block, f"{var_name} has no placeholder default"
+        # ...but the image input is not a secret value.
+        lowered = block.lower()
+        for token in RAW_SECRET_TOKENS:
+            assert token not in lowered, f"{token} leaked into {var_name}"
+
+
+def test_aws_task_definitions_consume_their_image_variables():
+    main = _read(AWS_DIR / "main.tf")
+    for name in AWS_TASK_DEF_NAMES:
+        block = _resource_block(main, "aws_ecs_task_definition", name)
+        assert block, f"missing task definition {name}"
+        assert (
+            f"var.{name}_image" in block
+        ), f"{name} task definition does not consume var.{name}_image"
+
+
+def test_aws_worker_task_def_sets_max_concurrent_runs_from_var():
+    main = _read(AWS_DIR / "main.tf")
+
+    worker = _resource_block(main, "aws_ecs_task_definition", "worker")
+    assert worker, "missing worker task definition"
+    assert "AGENTOPS_WORKER_MAX_CONCURRENT_RUNS" in worker
+    assert "var.max_concurrent_runs" in worker
+
+    # The per-task run-slot bound is worker-specific, not on the other services.
+    for other in ("control_plane", "scheduler"):
+        block = _resource_block(main, "aws_ecs_task_definition", other)
+        assert (
+            "AGENTOPS_WORKER_MAX_CONCURRENT_RUNS" not in block
+        ), f"{other} should not advertise the worker run-slot bound"
+
+
+def test_aws_all_task_defs_share_non_secret_runtime_env():
+    main = _read(AWS_DIR / "main.tf")
+    for name in AWS_TASK_DEF_NAMES:
+        block = _resource_block(main, "aws_ecs_task_definition", name)
+        assert block, f"missing task definition {name}"
+        assert (
+            "local.runtime_common_env" in block
+        ), f"{name} task definition does not include the shared runtime env"
+
+
+def test_aws_runtime_common_env_carries_profile_and_backend_refs():
+    main = _read(AWS_DIR / "main.tf")
+    env = _list_local(main, "runtime_common_env")
+    assert env, "missing runtime_common_env local list"
+
+    # AGENTOPS_RUNTIME_PROFILE=aws-managed
+    assert "AGENTOPS_RUNTIME_PROFILE" in env
+    assert "aws-managed" in env
+
+    # Queue ref wired to the real SQS queue (not a literal).
+    assert "AGENTOPS_QUEUE_URL" in env
+    assert "aws_sqs_queue.runs" in env
+
+    # Artifact store ref (BYO-aware bucket).
+    assert "AGENTOPS_ARTIFACT_BUCKET" in env
+    assert "artifact" in env.lower()
+
+    # Secret prefix/refs.
+    assert "AGENTOPS_SECRET_PREFIX" in env
+
+    # Database ref points at the database secret container, not a raw value.
+    assert "AGENTOPS_DATABASE" in env
+    assert 'aws_secretsmanager_secret.containers["database"].arn' in env
+
+
+# --- IAM: execution + task roles actually grant what the task defs need -----
+
+
+def test_aws_execution_role_has_ecs_execution_permissions():
+    # Task defs use execution_role_arn for awslogs + customer image pulls, so the
+    # execution role must carry the managed ECS execution policy (logs + ECR auth),
+    # not just an assume-role policy.
+    main = _read(AWS_DIR / "main.tf")
+    assert "AmazonECSTaskExecutionRolePolicy" in main, "execution role lacks ECS execution policy"
+
+    block = _resource_block(main, "aws_iam_role_policy_attachment", "task_execution")
+    assert block, "missing execution-role managed-policy attachment"
+    assert "aws_iam_role.task_execution" in block, "attachment not bound to the execution role"
+    assert "AmazonECSTaskExecutionRolePolicy" in block
+
+
+def test_aws_task_role_grants_scoped_backend_access():
+    # The task role is wired into the task defs and the runtime env advertises the
+    # queue/artifact/secret refs, so the role must actually permit SQS, S3, and
+    # Secrets Manager access scoped to the module's resources.
+    main = _read(AWS_DIR / "main.tf")
+    block = _resource_block(main, "aws_iam_role_policy", "task_runtime_backends")
+    assert block, "missing task_runtime_backends inline policy"
+
+    # Bound to the task role, not the execution role.
+    assert "aws_iam_role.task.id" in block, "policy not bound to the task role"
+
+    # SQS access scoped to the runs queue ARN.
+    assert "sqs:" in block
+    assert "aws_sqs_queue.runs.arn" in block
+
+    # S3 access scoped to the effective (created/BYO) artifact bucket + objects.
+    assert "s3:" in block
+    assert "local.effective_artifact_bucket" in block
+    assert "/*" in block, "no object-level S3 ARN"
+
+    # Secrets Manager access scoped to the created secret containers.
+    assert "secretsmanager:" in block
+    assert "aws_secretsmanager_secret.containers" in block
+
+
 def test_readmes_use_module_local_commands_not_root_relative_paths():
     for module_dir, name in ((AWS_DIR, "aws-managed"), (GCP_DIR, "gcp-managed")):
         readme = _read(module_dir / "README.md")

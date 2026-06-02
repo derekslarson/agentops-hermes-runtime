@@ -8,9 +8,9 @@ install.
 
 ## What it provisions
 
-- API / control-plane ECS/Fargate service
-- Worker fleet ECS/Fargate service (Application Auto Scaling)
-- Scheduler ECS/Fargate service
+- API / control-plane ECS/Fargate service + task definition
+- Worker fleet ECS/Fargate service + task definition (Application Auto Scaling)
+- Scheduler ECS/Fargate service + task definition
 - RDS Postgres database
 - SQS runs queue
 - S3 artifact store
@@ -20,11 +20,13 @@ install.
 
 ## Apply
 
-> **Completeness caveat:** Running `apply` provisions the resource skeleton but
-> **does not yield a working deployment** while `main.tf` still carries `TODO`
-> task definitions and container image references. Fill those in (and the ALB/DNS
-> and private-networking wiring noted under **Scope**) before expecting running
-> services.
+> **Completeness caveat:** ECS task definitions and the customer-supplied
+> container images are now wired to the services with the non-secret backend env
+> contract. However, running `apply` still **does not yield a working deployment**:
+> public ingress (ALB + listener) and DNS for the API/control-plane are still a
+> `TODO` in `main.tf`, so the API is not reachable at `domain`. Wire that ingress
+> (and the private-networking notes under **Scope**) before expecting a reachable
+> install.
 
 All commands run from inside this module directory. With Terraform:
 
@@ -89,7 +91,11 @@ After apply, `terraform output` (or `tofu output`) surfaces:
 
 ## Scope
 
-This slice packages the profile topology with the variables/outputs contract.
-Container image references, ALB/DNS wiring, and full networking are marked TODO
-in `main.tf` where they require site-specific values; fill those in for a
+This slice packages the profile topology with the variables/outputs contract and
+wires ECS task definitions to the customer-supplied container images
+(`control_plane_image`, `worker_image`, `scheduler_image`) with the non-secret
+backend env (`AGENTOPS_RUNTIME_PROFILE`, queue/artifact/secret-prefix/database
+refs, and the worker's `AGENTOPS_WORKER_MAX_CONCURRENT_RUNS`). Public ingress
+(ALB + listener), DNS, and full private networking are still marked `TODO` in
+`main.tf` where they require site-specific values; fill those in for a
 production-complete deployment.
