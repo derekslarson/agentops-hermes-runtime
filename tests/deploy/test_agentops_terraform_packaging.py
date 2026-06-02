@@ -1272,3 +1272,134 @@ def test_gcp_readme_documents_image_refs_and_keeps_honesty():
     # Raw integration secrets remain a bootstrap concern, not Terraform inputs.
     assert "bootstrap" in lowered
     assert "raw" in lowered
+
+
+# --- GCP IAM / service accounts (M15 slice) ---------------------------------
+#
+# Parity with the aws-managed task/execution IAM roles: the GCP Cloud Run
+# services must run as a dedicated runtime service account that is granted
+# least-reasonable, scoped access to exactly the backend refs advertised in
+# local.runtime_common_env (Pub/Sub queue, GCS artifacts, Secret Manager
+# containers, Cloud SQL), never the default Compute SA with broad scopes.
+
+GCP_CLOUD_RUN_SERVICES = ("control_plane", "worker", "scheduler")
+
+
+def test_gcp_defines_dedicated_runtime_service_account():
+    main = _read(GCP_DIR / "main.tf")
+    block = _resource_block(main, "google_service_account", "runtime")
+    assert block, "missing dedicated google_service_account.runtime resource"
+    # Account id derives from the name prefix (stable, non-secret).
+    assert "account_id" in block
+    assert "local.prefix" in block or "var.name_prefix" in block
+
+
+def test_gcp_cloud_run_services_run_as_runtime_service_account():
+    main = _read(GCP_DIR / "main.tf")
+    for name in GCP_CLOUD_RUN_SERVICES:
+        block = _resource_block(main, "google_cloud_run_v2_service", name)
+        assert block, f"missing google_cloud_run_v2_service {name}"
+        assert (
+            "service_account = google_service_account.runtime.email" in block
+        ), f"{name} Cloud Run service does not run as the dedicated runtime SA"
+
+
+def test_gcp_runtime_sa_gets_scoped_pubsub_access():
+    # runtime_common_env advertises the Pub/Sub topic + subscription, so the
+    # runtime SA must be able to publish to the topic and consume the
+    # subscription, scoped to those exact resources.
+    main = _read(GCP_DIR / "main.tf")
+
+    publisher = _resource_block(main, "google_pubsub_topic_iam_member", "runtime_publisher")
+    assert publisher, "missing Pub/Sub topic publisher binding for the runtime SA"
+    assert "roles/pubsub.publisher" in publisher
+    assert "google_pubsub_topic.runs" in publisher
+    assert "google_service_account.runtime.email" in publisher
+
+    subscriber = _resource_block(
+        main, "google_pubsub_subscription_iam_member", "runtime_subscriber"
+    )
+    assert subscriber, "missing Pub/Sub subscription subscriber binding for the runtime SA"
+    assert "roles/pubsub.subscriber" in subscriber
+    assert "google_pubsub_subscription.runs" in subscriber
+    assert "google_service_account.runtime.email" in subscriber
+
+
+def test_gcp_runtime_sa_gets_scoped_artifact_bucket_access():
+    # The artifact bucket ref (BYO-aware) is advertised to the runtime; the SA
+    # must get object read/write on the *effective* bucket, including the BYO
+    # bucket-name path, not a project-wide storage role.
+    main = _read(GCP_DIR / "main.tf")
+    block = _resource_block(main, "google_storage_bucket_iam_member", "runtime_artifacts")
+    assert block, "missing GCS artifact bucket binding for the runtime SA"
+    assert "roles/storage.object" in block, "binding is not object-scoped"
+    assert "local.effective_artifact_bucket" in block, "binding ignores the BYO bucket path"
+    assert "google_service_account.runtime.email" in block
+
+
+def test_gcp_runtime_sa_gets_secret_accessor_on_created_containers():
+    # Secret Manager containers carry the runtime/integration secrets bootstrap
+    # fills; the runtime SA must read them (accessor, not admin) scoped to the
+    # created containers, with no secret VERSION resource added.
+    main = _read(GCP_DIR / "main.tf")
+    block = _resource_block(
+        main, "google_secret_manager_secret_iam_member", "runtime_secret_accessor"
+    )
+    assert block, "missing Secret Manager accessor binding for the runtime SA"
+    assert "roles/secretmanager.secretAccessor" in block
+    assert "google_secret_manager_secret.containers" in block
+    assert "google_service_account.runtime.email" in block
+    # Read access only — do not grant admin and do not materialise secret values.
+    assert "secretmanager.admin" not in block
+    assert "google_secret_manager_secret_version" not in main
+
+
+def test_gcp_runtime_sa_gets_cloud_sql_client_access():
+    # The runtime connects to Cloud SQL (managed or BYO connection name), so the
+    # SA must hold the Cloud SQL client role.
+    main = _read(GCP_DIR / "main.tf")
+    block = _resource_block(main, "google_project_iam_member", "runtime_cloudsql")
+    assert block, "missing Cloud SQL client binding for the runtime SA"
+    assert "roles/cloudsql.client" in block
+    assert "google_service_account.runtime.email" in block
+
+
+def test_gcp_readme_drops_iam_parity_gap_keeps_remaining_gaps():
+    readme = _read(GCP_DIR / "README.md")
+    lowered = readme.lower()
+
+    # The stale IAM/service-accounts "not yet" gap must be gone now that the
+    # runtime SA + scoped bindings exist.
+    assert "are not yet defined" not in lowered, "README still lists IAM as an unwired gap"
+    # ...and the README should describe the now-wired, scoped runtime SA.
+    assert "service account" in lowered
+    assert "scoped" in lowered or "least" in lowered
+
+    # Remaining honest parity gaps stay explicit.
+    assert "private network" in lowered, "networking-creation gap dropped"
+    assert "load balancer" in lowered, "load balancer/DNS gap dropped"
+    assert "dns" in lowered, "DNS gap dropped"
+    assert "live" in lowered and "smoke" in lowered, "live apply/smoke gap dropped"
+
+
+def test_gcp_name_prefix_validation_covers_runtime_service_account_id():
+    # GCP service-account account_id is stricter than many resource names:
+    # `${name_prefix}-runtime` must stay <=30 chars, lowercase/hyphen safe, and
+    # start with a letter. The input contract must validate that before apply.
+    variables = _read(GCP_DIR / "variables.tf")
+    block = _variable_block(variables, "name_prefix")
+    assert block, "missing name_prefix variable"
+    assert "validation" in block, "name_prefix lacks validation for the runtime service account id"
+    assert "length(var.name_prefix) <= 22" in block
+    assert "regex" in block and "[a-z" in block.lower()
+    assert "service account" in block.lower()
+
+
+def test_gcp_readme_is_honest_that_cloudsql_iam_is_project_scoped():
+    # Most runtime bindings are resource-scoped, but roles/cloudsql.client is a
+    # project-level IAM binding. README must not imply every binding is resource
+    # scoped.
+    readme = _read(GCP_DIR / "README.md")
+    lowered = readme.lower()
+    assert "roles/cloudsql.client" in readme
+    assert "project-level" in lowered or "project scoped" in lowered or "project-scoped" in lowered

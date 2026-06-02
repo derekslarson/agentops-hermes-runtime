@@ -83,6 +83,7 @@ resource "google_cloud_run_v2_service" "control_plane" {
   name     = "${local.prefix}-control-plane"
   location = var.region
   template {
+    service_account = google_service_account.runtime.email
     containers {
       image = var.control_plane_image
       dynamic "env" {
@@ -110,6 +111,7 @@ resource "google_cloud_run_v2_service" "worker" {
   name     = "${local.prefix}-worker"
   location = var.region
   template {
+    service_account = google_service_account.runtime.email
     scaling {
       min_instance_count = var.min_task_count
       max_instance_count = var.max_task_count
@@ -145,6 +147,7 @@ resource "google_cloud_run_v2_service" "scheduler" {
   name     = "${local.prefix}-scheduler"
   location = var.region
   template {
+    service_account = google_service_account.runtime.email
     containers {
       image = var.scheduler_image
       dynamic "env" {
@@ -204,4 +207,55 @@ resource "google_secret_manager_secret" "containers" {
   replication {
     auto {}
   }
+}
+
+###############################################################################
+# IAM — dedicated runtime service account + scoped backend bindings
+#
+# GCP parity with the aws-managed task role: all three Cloud Run services run as
+# a dedicated runtime service account (not the default Compute SA), and that SA
+# is granted least-reasonable, resource-scoped access to exactly the backend
+# refs advertised in local.runtime_common_env. Bindings stay read-only where
+# possible (Secret Manager accessor, not admin); raw secret values remain a
+# bootstrap concern, so no secret VERSION resource is created here.
+###############################################################################
+
+resource "google_service_account" "runtime" {
+  account_id   = "${local.prefix}-runtime"
+  display_name = "AgentOps Hermes runtime (Cloud Run services)"
+}
+
+# Queue: publish to the runs topic and consume the runs subscription.
+resource "google_pubsub_topic_iam_member" "runtime_publisher" {
+  topic  = google_pubsub_topic.runs.name
+  role   = "roles/pubsub.publisher"
+  member = "serviceAccount:${google_service_account.runtime.email}"
+}
+
+resource "google_pubsub_subscription_iam_member" "runtime_subscriber" {
+  subscription = google_pubsub_subscription.runs.name
+  role         = "roles/pubsub.subscriber"
+  member       = "serviceAccount:${google_service_account.runtime.email}"
+}
+
+# Artifacts: object read/write on the effective bucket (created or BYO by name).
+resource "google_storage_bucket_iam_member" "runtime_artifacts" {
+  bucket = local.effective_artifact_bucket
+  role   = "roles/storage.objectAdmin"
+  member = "serviceAccount:${google_service_account.runtime.email}"
+}
+
+# Secrets: read-only accessor on each created container (bootstrap fills values).
+resource "google_secret_manager_secret_iam_member" "runtime_secret_accessor" {
+  for_each  = google_secret_manager_secret.containers
+  secret_id = each.value.id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.runtime.email}"
+}
+
+# Cloud SQL: client role to open connections (managed or BYO connection name).
+resource "google_project_iam_member" "runtime_cloudsql" {
+  project = var.project
+  role    = "roles/cloudsql.client"
+  member  = "serviceAccount:${google_service_account.runtime.email}"
 }

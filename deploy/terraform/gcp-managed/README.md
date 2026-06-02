@@ -107,13 +107,29 @@ only** and accepts no raw `slack_bot_token`, `github_token`,
 enters Terraform/OpenTofu state. Bootstrap (M16) writes the real values into the
 secret backend after apply.
 
+## IAM — dedicated runtime service account
+
+Like the `aws-managed` task role, all three Cloud Run services run as a
+dedicated runtime **service account** (`<prefix>-runtime`) rather than the
+default Compute service account. That account is granted least-reasonable,
+resource-**scoped** bindings to exactly the backend refs in
+`local.runtime_common_env`:
+
+- **Pub/Sub:** `roles/pubsub.publisher` on the runs topic and
+  `roles/pubsub.subscriber` on the runs subscription.
+- **GCS artifacts:** `roles/storage.objectAdmin` on the effective bucket
+  (module-created or bring-your-own by name).
+- **Secret Manager:** `roles/secretmanager.secretAccessor` (read-only) on each
+  created secret container — bootstrap still owns the raw values, and no secret
+  **version** resource is created here.
+- **Cloud SQL:** `roles/cloudsql.client` at project-level scope so the runtime can
+  open connections to the managed or BYO instance.
+
 ## Parity gaps vs aws-managed
 
 This GCP module is a scaffold and is intentionally behind the `aws-managed`
 module in the following areas:
 
-- **IAM/service accounts:** dedicated worker/task service accounts and bindings
-  are not yet defined (aws-managed defines task/execution IAM roles).
 - **Networking:** bring-your-own VPC/subnet refs are consumed (the services
   attach via Direct VPC egress when `existing_vpc_id` + `existing_subnet_ids`
   are set), but creating a *new* private network / VPC connector when none is

@@ -7,9 +7,14 @@
 ###############################################################################
 
 variable "name_prefix" {
-  description = "Prefix applied to all created resource names."
+  description = "Prefix applied to all created resource names. Must also fit GCP service-account account_id rules when '-runtime' is appended."
   type        = string
   default     = "agentops"
+
+  validation {
+    condition     = length(var.name_prefix) <= 22 && can(regex("^[a-z][a-z0-9-]*$", var.name_prefix))
+    error_message = "name_prefix must be <=22 chars and contain only lowercase letters, numbers, and hyphens, starting with a letter, so '<prefix>-runtime' is a valid GCP service account id."
+  }
 }
 
 variable "project" {
