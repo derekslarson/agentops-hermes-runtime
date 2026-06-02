@@ -180,6 +180,12 @@ so **no live GCP apply/smoke is captured** — a successful plan is not a captur
 live deployment. The helper never accepts or echoes raw integration secret
 values; bootstrap (M16) owns those.
 
+A smoke/plan run also leaves module-local Terraform/OpenTofu artifacts here — the
+`.terraform/` working dir and any `*.tfstate`/`*.tfplan`/`crash.log` files. These
+hold infrastructure details and may carry sensitive values, so they are
+operator-local and must not be committed (the root `.gitignore` already ignores
+them).
+
 ## Public API endpoint
 
 By default, without `enable_load_balancer_custom_domain`, the public API

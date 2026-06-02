@@ -105,3 +105,14 @@ smoke-transcript-*.log
 # deploy/terraform/*-managed/publish-images.sh on the WRITE_TFVARS=1 live path.
 # Per-operator generated input, never source.
 deploy/terraform/*-managed/*.auto.tfvars
+
+# Terraform/OpenTofu local working dir + state/plan/crash artifacts — created by
+# deploy/terraform/*-managed smoke/publish operator runs. The .terraform/ working
+# dir and any state/backup/plan/crash files can carry infrastructure details or
+# sensitive values; they are operator-local and never source.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log

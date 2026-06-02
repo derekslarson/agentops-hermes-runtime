@@ -3366,3 +3366,80 @@ def test_publish_validates_image_tfvars_path_is_module_local_before_side_effects
         assert guard_idx < min(side_effects), (
             f"{name}: IMAGE_TFVARS_PATH validation runs after a side effect"
         )
+
+
+# --- Terraform/OpenTofu local working & state artifacts are git-ignored (M15) ---
+#
+# The live smoke/publish helpers now run module-local terraform/tofu commands in
+# deploy/terraform/*-managed. An operator run leaves a `.terraform/` working dir
+# and may leave state/backup/plan/crash artifacts (*.tfstate, *.tfstate.*,
+# *.tfplan, crash.log, crash.*.log) that can carry infrastructure details or
+# sensitive values. These are operator-local and must never be accidentally
+# committed, so the root .gitignore must ignore them. git check-ignore tests the
+# real ignore behavior (the patterns can evolve) rather than exact gitignore lines.
+
+
+def _git_check_ignore(path: str) -> bool:
+    result = subprocess.run(
+        ["git", "check-ignore", "-q", "--", path],
+        cwd=REPO_ROOT,
+        capture_output=True,
+    )
+    return result.returncode == 0
+
+
+def test_root_gitignore_ignores_managed_terraform_working_dir():
+    # The `.terraform/` plugin/module working dir a local init creates under each
+    # managed module must be ignored (contents and the directory itself).
+    for path in (
+        "deploy/terraform/aws-managed/.terraform/providers/registry/x",
+        "deploy/terraform/gcp-managed/.terraform/modules/y",
+    ):
+        assert _git_check_ignore(path), (
+            f"root .gitignore does not ignore the Terraform working dir {path}"
+        )
+
+
+def test_root_gitignore_ignores_terraform_state_plan_and_crash_artifacts():
+    # State/backup/plan/crash artifacts a local apply/plan can leave behind may
+    # contain infrastructure details or sensitive values.
+    for path in (
+        "deploy/terraform/aws-managed/terraform.tfstate",
+        "deploy/terraform/gcp-managed/terraform.tfstate.backup",
+        "deploy/terraform/aws-managed/terraform.tfstate.1700000000",
+        "deploy/terraform/gcp-managed/run.tfplan",
+        "deploy/terraform/aws-managed/crash.log",
+        "deploy/terraform/gcp-managed/crash.2024-01-01.log",
+    ):
+        assert _git_check_ignore(path), (
+            f"root .gitignore does not ignore the Terraform artifact {path}"
+        )
+
+
+def test_root_gitignore_still_ignores_existing_managed_operator_artifacts():
+    # The new Terraform-artifact coverage must not regress the existing operator
+    # artifact ignores: per-module smoke transcripts and generated image tfvars.
+    for path in (
+        "deploy/terraform/aws-managed/smoke-transcript-20240101T000000Z.log",
+        "deploy/terraform/gcp-managed/smoke-transcript-20240101T000000Z.log",
+        "deploy/terraform/aws-managed/image.auto.tfvars",
+        "deploy/terraform/gcp-managed/custom-images.auto.tfvars",
+    ):
+        assert _git_check_ignore(path), (
+            f"root .gitignore regressed the existing operator artifact ignore for {path}"
+        )
+
+
+def test_live_smoke_docs_note_terraform_artifacts_are_operator_local_not_committed():
+    for module_dir in (AWS_DIR, GCP_DIR):
+        section = _smoke_section(_read(module_dir / "README.md"))
+        assert section, f"{module_dir.name}: README has no live-smoke helper section"
+        lowered = section.lower()
+        # The working dir / state / plan artifacts a smoke run leaves behind are
+        # operator-local and must not be committed.
+        assert "state" in lowered, (
+            f"{module_dir.name}: live-smoke section does not mention local Terraform state artifacts"
+        )
+        assert "commit" in lowered, (
+            f"{module_dir.name}: live-smoke section does not say the local Terraform artifacts must not be committed"
+        )

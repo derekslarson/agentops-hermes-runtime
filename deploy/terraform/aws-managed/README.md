@@ -206,6 +206,12 @@ The helper never accepts or echoes raw app/integration secret values; bootstrap
 yet** — treat the first real `PLAN_ONLY=0 ./smoke.sh` against an account as the
 smoke test.
 
+A smoke/plan run also leaves module-local Terraform/OpenTofu artifacts here — the
+`.terraform/` working dir and any `*.tfstate`/`*.tfplan`/`crash.log` files. These
+hold infrastructure details and may carry sensitive values, so they are
+operator-local and must not be committed (the root `.gitignore` already ignores
+them).
+
 ## Bring your own network / managed resources
 
 Set the `existing_*` variables to reuse infrastructure instead of creating new
