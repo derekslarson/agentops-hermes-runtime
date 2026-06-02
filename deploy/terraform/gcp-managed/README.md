@@ -103,6 +103,19 @@ Copy them into `terraform.tfvars`, then run `PLAN_ONLY=0 ./smoke.sh` to apply
 with real images (the smoke helper refuses to apply while any `:replace-me`
 placeholder remains).
 
+To skip the hand-copy step, set `WRITE_TFVARS=1` on the live path: in addition
+to printing the lines, the helper writes **only** those three non-secret image
+assignments to a module-local tfvars override (default `image.auto.tfvars`,
+overridable via `IMAGE_TFVARS_PATH`) using a temp file + `mv`. Terraform auto-loads
+any `*.auto.tfvars` file, so the next `PLAN_ONLY=0 ./smoke.sh` picks the images up
+with no manual edit. The writer is opt-in and **never runs in the default
+`DRY_RUN=1` mode** (dry-run stays side-effect-free), writes no secret values, and
+the generated file is git-ignored.
+
+```bash
+DRY_RUN=0 WRITE_TFVARS=1 CREATE_REPO=1 ./publish-images.sh   # also writes image.auto.tfvars
+```
+
 ## Live-smoke helper (`./smoke.sh`)
 
 `./smoke.sh` is a module-local helper you run from inside this directory after

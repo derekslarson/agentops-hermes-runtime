@@ -2455,3 +2455,194 @@ def test_publish_helper_readmes_document_context_dockerfile_preflight():
         assert "_context" in lowered, (
             f"{name}: publish section does not mention the *_CONTEXT overrides"
         )
+
+
+# --- opt-in non-secret image tfvars writer (M15 slice) ----------------------
+#
+# By default the publish helpers only PRINT the three non-secret image
+# assignments, leaving operators to hand-copy them into terraform.tfvars before
+# a PLAN_ONLY=0 ./smoke.sh apply. WRITE_TFVARS=1 on the live path (DRY_RUN=0)
+# additionally writes exactly those non-secret assignments
+# (control_plane_image / worker_image / scheduler_image) to a module-local
+# tfvars override (default image.auto.tfvars, overridable via IMAGE_TFVARS_PATH)
+# using a safe temp-file + mv. The writer is opt-in, NEVER runs in dry-run (which
+# must stay side-effect-free), still prints the three lines to stdout, and never
+# emits a raw app/integration secret value. Generated files are git-ignored.
+
+IMAGE_AUTO_TFVARS = "image.auto.tfvars"
+
+
+def _make_publish_context_with_dockerfile(tmp_path: Path) -> Path:
+    ctx = tmp_path / "ctx"
+    ctx.mkdir()
+    (ctx / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    return ctx
+
+
+def test_publish_helpers_default_write_tfvars_off_and_image_path():
+    for script in (AWS_PUBLISH_SCRIPT, GCP_PUBLISH_SCRIPT):
+        text = _read(script)
+        name = script.parent.name
+        # Opt-in: WRITE_TFVARS defaults to 0 (off).
+        assert 'WRITE_TFVARS="${WRITE_TFVARS:-0}"' in text, (
+            f"{name}: publish-images.sh does not default WRITE_TFVARS to 0"
+        )
+        # Default output path is the module-local image.auto.tfvars, overridable.
+        assert 'IMAGE_TFVARS_PATH="${IMAGE_TFVARS_PATH:-image.auto.tfvars}"' in text, (
+            f"{name}: publish-images.sh does not default IMAGE_TFVARS_PATH to image.auto.tfvars"
+        )
+
+
+def test_publish_image_tfvars_writer_uses_safe_temp_file_then_mv():
+    for script in (AWS_PUBLISH_SCRIPT, GCP_PUBLISH_SCRIPT):
+        text = _read(script)
+        name = script.parent.name
+        assert "mktemp" in text, f"{name}: image tfvars writer does not use a temp file"
+        assert "mv " in text, f"{name}: image tfvars writer does not mv the temp file into place"
+
+
+def test_publish_image_tfvars_writer_does_not_reference_raw_secrets():
+    for script in (AWS_PUBLISH_SCRIPT, GCP_PUBLISH_SCRIPT):
+        lowered = _read(script).lower()
+        for token in RAW_SECRET_TOKENS:
+            assert token not in lowered, f"{token} referenced in {script.parent.name}/publish-images.sh"
+
+
+def test_publish_write_tfvars_writes_only_non_secret_image_file_on_live_path(tmp_path):
+    for module_dir, cloud_tool in ((AWS_DIR, "aws"), (GCP_DIR, "gcloud")):
+        sub = tmp_path / cloud_tool
+        sub.mkdir()
+        module_copy, env, _ = _make_publish_env(sub, module_dir, cloud_tool)
+        ctx = _make_publish_context_with_dockerfile(sub)
+        env.update(
+            {
+                "DRY_RUN": "0",
+                "WRITE_TFVARS": "1",
+                "CONTROL_PLANE_CONTEXT": str(ctx),
+                "WORKER_CONTEXT": str(ctx),
+                "SCHEDULER_CONTEXT": str(ctx),
+            }
+        )
+        result = _run_publish(module_copy, env)
+        name = module_dir.name
+        assert result.returncode == 0, (
+            f"{name}: live publish with WRITE_TFVARS=1 failed\n{result.stdout}\n{result.stderr}"
+        )
+
+        written = module_copy / IMAGE_AUTO_TFVARS
+        assert written.is_file(), f"{name}: WRITE_TFVARS=1 did not write {IMAGE_AUTO_TFVARS}"
+
+        body = written.read_text(encoding="utf-8")
+        # Exactly the three non-secret image assignments — nothing else.
+        assign_lines = [
+            line for line in body.splitlines() if "=" in line and not line.lstrip().startswith("#")
+        ]
+        assert len(assign_lines) == 3, (
+            f"{name}: {IMAGE_AUTO_TFVARS} has {len(assign_lines)} assignments, expected only the 3 image vars"
+        )
+        for var_name in IMAGE_TFVARS_VARS:
+            assert var_name in body, f"{name}: {IMAGE_AUTO_TFVARS} missing {var_name}"
+        lowered = body.lower()
+        for token in RAW_SECRET_TOKENS:
+            assert token not in lowered, f"{token} leaked into {name}/{IMAGE_AUTO_TFVARS}"
+
+        # The helper still prints the three lines to stdout as before.
+        for var_name in IMAGE_TFVARS_VARS:
+            assert var_name in result.stdout, f"{name}: stdout no longer prints {var_name}"
+
+
+def test_publish_dry_run_never_writes_image_tfvars_even_with_write_flag(tmp_path):
+    for module_dir, cloud_tool in ((AWS_DIR, "aws"), (GCP_DIR, "gcloud")):
+        sub = tmp_path / cloud_tool
+        sub.mkdir()
+        module_copy, env, _ = _make_publish_env(sub, module_dir, cloud_tool)
+        # WRITE_TFVARS=1 must be ignored in the default DRY_RUN=1 mode.
+        env.update({"DRY_RUN": "1", "WRITE_TFVARS": "1"})
+        result = _run_publish(module_copy, env)
+        name = module_dir.name
+        assert result.returncode == 0, f"{name}: dry-run failed\n{result.stdout}\n{result.stderr}"
+        assert not (module_copy / IMAGE_AUTO_TFVARS).exists(), (
+            f"{name}: dry-run wrote {IMAGE_AUTO_TFVARS} (dry-run must be side-effect-free)"
+        )
+
+
+def test_publish_live_without_write_flag_only_prints_does_not_write(tmp_path):
+    for module_dir, cloud_tool in ((AWS_DIR, "aws"), (GCP_DIR, "gcloud")):
+        sub = tmp_path / cloud_tool
+        sub.mkdir()
+        module_copy, env, _ = _make_publish_env(sub, module_dir, cloud_tool)
+        ctx = _make_publish_context_with_dockerfile(sub)
+        env.update(
+            {
+                "DRY_RUN": "0",
+                "CONTROL_PLANE_CONTEXT": str(ctx),
+                "WORKER_CONTEXT": str(ctx),
+                "SCHEDULER_CONTEXT": str(ctx),
+            }
+        )
+        result = _run_publish(module_copy, env)
+        name = module_dir.name
+        assert result.returncode == 0, (
+            f"{name}: live publish failed\n{result.stdout}\n{result.stderr}"
+        )
+        # Writing is opt-in: a live publish without WRITE_TFVARS=1 only prints.
+        assert not (module_copy / IMAGE_AUTO_TFVARS).exists(), (
+            f"{name}: writer is not opt-in — wrote {IMAGE_AUTO_TFVARS} without WRITE_TFVARS=1"
+        )
+        for var_name in IMAGE_TFVARS_VARS:
+            assert var_name in result.stdout, f"{name}: stdout no longer prints {var_name}"
+
+
+def test_publish_write_tfvars_respects_custom_image_tfvars_path(tmp_path):
+    for module_dir, cloud_tool in ((AWS_DIR, "aws"), (GCP_DIR, "gcloud")):
+        sub = tmp_path / cloud_tool
+        sub.mkdir()
+        module_copy, env, _ = _make_publish_env(sub, module_dir, cloud_tool)
+        ctx = _make_publish_context_with_dockerfile(sub)
+        env.update(
+            {
+                "DRY_RUN": "0",
+                "WRITE_TFVARS": "1",
+                "IMAGE_TFVARS_PATH": "custom-images.auto.tfvars",
+                "CONTROL_PLANE_CONTEXT": str(ctx),
+                "WORKER_CONTEXT": str(ctx),
+                "SCHEDULER_CONTEXT": str(ctx),
+            }
+        )
+        result = _run_publish(module_copy, env)
+        name = module_dir.name
+        assert result.returncode == 0, (
+            f"{name}: live publish failed\n{result.stdout}\n{result.stderr}"
+        )
+        assert (module_copy / "custom-images.auto.tfvars").is_file(), (
+            f"{name}: IMAGE_TFVARS_PATH override not honored"
+        )
+        assert not (module_copy / IMAGE_AUTO_TFVARS).exists(), (
+            f"{name}: default path written despite IMAGE_TFVARS_PATH override"
+        )
+
+
+def test_root_gitignore_ignores_generated_image_tfvars():
+    gitignore = _read(REPO_ROOT / ".gitignore")
+    lines = {line.strip() for line in gitignore.splitlines()}
+    # The generated module-local image tfvars override must be ignored so an
+    # operator's WRITE_TFVARS=1 output is never accidentally committed.
+    assert "deploy/terraform/*-managed/image*.auto.tfvars" in lines, (
+        "root .gitignore does not ignore generated image*.auto.tfvars operator files"
+    )
+
+
+def test_publish_helper_readmes_document_write_tfvars_option():
+    for module_dir in (AWS_DIR, GCP_DIR):
+        section = _publish_section(_read(module_dir / "README.md"))
+        lowered = section.lower()
+        name = module_dir.name
+        assert "write_tfvars" in lowered, (
+            f"{name}: publish section does not document the WRITE_TFVARS opt-in writer"
+        )
+        assert "image.auto.tfvars" in lowered, (
+            f"{name}: publish section does not document the image.auto.tfvars output"
+        )
+        assert "image_tfvars_path" in lowered, (
+            f"{name}: publish section does not document the IMAGE_TFVARS_PATH override"
+        )

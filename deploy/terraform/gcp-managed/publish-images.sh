@@ -44,6 +44,14 @@ cd "$(dirname "$0")"
 
 DRY_RUN="${DRY_RUN:-1}"
 
+# Opt-in, non-secret image tfvars writer. With WRITE_TFVARS=1 on the live path
+# (DRY_RUN=0) the three image assignments are also written to a module-local
+# tfvars override (default image.auto.tfvars) so operators need not hand-copy
+# them before a PLAN_ONLY=0 ./smoke.sh apply. Off by default; never writes in
+# dry-run.
+WRITE_TFVARS="${WRITE_TFVARS:-0}"
+IMAGE_TFVARS_PATH="${IMAGE_TFVARS_PATH:-image.auto.tfvars}"
+
 IMAGE_TAG="${IMAGE_TAG:-$(date -u +%Y%m%d%H%M%S)}"
 AR_LOCATION="${AR_LOCATION:-us-central1}"
 AR_REPO="${AR_REPO:-agentops-hermes-runtime}"
@@ -153,3 +161,23 @@ fi
 echo "control_plane_image = \"${CONTROL_PLANE_IMAGE}\""
 echo "worker_image        = \"${WORKER_IMAGE}\""
 echo "scheduler_image     = \"${SCHEDULER_IMAGE}\""
+
+# --- opt-in: write the non-secret image tfvars override ----------------------
+# Only on the live path (DRY_RUN=0) and only when WRITE_TFVARS=1. Writes solely
+# the three non-secret image assignments via a temp file + mv (atomic, no
+# partial file on failure). Dry-run never writes anything.
+write_image_tfvars() {
+  dest="$1"
+  tmp="$(mktemp "${dest}.XXXXXX")"
+  {
+    echo "control_plane_image = \"${CONTROL_PLANE_IMAGE}\""
+    echo "worker_image        = \"${WORKER_IMAGE}\""
+    echo "scheduler_image     = \"${SCHEDULER_IMAGE}\""
+  } >"$tmp"
+  mv "$tmp" "$dest"
+}
+
+if [ "$DRY_RUN" = "0" ] && [ "$WRITE_TFVARS" = "1" ]; then
+  write_image_tfvars "${IMAGE_TFVARS_PATH}"
+  echo "Wrote non-secret image vars to ${IMAGE_TFVARS_PATH}"
+fi
