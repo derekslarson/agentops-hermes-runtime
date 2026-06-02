@@ -106,11 +106,14 @@ placeholder remains).
 To skip the hand-copy step, set `WRITE_TFVARS=1` on the live path: in addition
 to printing the lines, the helper writes **only** those three non-secret image
 assignments to a module-local tfvars override (default `image.auto.tfvars`,
-overridable via `IMAGE_TFVARS_PATH`) using a temp file + `mv`. Terraform auto-loads
+overridable via `IMAGE_TFVARS_PATH`) **atomically** — building into a
+`mktemp "${dest}.XXXXXX"` temp file and renaming it into place only once fully
+written, so a failure never leaves a partial override. Terraform auto-loads
 any `*.auto.tfvars` file, so the next `PLAN_ONLY=0 ./smoke.sh` picks the images up
 with no manual edit. The writer is opt-in and **never runs in the default
 `DRY_RUN=1` mode** (dry-run stays side-effect-free), writes no secret values, and
-the generated file is git-ignored. A custom `IMAGE_TFVARS_PATH` must stay a
+both the generated file and any interrupted `*.auto.tfvars.XXXXXX` temp artifact
+are git-ignored. A custom `IMAGE_TFVARS_PATH` must stay a
 module-local plain filename (no leading `/`, no `/` path segments, no `..`); the
 helper fails closed before publishing otherwise, so the writer can never clobber
 files outside this module.

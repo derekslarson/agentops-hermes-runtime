@@ -106,8 +106,12 @@ smoke-transcript-*.log.tmp
 
 # Generated non-secret image tfvars overrides — written by
 # deploy/terraform/*-managed/publish-images.sh on the WRITE_TFVARS=1 live path.
-# Per-operator generated input, never source.
+# Per-operator generated input, never source. The `.auto.tfvars.*` form is the
+# atomic-write temp file: the writer builds into a `mktemp "${dest}.XXXXXX"`
+# temp file and renames it into place, so an interrupted publish must not leave
+# a committable partial `<name>.auto.tfvars.XXXXXX` artifact behind.
 deploy/terraform/*-managed/*.auto.tfvars
+deploy/terraform/*-managed/*.auto.tfvars.*
 
 # Terraform/OpenTofu local working dir + state/plan/crash artifacts — created by
 # deploy/terraform/*-managed smoke/publish operator runs. The .terraform/ working

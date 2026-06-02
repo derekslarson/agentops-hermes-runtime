@@ -3492,6 +3492,35 @@ def test_root_gitignore_ignores_generated_image_tfvars():
     )
 
 
+def test_root_gitignore_ignores_image_tfvars_temp_artifact():
+    # The opt-in writer builds the image tfvars override atomically: it writes
+    # into a `mktemp "${dest}.XXXXXX"` temp file and only `mv`s it into place once
+    # fully written. If a WRITE_TFVARS=1 publish is interrupted between the temp
+    # write and the rename, a partial `<name>.auto.tfvars.XXXXXX` artifact is left
+    # behind. The `deploy/terraform/*-managed/*.auto.tfvars` ignore does NOT cover
+    # the trailing `.XXXXXX` suffix, so that partial operator-generated input could
+    # be accidentally committed — exactly what the atomic write was meant to
+    # prevent. The temp artifact must be git-ignored too, for both the default
+    # `image.auto.tfvars` and a custom module-local override name.
+    for module_dir in (AWS_DIR, GCP_DIR):
+        # The scripts derive the temp name as `mktemp "${dest}.XXXXXX"`; assert
+        # that invariant so this test stays anchored to the real script behavior.
+        script = _read(module_dir / "publish-images.sh")
+        assert 'mktemp "${dest}.XXXXXX"' in script, (
+            f"{module_dir.name}/publish-images.sh no longer writes the image tfvars "
+            'via a `mktemp "${dest}.XXXXXX"` temp file — update this test'
+        )
+        for temp_name in (
+            "image.auto.tfvars.ABCDEF",
+            "custom-images.auto.tfvars.XYZ123",
+        ):
+            temp_path = f"deploy/terraform/{module_dir.name}/{temp_name}"
+            assert _git_check_ignore(temp_path), (
+                f"root .gitignore does not ignore the partial image tfvars writer "
+                f"temp artifact {temp_path}"
+            )
+
+
 def test_publish_helper_readmes_document_write_tfvars_option():
     for module_dir in (AWS_DIR, GCP_DIR):
         section = _publish_section(_read(module_dir / "README.md"))
