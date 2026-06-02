@@ -707,7 +707,7 @@ Required semantics:
 
 ### M14. Cloud adapter spike: AWS first, GCP later
 
-**Status:** Pending
+**Status:** Started
 
 **Goal:** Prove core contracts can be deployed to one real cloud without hard-coding that cloud into the core.
 
@@ -734,6 +734,8 @@ Required semantics:
 - Local/fake/compose adapters remain the default test path.
 - Same worker lifecycle runs locally, in Compose, and in AWS adapter mode.
 - ECS desired task count can scale independently from per-task run concurrency.
+
+**Autonomous run note (2026-06-02):** First reviewable spike slice landed. This is a contract-level spike, **not** a real AWS deployment — no boto3, AWS credentials, network, or Terraform are involved, and no ECS/SQS/RDS/S3/Secrets Manager/CloudWatch infrastructure is provisioned. What shipped: a new adapter module `agentops_runtime/aws_managed.py` isolating all AWS-specific naming (the `aws-managed` profile string and the `EcsWorkerFleetPlan` planner) outside the core contract modules; `configure_aws_managed_runtime_backends`/`build_aws_managed_test_registry` register the existing local/fake backends under the `aws-managed` profile through the unchanged `RuntimeBackendRegistry` contract; `build_aws_managed_run_supervisor` runs the same `LocalRunSupervisor` lifecycle under `RuntimeContext.backend_profile='aws-managed'`; and `EcsWorkerFleetPlan` proves desired ECS task count and per-task `max_concurrent_runs` scale independently (`capacity = desired_task_count * max_concurrent_runs`; rescaling one returns a new immutable plan and never mutates the other; both validate positive integers and fail closed). Acceptance-criteria status against this slice: criteria 1 (cloud code isolated to adapter module), 2 (local/fake remains default test path), and 4 (independent ECS task-count vs per-task concurrency) are satisfied at the contract layer with a leakage guard test asserting core modules carry no AWS provider/service strings; criterion 3 is satisfied only for the local/Compose paths plus an `aws-managed`-profiled local lifecycle — **real AWS-mode execution is still pending**, so Status stays Started. Test evidence: focused RED (`ModuleNotFoundError: agentops_runtime.aws_managed`) → GREEN `python -m pytest tests/agentops_runtime/test_aws_managed_runtime.py` → 16 passed; adjacent `tests/agent/test_runtime_backends.py tests/agent/test_runtime_context.py tests/agentops_runtime/test_compose_backends.py` → 41 passed (1 pre-existing unrelated `audioop` deprecation warning); `ruff check agentops_runtime/aws_managed.py tests/agentops_runtime/test_aws_managed_runtime.py` → passed; `git diff --check` → clean.
 
 ### M15. Managed cloud Terraform/OpenTofu packaging
 
