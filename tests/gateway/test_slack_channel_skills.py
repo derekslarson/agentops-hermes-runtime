@@ -131,3 +131,90 @@ class TestSlackMessageEventAutoSkill:
             auto_skill=auto_skill,
         )
         assert event.auto_skill == ["german-flashcards"]
+
+    def test_message_event_can_carry_runtime_context(self):
+        from agent.runtime_context import RuntimeContext
+        from gateway.platforms.base import MessageEvent, MessageType, Platform, SessionSource
+
+        runtime_context = RuntimeContext(
+            mode="agentops",
+            workspace_type="slack",
+            workspace_id="T_acme",
+            user_id="U_derek",
+            conversation_id="slack:T_acme:C_support:1710000000.000000",
+            external_channel_id="C_support",
+            external_thread_id="1710000000.000000",
+            backend_profile="compose-self-hosted",
+        )
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C_support",
+            chat_type="group",
+            user_id="U_derek",
+            thread_id="1710000000.000000",
+        )
+
+        event = MessageEvent(
+            text="work",
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message={},
+            message_id="1710000000.000100",
+            runtime_context=runtime_context,
+        )
+
+        assert event.runtime_context is runtime_context
+
+
+class TestSlackAgentOpsRuntimeContext:
+    def test_adapter_builds_agentops_runtime_context_from_extra_config(self):
+        adapter = _make_adapter({
+            "agentops": {
+                "enabled": True,
+                "org_id": "org_acme",
+                "project_id": "proj_support",
+                "backend_profile": "compose-self-hosted",
+            }
+        })
+
+        context = adapter._build_agentops_runtime_context({
+            "team": "T_acme",
+            "channel": "C_support",
+            "user": "U_derek",
+            "ts": "1710000000.000100",
+            "thread_ts": "1710000000.000000",
+        })
+
+        assert context is not None
+        assert context.mode == "agentops"
+        assert context.workspace_type == "slack"
+        assert context.workspace_id == "T_acme"
+        assert context.external_channel_id == "C_support"
+        assert context.external_thread_id == "1710000000.000000"
+        assert context.user_id == "U_derek"
+
+    def test_adapter_runtime_context_disabled_by_default(self):
+        adapter = _make_adapter()
+
+        context = adapter._build_agentops_runtime_context({
+            "team": "T_acme",
+            "channel": "C_support",
+            "user": "U_derek",
+            "ts": "1710000000.000100",
+        })
+
+        assert context is None
+
+    def test_slash_command_runtime_context_uses_trigger_id_when_message_ts_absent(self):
+        adapter = _make_adapter({"agentops": {"enabled": True}})
+
+        context = adapter._build_agentops_runtime_context({
+            "team_id": "T_acme",
+            "channel_id": "C_support",
+            "user_id": "U_derek",
+            "trigger_id": "1710000000.000100.abcdef",
+        })
+
+        assert context is not None
+        assert context.external_thread_id == "1710000000.000100.abcdef"
+        assert context.conversation_id == "slack:T_acme:C_support:1710000000.000100.abcdef"

@@ -9034,6 +9034,7 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
+                runtime_context=getattr(event, "runtime_context", None),
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -16250,6 +16251,7 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        runtime_context: Any = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -17097,12 +17099,18 @@ class GatewayRunner:
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
             # schemas for prompt cache hits.
+            _cache_keys = self._extract_cache_busting_config(user_config)
+            if runtime_context is not None:
+                try:
+                    _cache_keys["runtime_context"] = runtime_context.to_dict()
+                except Exception:
+                    _cache_keys["runtime_context"] = str(runtime_context)
             _sig = self._agent_config_signature(
                 turn_route["model"],
                 turn_route["runtime"],
                 enabled_toolsets,
                 combined_ephemeral,
-                cache_keys=self._extract_cache_busting_config(user_config),
+                cache_keys=_cache_keys,
                 user_id=getattr(source, "user_id", None),
                 user_id_alt=getattr(source, "user_id_alt", None),
             )
@@ -17157,6 +17165,7 @@ class GatewayRunner:
                     gateway_session_key=session_key,
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
+                    runtime_context=runtime_context,
                 )
                 if _cache_lock and _cache is not None:
                     with _cache_lock:

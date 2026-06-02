@@ -1330,6 +1330,11 @@ class MessageEvent:
     # Applied at API call time and never persisted to transcript history.
     channel_prompt: Optional[str] = None
 
+    # Explicit RuntimeContext resolved by a platform adapter or control-plane
+    # ingress. When present, gateway-created AIAgent instances use it instead
+    # of re-deriving scope from local/session metadata.
+    runtime_context: Any = None
+
     # Channel context recovered by history backfill (e.g. messages between
     # bot turns that were missed due to require_mention).  Kept separate
     # from ``text`` so the sender-prefix logic in run.py can operate on the

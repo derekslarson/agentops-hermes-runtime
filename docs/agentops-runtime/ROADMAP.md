@@ -688,13 +688,13 @@ Required semantics:
 
 ### M13. Slack multi-user/thread MVP
 
-**Status:** Pending
+**Status:** Started
 
 **Goal:** Prove business messaging integration with multiple users and threads.
 
 **Acceptance criteria:**
 
-- Slack workspace/channel/thread/user maps to RuntimeContext.
+- Slack workspace/channel/thread/user maps to RuntimeContext. (Started: `agentops_runtime/slack_runtime.py` maps Slack event/command payloads when AgentOps mode is enabled, Slack `MessageEvent` instances carry the context, and gateway-created `AIAgent` instances receive it.)
 - Two Slack users in different threads get isolated user/thread memory.
 - Shared org/project skill can be loaded in both threads.
 - Hermes replies in the correct Slack thread.

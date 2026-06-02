@@ -349,6 +349,20 @@ class SlackAdapter(BasePlatformAdapter):
         # Each value: {"response_url": str, "ts": float}
         self._slash_command_contexts: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
+    def _build_agentops_runtime_context(self, event: Dict[str, Any]):
+        """Build an AgentOps RuntimeContext for a Slack event when configured."""
+        try:
+            from agentops_runtime.slack_runtime import build_slack_runtime_context
+            return build_slack_runtime_context(
+                event,
+                config={"agentops": (getattr(self.config, "extra", {}) or {}).get("agentops", {})},
+            )
+        except ValueError:
+            raise
+        except Exception:
+            logger.exception("[Slack] Failed to build AgentOps RuntimeContext")
+            return None
+
     def _describe_slack_api_error(self, response: Any, *, file_obj: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """Convert Slack API auth/permission failures into actionable user-facing text."""
         if response is None or not hasattr(response, "get"):
@@ -2226,6 +2240,7 @@ class SlackAdapter(BasePlatformAdapter):
             channel_prompt=_channel_prompt,
             reply_to_text=reply_to_text,
             auto_skill=_auto_skill,
+            runtime_context=self._build_agentops_runtime_context(event),
         )
 
         # Only react when bot is directly addressed (DM or @mention).
@@ -2817,6 +2832,7 @@ class SlackAdapter(BasePlatformAdapter):
             message_type=MessageType.COMMAND if text.startswith("/") else MessageType.TEXT,
             source=source,
             raw_message=command,
+            runtime_context=self._build_agentops_runtime_context(command),
         )
 
         # Stash the Slack response_url so the first reply for this
