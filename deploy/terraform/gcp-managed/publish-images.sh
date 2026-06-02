@@ -185,15 +185,46 @@ echo "scheduler_image     = \"${SCHEDULER_IMAGE}\""
 # Only on the live path (DRY_RUN=0) and only when WRITE_TFVARS=1. Writes solely
 # the three non-secret image assignments via a temp file + mv (atomic, no
 # partial file on failure). Dry-run never writes anything.
+#
+# The temp path is tracked in a script-level IMAGE_TFVARS_TMP so an EXIT/signal
+# handler can remove a partial `*.auto.tfvars.XXXXXX` left behind if the script
+# is interrupted or exits in the window between `mktemp` and the atomic `mv` (a
+# function-local `tmp` could never be trapped). EXIT cleanup returns normally; a
+# trapped signal otherwise REPLACES bash's default terminating behavior, so the
+# HUP/INT/TERM handler must also terminate non-zero (128+signal) to fail closed.
+IMAGE_TFVARS_TMP=""
+cleanup_image_tfvars_tmp() {
+  if [ -n "${IMAGE_TFVARS_TMP:-}" ]; then
+    rm -f "$IMAGE_TFVARS_TMP"
+  fi
+}
+on_signal_cleanup_image_tfvars() {
+  cleanup_image_tfvars_tmp
+  trap - EXIT HUP INT TERM
+  case "$1" in
+    HUP) exit 129 ;;
+    INT) exit 130 ;;
+    TERM) exit 143 ;;
+    *) exit 1 ;;
+  esac
+}
 write_image_tfvars() {
   dest="$1"
-  tmp="$(mktemp "${dest}.XXXXXX")"
+  IMAGE_TFVARS_TMP="$(mktemp "${dest}.XXXXXX")"
+  trap cleanup_image_tfvars_tmp EXIT
+  trap 'on_signal_cleanup_image_tfvars HUP' HUP
+  trap 'on_signal_cleanup_image_tfvars INT' INT
+  trap 'on_signal_cleanup_image_tfvars TERM' TERM
   {
     echo "control_plane_image = \"${CONTROL_PLANE_IMAGE}\""
     echo "worker_image        = \"${WORKER_IMAGE}\""
     echo "scheduler_image     = \"${SCHEDULER_IMAGE}\""
-  } >"$tmp"
-  mv "$tmp" "$dest"
+  } >"$IMAGE_TFVARS_TMP"
+  mv "$IMAGE_TFVARS_TMP" "$dest"
+  # The generated tfvars file is in place; clear the temp path and disable the
+  # cleanup traps so an EXIT handler can never remove the operator-facing file.
+  IMAGE_TFVARS_TMP=""
+  trap - EXIT HUP INT TERM
 }
 
 if [ "$DRY_RUN" = "0" ] && [ "$WRITE_TFVARS" = "1" ]; then

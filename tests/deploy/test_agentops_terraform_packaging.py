@@ -3537,6 +3537,251 @@ def test_publish_helper_readmes_document_write_tfvars_option():
         )
 
 
+# --- image tfvars temp file is cleaned up on interruption (M15 slice) --------
+#
+# The opt-in WRITE_TFVARS=1 writer builds the image tfvars override atomically:
+# it creates a `mktemp "${dest}.XXXXXX"` temp file, writes the three non-secret
+# image assignments into it, and `mv`s it into place. The atomic mv removes a
+# partial file when a WRITE COMMAND fails, but a signal (HUP/INT/TERM) or an
+# unexpected EXIT in the window between `mktemp` and the `mv` would leave a
+# partial `*.auto.tfvars.XXXXXX` temp file behind. Mirroring the smoke transcript
+# helper, the writer must track the temp path in a script-level variable
+# (IMAGE_TFVARS_TMP) — a function-local `tmp` cannot be trapped — arm an
+# EXIT/HUP/INT/TERM cleanup once the temp path is set (before the temp file is
+# written), and clear/disable that cleanup after the mv succeeds so the final
+# generated tfvars file is preserved. Both READMEs say the partial temp file is
+# removed on interruption and the interrupted write fails closed.
+
+
+def _assert_publish_image_tfvars_interrupt_cleanup(script_path: Path) -> None:
+    text = _read(script_path)
+    name = script_path.parent.name
+
+    # The temp path is tracked in a script-level variable (trappable), not only a
+    # function-local `tmp` that an EXIT/signal handler could never see.
+    assert "IMAGE_TFVARS_TMP" in text, (
+        f"{name}: image tfvars writer does not track the temp path in IMAGE_TFVARS_TMP"
+    )
+    # The mktemp result is assigned to that variable (keeping the existing
+    # `mktemp "${dest}.XXXXXX"` invariant the .gitignore coverage depends on).
+    assert 'IMAGE_TFVARS_TMP="$(mktemp "${dest}.XXXXXX")"' in text, (
+        f"{name}: mktemp result is not assigned to IMAGE_TFVARS_TMP"
+    )
+
+    # Normal exit AND every interruption signal is trapped for cleanup. The traps
+    # may be split across multiple `trap` lines (EXIT can return normally while
+    # signals must terminate), so collect installs rather than expecting one line.
+    trapped = set()
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        if not stripped.startswith("trap ") or stripped.startswith("trap -"):
+            continue
+        for signal in ("EXIT", "HUP", "INT", "TERM"):
+            if signal in stripped:
+                trapped.add(signal)
+    for signal in ("EXIT", "HUP", "INT", "TERM"):
+        assert signal in trapped, (
+            f"{name}: image tfvars cleanup trap does not cover {signal}"
+        )
+
+    # The cleanup actually removes the temp file.
+    assert 'rm -f "$IMAGE_TFVARS_TMP"' in text, (
+        f"{name}: image tfvars cleanup does not rm -f the temp file"
+    )
+
+    # Cleanup is armed AFTER the temp path is set but BEFORE the temp file is
+    # written, so an interrupt mid-write is covered.
+    tmp_idx = text.find('IMAGE_TFVARS_TMP="$(mktemp "${dest}.XXXXXX")"')
+    trap_idx = text.find("trap cleanup_image_tfvars_tmp EXIT")
+    assert trap_idx != -1, (
+        f"{name}: no EXIT cleanup trap armed for the image tfvars temp file"
+    )
+    write_idx = text.find('>"$IMAGE_TFVARS_TMP"')
+    assert write_idx != -1, f"{name}: image tfvars is not written to IMAGE_TFVARS_TMP"
+    assert tmp_idx < trap_idx, (
+        f"{name}: cleanup trap is armed before the temp path is set"
+    )
+    assert trap_idx < write_idx, (
+        f"{name}: cleanup trap is armed after the temp file is written"
+    )
+
+    # After the atomic mv succeeds, the cleanup is cleared/disabled so the final
+    # generated tfvars file is NOT removed by the EXIT trap.
+    mv_idx = text.find('mv "$IMAGE_TFVARS_TMP" "$dest"')
+    assert mv_idx != -1, f"{name}: image tfvars is not atomically renamed (mv temp -> dest)"
+    after_mv = text[mv_idx:]
+    assert 'IMAGE_TFVARS_TMP=""' in after_mv and "trap -" in after_mv, (
+        f"{name}: image tfvars cleanup is not cleared/disabled after the successful mv "
+        "(a stale EXIT trap could remove the generated tfvars file)"
+    )
+
+
+def test_aws_publish_image_tfvars_cleans_up_temp_on_interruption():
+    _assert_publish_image_tfvars_interrupt_cleanup(AWS_PUBLISH_SCRIPT)
+
+
+def test_gcp_publish_image_tfvars_cleans_up_temp_on_interruption():
+    _assert_publish_image_tfvars_interrupt_cleanup(GCP_PUBLISH_SCRIPT)
+
+
+# In bash a trapped signal REPLACES the default terminating behavior: after the
+# handler returns the script keeps running. So an HUP/INT/TERM cleanup that only
+# `rm -f`s the temp and returns is not fail-closed. The signal cleanup must
+# remove the temp AND terminate non-zero with the conventional 128+signal code
+# (HUP=129, INT=130, TERM=143), while the EXIT handler may clean up and return.
+
+
+def _assert_publish_image_tfvars_signal_fails_closed(script_path: Path) -> None:
+    text = _read(script_path)
+    name = script_path.parent.name
+
+    for signal in ("HUP", "INT", "TERM"):
+        trapped = any(
+            line.lstrip().startswith("trap ")
+            and not line.lstrip().startswith("trap -")
+            and signal in line
+            for line in text.splitlines()
+        )
+        assert trapped, f"{name}: {signal} is not trapped for fail-closed image tfvars cleanup"
+
+    exit_trapped = any(
+        line.lstrip().startswith("trap ")
+        and not line.lstrip().startswith("trap -")
+        and "EXIT" in line
+        for line in text.splitlines()
+    )
+    assert exit_trapped, f"{name}: no EXIT cleanup trap installed for the image tfvars temp file"
+
+    assert 'rm -f "$IMAGE_TFVARS_TMP"' in text, (
+        f"{name}: signal cleanup does not rm -f the image tfvars temp file"
+    )
+    for signal, code in (("HUP", "129"), ("INT", "130"), ("TERM", "143")):
+        assert f"exit {code}" in text, (
+            f"{name}: {signal} cleanup does not terminate non-zero (no exit {code})"
+        )
+
+
+def test_aws_publish_image_tfvars_signal_cleanup_fails_closed():
+    _assert_publish_image_tfvars_signal_fails_closed(AWS_PUBLISH_SCRIPT)
+
+
+def test_gcp_publish_image_tfvars_signal_cleanup_fails_closed():
+    _assert_publish_image_tfvars_signal_fails_closed(GCP_PUBLISH_SCRIPT)
+
+
+def _glob_image_tfvars_temp_artifacts(module_copy: Path) -> list[Path]:
+    return list(module_copy.glob(f"{IMAGE_AUTO_TFVARS}.*"))
+
+
+def test_publish_image_tfvars_exit_cleanup_removes_temp_when_mv_fails(tmp_path):
+    # Behavioral: drive a live WRITE_TFVARS=1 publish but make `mv` fail. With
+    # `set -e` the failed mv exits the script, and the armed EXIT trap must remove
+    # the in-progress temp file so no partial `image.auto.tfvars.XXXXXX` remains.
+    for module_dir, cloud_tool in ((AWS_DIR, "aws"), (GCP_DIR, "gcloud")):
+        sub = tmp_path / cloud_tool
+        sub.mkdir()
+        module_copy, env, _ = _make_publish_env(sub, module_dir, cloud_tool)
+        ctx = _make_publish_context_with_dockerfile(sub)
+        # A fake `mv` that refuses to move (simulating an mv failure) so the EXIT
+        # trap is exercised on the temp file the writer already created.
+        fake_mv = sub / "bin" / "mv"
+        fake_mv.write_text(
+            "#!/usr/bin/env bash\n"
+            'echo "fake mv refusing to move" >&2\n'
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        fake_mv.chmod(0o755)
+        env.update(
+            {
+                "DRY_RUN": "0",
+                "WRITE_TFVARS": "1",
+                "CONTROL_PLANE_CONTEXT": str(ctx),
+                "WORKER_CONTEXT": str(ctx),
+                "SCHEDULER_CONTEXT": str(ctx),
+            }
+        )
+        result = _run_publish(module_copy, env)
+        name = module_dir.name
+        assert result.returncode != 0, (
+            f"{name}: publish did not fail when mv failed\n{result.stdout}\n{result.stderr}"
+        )
+        leftovers = _glob_image_tfvars_temp_artifacts(module_copy)
+        assert not leftovers, (
+            f"{name}: EXIT cleanup left partial image tfvars temp file(s): {leftovers}"
+        )
+        # And the final generated file was never put in place.
+        assert not (module_copy / IMAGE_AUTO_TFVARS).exists(), (
+            f"{name}: dest tfvars exists despite the mv failure"
+        )
+
+
+def test_publish_image_tfvars_signal_cleanup_removes_temp_and_fails_closed(tmp_path):
+    # Behavioral: a fake `mv` that signals the running script (SIGTERM) before the
+    # rename completes. The TERM trap must remove the in-progress temp file and
+    # terminate the script non-zero with the conventional 143 (128+15) code.
+    for module_dir, cloud_tool in ((AWS_DIR, "aws"), (GCP_DIR, "gcloud")):
+        sub = tmp_path / cloud_tool
+        sub.mkdir()
+        module_copy, env, _ = _make_publish_env(sub, module_dir, cloud_tool)
+        ctx = _make_publish_context_with_dockerfile(sub)
+        fake_mv = sub / "bin" / "mv"
+        fake_mv.write_text(
+            "#!/usr/bin/env bash\n"
+            "# Simulate an interruption arriving while the writer is renaming.\n"
+            'kill -TERM "$PPID"\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        fake_mv.chmod(0o755)
+        env.update(
+            {
+                "DRY_RUN": "0",
+                "WRITE_TFVARS": "1",
+                "CONTROL_PLANE_CONTEXT": str(ctx),
+                "WORKER_CONTEXT": str(ctx),
+                "SCHEDULER_CONTEXT": str(ctx),
+            }
+        )
+        result = _run_publish(module_copy, env)
+        name = module_dir.name
+        assert result.returncode == 143, (
+            f"{name}: TERM cleanup did not fail closed with 143 (got {result.returncode})\n"
+            f"{result.stdout}\n{result.stderr}"
+        )
+        leftovers = _glob_image_tfvars_temp_artifacts(module_copy)
+        assert not leftovers, (
+            f"{name}: signal cleanup left partial image tfvars temp file(s): {leftovers}"
+        )
+        assert not (module_copy / IMAGE_AUTO_TFVARS).exists(), (
+            f"{name}: dest tfvars exists despite the simulated interruption"
+        )
+
+
+def test_publish_helper_readmes_document_image_tfvars_interrupt_cleanup():
+    for module_dir in (AWS_DIR, GCP_DIR):
+        section = _publish_section(_read(module_dir / "README.md"))
+        name = module_dir.name
+        # The doc must describe interrupt-time cleanup: an interrupted
+        # WRITE_TFVARS=1 write removes the partial temp file and fails closed.
+        # Require the three concepts to co-occur within one passage (a window
+        # anchored on "interrupt") so the section actually documents the new
+        # behavior rather than incidentally reusing these words elsewhere.
+        flat = section.replace("\n", " ").lower()
+        idx = flat.find("interrupt")
+        assert idx != -1, (
+            f"{name}: publish section does not mention interrupted writes"
+        )
+        window = flat[idx : idx + 320]
+        assert "remov" in window, (
+            f"{name}: publish section does not say an interrupted WRITE_TFVARS write "
+            "removes the partial temp file"
+        )
+        assert "fail closed" in window or "fails closed" in window, (
+            f"{name}: publish section does not say an interrupted WRITE_TFVARS write fails closed"
+        )
+
+
 # --- custom IMAGE_TFVARS_PATH must stay module-local (M15 hardening slice) ----
 #
 # The opt-in writer (WRITE_TFVARS=1) writes the generated non-secret image tfvars

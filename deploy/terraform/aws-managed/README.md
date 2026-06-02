@@ -145,7 +145,11 @@ any `*.auto.tfvars` file, so the next `PLAN_ONLY=0 ./smoke.sh` picks the images 
 with no manual edit. The writer is opt-in and **never runs in the default
 `DRY_RUN=1` mode** (dry-run stays side-effect-free), writes no secret values, and
 both the generated file and any interrupted `*.auto.tfvars.XXXXXX` temp artifact
-are git-ignored. A custom `IMAGE_TFVARS_PATH` must stay a
+are git-ignored. If the write is interrupted (a `HUP`/`INT`/`TERM` signal or an
+unexpected exit) between the `mktemp` temp file and the rename, the helper
+removes the partial `*.auto.tfvars.XXXXXX` temp file and fails closed (exiting
+non-zero rather than continuing), so no half-written override is ever left
+behind. A custom `IMAGE_TFVARS_PATH` must stay a
 module-local plain filename (no leading `/`, no `/` path segments, no `..`); the
 helper fails closed before publishing otherwise, so the writer can never clobber
 files outside this module.
