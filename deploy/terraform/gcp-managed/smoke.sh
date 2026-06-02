@@ -55,6 +55,52 @@ if ! gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/nu
   exit 1
 fi
 
+# --- preflight: required non-secret Terraform inputs -------------------------
+# Validate the module's required non-secret account/location inputs (project,
+# region) BEFORE any Terraform/OpenTofu side effect (init/validate/plan/apply),
+# so an unconfigured run fails closed without creating .terraform/ or a lock file
+# (and never reaches a post-init plan-time "missing required variable" error).
+# Inputs may be supplied via a tfvars file (terraform.tfvars[.json],
+# *.auto.tfvars[.json]) or TF_VAR_* env vars. These are non-secret inputs only;
+# raw app/integration secrets remain a bootstrap (M16) concern.
+tfvars_file_defines() {
+  local file="$1"
+  local var_name="$2"
+  case "$file" in
+    *.json)
+      grep -Eq '"'"${var_name}"'"[[:space:]]*:' "$file"
+      ;;
+    *)
+      grep -Eq "^[[:space:]]*${var_name}[[:space:]]*=" "$file"
+      ;;
+  esac
+}
+
+missing=""
+for required_var in project region; do
+  env_name="TF_VAR_${required_var}"
+  configured=0
+  if [ -n "${!env_name:-}" ]; then
+    configured=1
+  else
+    for tfvars_file in terraform.tfvars terraform.tfvars.json *.auto.tfvars *.auto.tfvars.json; do
+      if [ -f "$tfvars_file" ] && tfvars_file_defines "$tfvars_file" "$required_var"; then
+        configured=1
+        break
+      fi
+    done
+  fi
+  if [ "$configured" -eq 0 ]; then
+    missing="${missing} ${required_var}"
+  fi
+done
+
+if [ -n "$missing" ]; then
+  echo "error: missing required non-secret Terraform input(s):${missing}" >&2
+  echo "       supply them via a terraform.tfvars / *.auto.tfvars file that defines each required input, or set TF_VAR_<name> env vars (e.g. TF_VAR_project, TF_VAR_region) before running ./smoke.sh" >&2
+  exit 1
+fi
+
 # --- side effects only after prerequisites pass ------------------------------
 "$TF" init -input=false
 "$TF" validate

@@ -129,6 +129,14 @@ closed before any side effect** when neither the `terraform` nor `tofu`
 commands as above (no root-relative `-chdir`), auto-detecting whichever CLI is
 installed.
 
+It also **preflights the required non-secret inputs** (`region`, `domain`)
+before any Terraform/OpenTofu side effect, so an unconfigured run fails closed
+without creating `.terraform/` or a lock file (rather than erroring at plan time
+after `init`). Satisfy the check either with a `terraform.tfvars` /
+`*.auto.tfvars` file that defines each required input, or with `TF_VAR_region` /
+`TF_VAR_domain` environment variables. These are non-secret account/location
+inputs only; raw app/integration secrets remain a bootstrap (M16) concern.
+
 It defaults to a safe **plan-only** mode (`PLAN_ONLY=1`): `init` + `validate` +
 `plan` with no apply. Set `PLAN_ONLY=0` to also `apply`, then **probe the live
 API** and print the post-apply smoke hints/outputs (`agentops_api_url`,

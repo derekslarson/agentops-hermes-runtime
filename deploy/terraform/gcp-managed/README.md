@@ -105,6 +105,14 @@ closed *before* any Terraform/OpenTofu side effect when:
 - the `gcloud` CLI is missing, or
 - no gcloud account is active (a read-only `gcloud auth list` check).
 
+It also **preflights the required non-secret inputs** (`project`, `region`)
+before any Terraform/OpenTofu side effect, so an unconfigured run fails closed
+without creating `.terraform/` or a lock file (rather than erroring at plan time
+after `init`). Satisfy the check either with a `terraform.tfvars` /
+`*.auto.tfvars` file that defines each required input, or with `TF_VAR_project` /
+`TF_VAR_region` environment variables. These are non-secret account/location
+inputs only; raw app/integration secrets remain a bootstrap (M16) concern.
+
 It defaults to a safe **`PLAN_ONLY=1`** mode (`init` + `validate` + `plan`, no
 apply). Set `PLAN_ONLY=0` to run `apply`, then **probe the live API** and surface
 the `agentops_api_url` and `smoke_test_hints` outputs. On the apply path the

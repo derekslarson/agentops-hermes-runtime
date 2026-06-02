@@ -9,6 +9,9 @@ values out of the recommended state path.
 
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
 from pathlib import Path
 
 
@@ -2068,4 +2071,167 @@ def test_publish_helper_readmes_document_repo_root_build_context_default():
         )
         assert "repo" in lowered and "root" in lowered, (
             f"{name}: README does not say the build context defaults to the repo root"
+        )
+
+
+# --- required non-secret input preflight (M15 hardening slice) --------------
+#
+# Running smoke.sh from the module dir with no terraform.tfvars and no required
+# account/location inputs must fail closed BEFORE the first Terraform/OpenTofu
+# side effect (init/validate/plan/apply), so an unconfigured run never creates
+# .terraform/ or a lock file and never reaches a plan-time "missing required
+# variable" error after init. The required non-secret inputs may be satisfied by
+# a tfvars file (terraform.tfvars[.json], *.auto.tfvars[.json]) or by TF_VAR_*
+# env vars. The preflight is behavioral/contract-oriented (not a snapshot) and
+# must never reference raw app/integration secret values.
+#
+#   AWS required non-secret inputs: region, domain.
+#   GCP required non-secret inputs: project, region.
+
+AWS_REQUIRED_TFVARS = ("region", "domain")
+GCP_REQUIRED_TFVARS = ("project", "region")
+
+# A tfvars file in any of these forms satisfies the preflight.
+TFVARS_FILE_FORMS = (
+    "terraform.tfvars",
+    "terraform.tfvars.json",
+    "*.auto.tfvars",
+    "*.auto.tfvars.json",
+)
+
+
+def _first_side_effect_index(text: str) -> int:
+    # `-input=false` only appears on the real init/plan/apply command lines
+    # (never in prose), so it anchors "the first Terraform/OpenTofu side effect".
+    return text.find("-input=false")
+
+
+def _assert_required_input_preflight(script_path: Path, required_vars: tuple[str, ...]) -> None:
+    text = _read(script_path)
+    name = script_path.parent.name
+
+    first_side_effect = _first_side_effect_index(text)
+    assert first_side_effect != -1, f"{name}: smoke.sh never runs a Terraform/OpenTofu command"
+
+    # Each required non-secret input is named in the preflight and is accepted
+    # via its TF_VAR_<name> env var, before any side effect.
+    for var in required_vars:
+        env_name = f"TF_VAR_{var}"
+        idx = text.find(env_name)
+        assert idx != -1, f"{name}: preflight does not accept the {env_name} env var"
+        assert idx < first_side_effect, (
+            f"{name}: {env_name} preflight runs after the first Terraform/OpenTofu side effect"
+        )
+
+    # A tfvars file (operator-configured inputs) also satisfies the preflight,
+    # in every supported form, checked before any side effect.
+    for fname in TFVARS_FILE_FORMS:
+        idx = text.find(fname)
+        assert idx != -1, f"{name}: preflight does not accept a {fname} file"
+        assert idx < first_side_effect, (
+            f"{name}: the {fname} check runs after the first Terraform/OpenTofu side effect"
+        )
+
+    # Fails closed with a clear, non-secret missing-config error BEFORE any side
+    # effect — not a post-init plan-time variable error.
+    missing_idx = text.lower().find("missing required")
+    assert missing_idx != -1, f"{name}: preflight has no clear missing-config error"
+    assert missing_idx < first_side_effect, (
+        f"{name}: the missing-config error is emitted after a Terraform/OpenTofu side effect"
+    )
+
+    fail_idx = text.find("exit 1", missing_idx)
+    assert fail_idx != -1 and fail_idx < first_side_effect, (
+        f"{name}: preflight does not fail closed (exit 1) before the first side effect"
+    )
+
+
+def test_aws_smoke_script_preflights_required_inputs_before_side_effects():
+    _assert_required_input_preflight(SMOKE_SCRIPT, AWS_REQUIRED_TFVARS)
+
+
+def test_gcp_smoke_script_preflights_required_inputs_before_side_effects():
+    _assert_required_input_preflight(GCP_SMOKE_SCRIPT, GCP_REQUIRED_TFVARS)
+
+
+def test_smoke_input_preflight_does_not_reference_raw_secrets():
+    # The required-input preflight deals only with non-secret account/location
+    # inputs; raw app/integration secrets remain a bootstrap concern.
+    for script in (SMOKE_SCRIPT, GCP_SMOKE_SCRIPT):
+        lowered = _read(script).lower()
+        for token in RAW_SECRET_TOKENS:
+            assert token not in lowered, f"{token} referenced in {script.parent.name}/smoke.sh"
+
+
+def _run_smoke_with_empty_tfvars(
+    tmp_path: Path,
+    module_dir: Path,
+    cloud_tool: str,
+) -> subprocess.CompletedProcess[str]:
+    module_copy = tmp_path / module_dir.name
+    shutil.copytree(module_dir, module_copy, ignore=shutil.ignore_patterns(".terraform", ".terraform.lock.hcl"))
+    (module_copy / "terraform.tfvars").write_text("# intentionally missing required inputs\n", encoding="utf-8")
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    marker = tmp_path / "terraform-invoked"
+    for tf_cli in ("terraform", "tofu"):
+        (bin_dir / tf_cli).write_text(f"#!/usr/bin/env bash\ntouch {marker}\nexit 0\n", encoding="utf-8")
+        (bin_dir / tf_cli).chmod(0o755)
+
+    if cloud_tool == "aws":
+        (bin_dir / "aws").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    elif cloud_tool == "gcloud":
+        (bin_dir / "gcloud").write_text("#!/usr/bin/env bash\necho user@example.com\nexit 0\n", encoding="utf-8")
+    else:  # pragma: no cover - helper guard
+        raise AssertionError(f"unsupported cloud tool {cloud_tool}")
+    (bin_dir / cloud_tool).chmod(0o755)
+
+    env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+    for key in list(env):
+        if key.startswith("TF_VAR_"):
+            env.pop(key)
+    result = subprocess.run(
+        ["bash", "./smoke.sh"],
+        cwd=module_copy,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert not marker.exists(), f"{module_dir.name}: Terraform/OpenTofu was invoked before required-input preflight"
+    assert not (module_copy / ".terraform").exists(), f"{module_dir.name}: .terraform was created before preflight"
+    return result
+
+
+def test_aws_smoke_script_rejects_incomplete_tfvars_before_init(tmp_path):
+    result = _run_smoke_with_empty_tfvars(tmp_path, AWS_DIR, "aws")
+    assert result.returncode == 1
+    assert "missing required" in result.stderr.lower()
+    assert "region" in result.stderr and "domain" in result.stderr
+
+
+def test_gcp_smoke_script_rejects_incomplete_tfvars_before_init(tmp_path):
+    result = _run_smoke_with_empty_tfvars(tmp_path, GCP_DIR, "gcloud")
+    assert result.returncode == 1
+    assert "missing required" in result.stderr.lower()
+    assert "project" in result.stderr and "region" in result.stderr
+
+
+def test_readmes_document_required_input_preflight():
+    for module_dir, required in ((AWS_DIR, AWS_REQUIRED_TFVARS), (GCP_DIR, GCP_REQUIRED_TFVARS)):
+        section = _smoke_section(_read(module_dir / "README.md"))
+        assert section, f"{module_dir.name}: README has no live-smoke helper section"
+        lowered = section.lower()
+        # The preflight requirement is documented against the smoke-helper path.
+        assert "required" in lowered, (
+            f"{module_dir.name}: smoke-helper section does not mention the required-input preflight"
+        )
+        # Both satisfaction paths are documented: a tfvars file or TF_VAR_* env vars.
+        assert "tfvars" in lowered, (
+            f"{module_dir.name}: smoke-helper section does not mention the tfvars-file path"
+        )
+        assert "tf_var_" in lowered, (
+            f"{module_dir.name}: smoke-helper section does not mention the TF_VAR_* env-var path"
         )
