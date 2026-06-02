@@ -41,6 +41,31 @@ tofu plan
 tofu apply
 ```
 
+## Live-smoke helper (`./smoke.sh`)
+
+`./smoke.sh` is a module-local helper you run from inside this directory after
+configuring `terraform.tfvars` and `gcloud` (auth + project/region). It fails
+closed *before* any Terraform/OpenTofu side effect when:
+
+- neither `terraform` nor `tofu` (OpenTofu) is on `PATH`, or
+- the `gcloud` CLI is missing, or
+- no gcloud account is active (a read-only `gcloud auth list` check).
+
+It defaults to a safe **`PLAN_ONLY=1`** mode (`init` + `validate` + `plan`, no
+apply). Set `PLAN_ONLY=0` to run `apply` and then print the `agentops_api_url`
+and `smoke_test_hints` outputs:
+
+```bash
+cd deploy/terraform/gcp-managed
+./smoke.sh              # plan-only (default)
+PLAN_ONLY=0 ./smoke.sh  # opt-in apply, then surface smoke outputs
+```
+
+Honest caveat: this module is still scaffold-level (see the parity gaps below),
+so **no live GCP apply/smoke is captured** — a successful plan is not a captured
+live deployment. The helper never accepts or echoes raw integration secret
+values; bootstrap (M16) owns those.
+
 ## Bring your own network / managed resources
 
 Set the `existing_*` variables (`existing_vpc_id`, `existing_subnet_ids`,

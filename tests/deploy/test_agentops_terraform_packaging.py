@@ -918,6 +918,7 @@ def test_tfvars_example_documents_optional_tls_dns():
 
 
 SMOKE_SCRIPT = AWS_DIR / "smoke.sh"
+GCP_SMOKE_SCRIPT = GCP_DIR / "smoke.sh"
 
 
 def test_aws_smoke_script_exists_is_executable_and_strict():
@@ -997,3 +998,62 @@ def test_aws_readme_documents_smoke_script():
     assert "plan_only" in lowered, "README does not document the PLAN_ONLY default"
     # The helper is run from inside the module directory.
     assert "./smoke.sh" in readme, "README does not show running ./smoke.sh from the module dir"
+
+
+# --- GCP live-smoke helper parity (M15 slice) -------------------------------
+#
+# The GCP scaffold should provide the same module-local smoke-helper ergonomics
+# as aws-managed while staying honest that the GCP module remains scaffold-level.
+
+
+def test_gcp_smoke_script_exists_is_executable_and_strict():
+    assert GCP_SMOKE_SCRIPT.is_file(), "missing gcp-managed/smoke.sh live-smoke helper"
+    mode = GCP_SMOKE_SCRIPT.stat().st_mode
+    assert mode & 0o111, "gcp smoke.sh is not executable"
+    text = _read(GCP_SMOKE_SCRIPT)
+    assert text.startswith("#!"), "gcp smoke.sh has no shebang"
+    assert "set -euo pipefail" in text, "gcp smoke.sh is not in strict mode"
+
+
+def test_gcp_smoke_script_requires_a_terraform_or_opentofu_cli_and_gcloud_auth():
+    text = _read(GCP_SMOKE_SCRIPT)
+    assert "command -v" in text, "gcp smoke.sh does not detect tools with command -v"
+    assert "terraform" in text and "tofu" in text, "gcp smoke.sh does not consider both terraform and tofu"
+    assert "gcloud" in text, "gcp smoke.sh does not require gcloud"
+    assert "auth" in text and "list" in text, "gcp smoke.sh does not verify gcloud authentication"
+
+
+def test_gcp_smoke_script_fails_closed_before_side_effects_and_defaults_plan_only():
+    text = _read(GCP_SMOKE_SCRIPT)
+    cli_idx = text.find("command -v")
+    auth_idx = text.find("gcloud auth")
+    first_side_effect = text.find("-input=false")
+    assert cli_idx != -1 and auth_idx != -1
+    assert first_side_effect != -1, "gcp smoke.sh never runs a Terraform/OpenTofu command"
+    assert cli_idx < first_side_effect, "CLI checks must run before any Terraform/OpenTofu side effect"
+    assert auth_idx < first_side_effect, "gcloud auth check must run before any Terraform/OpenTofu side effect"
+    assert "exit 1" in text, "gcp smoke.sh does not fail closed with a non-zero exit"
+    assert "PLAN_ONLY" in text, "gcp smoke.sh does not expose a PLAN_ONLY mode"
+    assert "apply" in text and "plan" in text, "gcp smoke.sh must expose plan and opt-in apply paths"
+
+
+def test_gcp_smoke_script_is_module_local_and_surfaces_outputs_without_raw_secrets():
+    text = _read(GCP_SMOKE_SCRIPT)
+    assert "-chdir=deploy/terraform" not in text
+    for command in ("init", "validate", "plan"):
+        assert command in text, f"gcp smoke.sh does not run {command}"
+    assert "output" in text, "gcp smoke.sh does not surface Terraform/OpenTofu outputs"
+    assert "agentops_api_url" in text, "gcp smoke.sh does not surface agentops_api_url"
+    assert "smoke_test_hints" in text, "gcp smoke.sh does not surface smoke_test_hints"
+    lowered = text.lower()
+    for token in RAW_SECRET_TOKENS:
+        assert token not in lowered, f"{token} referenced in gcp smoke.sh"
+
+
+def test_gcp_readme_documents_smoke_script_and_plan_only_default():
+    readme = _read(GCP_DIR / "README.md")
+    lowered = readme.lower()
+    assert "smoke.sh" in readme, "GCP README does not document the smoke.sh helper"
+    assert "plan_only" in lowered, "GCP README does not document the PLAN_ONLY default"
+    assert "./smoke.sh" in readme, "GCP README does not show running ./smoke.sh from the module dir"
+    assert "gcloud" in lowered, "GCP README does not document the gcloud prerequisite"
