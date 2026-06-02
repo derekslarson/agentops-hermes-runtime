@@ -1403,3 +1403,164 @@ def test_gcp_readme_is_honest_that_cloudsql_iam_is_project_scoped():
     lowered = readme.lower()
     assert "roles/cloudsql.client" in readme
     assert "project-level" in lowered or "project scoped" in lowered or "project-scoped" in lowered
+
+
+# --- GCP public API endpoint contract (M15 slice) ---------------------------
+#
+# Parity with the aws-managed ALB-DNS honesty: the gcp-managed control-plane has
+# no provisioned custom-domain/load-balancer, so the DEFAULT public API endpoint
+# must be the Cloud Run control-plane service URI, not an unprovisioned
+# `https://${var.domain}`. Public unauthenticated access is an opt-in toggle
+# (allUsers + roles/run.invoker on the control-plane only). A custom domain
+# mapping is optional and only created when explicitly configured. All of these
+# are non-secret inputs.
+
+
+def test_gcp_api_url_outputs_derive_from_cloud_run_uri_not_unprovisioned_domain():
+    outputs = _read(GCP_DIR / "outputs.tf")
+    # The default API endpoint is the Cloud Run control-plane service URI.
+    assert (
+        "google_cloud_run_v2_service.control_plane.uri" in outputs
+    ), "api url not derived from the Cloud Run control-plane service URI"
+    # The old unconditional custom-domain URL must be gone.
+    assert (
+        'api_base_url = "https://${var.domain}"' not in outputs
+    ), "api_base_url still hard-codes the unprovisioned custom domain"
+    # A custom domain is only the effective endpoint when explicitly configured.
+    assert (
+        "var.enable_custom_domain" in outputs
+    ), "effective API URL is not conditioned on the custom-domain toggle"
+
+
+def test_gcp_outputs_expose_cloud_run_uri_and_effective_api_url():
+    outputs = _read(GCP_DIR / "outputs.tf")
+    # The raw Cloud Run service URI is always exposed (analogous to alb_http_url).
+    assert 'output "cloud_run_api_url"' in outputs, "missing cloud_run_api_url output"
+    assert "google_cloud_run_v2_service.control_plane.uri" in outputs
+    # agentops_api_url surfaces the effective base URL.
+    api_url = _output_block(outputs, "agentops_api_url")
+    assert "local.api_base_url" in api_url, "agentops_api_url does not surface the effective base URL"
+
+
+def test_gcp_bootstrap_and_webhook_urls_derive_from_effective_api_url():
+    outputs = _read(GCP_DIR / "outputs.tf")
+    for out in (
+        "bootstrap_url",
+        "slack_webhook_url",
+        "github_webhook_url",
+        "linear_webhook_url",
+        "jira_webhook_url",
+    ):
+        block = _output_block(outputs, out)
+        assert block, f"missing output {out}"
+        assert "local.api_base_url" in block, f"{out} does not derive from the effective API base URL"
+
+
+def test_gcp_public_invoker_binding_is_variable_gated_alluser_run_invoker():
+    main = _read(GCP_DIR / "main.tf")
+    block = _resource_block(
+        main, "google_cloud_run_v2_service_iam_member", "control_plane_public"
+    )
+    assert block, "missing variable-gated public invoker binding for the control-plane"
+    # allUsers + roles/run.invoker on the control-plane Cloud Run service only.
+    assert "roles/run.invoker" in block
+    assert "allUsers" in block
+    assert "google_cloud_run_v2_service.control_plane" in block
+    # Opt-in only: gated on the non-secret enable_public_invoker toggle.
+    assert "var.enable_public_invoker" in block, "public invoker binding is not gated on the toggle"
+    assert "count" in block, "public invoker binding is not conditional"
+
+
+def test_gcp_public_invoker_not_granted_to_worker_or_scheduler():
+    main = _read(GCP_DIR / "main.tf")
+    # The public unauthenticated invoker is for the control-plane API only — the
+    # worker/scheduler services must never get an allUsers run.invoker binding.
+    for other in ("worker", "scheduler"):
+        block = _resource_block(
+            main, "google_cloud_run_v2_service_iam_member", f"{other}_public"
+        )
+        assert not block, f"{other} must not have a public invoker binding"
+
+
+def test_gcp_public_invoker_variable_is_non_secret_bool_default_false():
+    variables = _read(GCP_DIR / "variables.tf")
+    block = _variable_block(variables, "enable_public_invoker")
+    assert block, "missing enable_public_invoker variable"
+    assert "bool" in block, "enable_public_invoker is not a bool toggle"
+    assert "default     = false" in block or "default = false" in block, "default is not false (safe)"
+    lowered = block.lower()
+    for token in RAW_SECRET_TOKENS:
+        assert token not in lowered, f"{token} leaked into enable_public_invoker"
+
+
+def test_gcp_optional_custom_domain_mapping_is_gated_and_non_secret():
+    main = _read(GCP_DIR / "main.tf")
+    block = _resource_block(main, "google_cloud_run_domain_mapping", "control_plane")
+    assert block, "missing optional Cloud Run domain mapping for the control-plane"
+    # Created only when explicitly configured (toggle + a domain value).
+    assert "var.enable_custom_domain" in block, "domain mapping is not gated on the toggle"
+    assert "var.domain" in block, "domain mapping does not use the configured domain"
+    assert "count" in block, "domain mapping is not conditional"
+    # Routes the custom domain at the control-plane service.
+    assert (
+        "google_cloud_run_v2_service.control_plane.name" in block
+    ), "domain mapping does not route to the control-plane service"
+
+
+def test_gcp_custom_domain_variables_are_optional_and_non_secret():
+    variables = _read(GCP_DIR / "variables.tf")
+
+    enable = _variable_block(variables, "enable_custom_domain")
+    assert enable, "missing enable_custom_domain variable"
+    assert "bool" in enable, "enable_custom_domain is not a bool toggle"
+    assert "default     = false" in enable or "default = false" in enable
+
+    domain = _variable_block(variables, "domain")
+    assert domain, "missing domain variable"
+    # Optional: empty-string default keeps the Cloud Run URI as the endpoint.
+    assert 'default     = ""' in domain or 'default = ""' in domain, "domain is not optional (no empty default)"
+
+    for block in (enable, domain):
+        lowered = block.lower()
+        for token in RAW_SECRET_TOKENS:
+            assert token not in lowered
+
+
+def test_gcp_smoke_hints_honest_about_cloud_run_uri_and_public_invoker():
+    outputs = _read(GCP_DIR / "outputs.tf")
+    hints = _output_block(outputs, "smoke_test_hints").lower()
+    assert hints, "missing smoke_test_hints output"
+    # The default endpoint is the Cloud Run service URI...
+    assert "cloud run" in hints, "smoke hints do not mention the Cloud Run service URI default"
+    # ...public access is opt-in via the invoker toggle...
+    assert "invoker" in hints, "smoke hints do not flag the public-invoker requirement"
+    # ...custom domain is optional...
+    assert "optional" in hints, "smoke hints do not flag the custom domain as optional"
+    # ...and a live apply/smoke is still pending.
+    assert "smoke" in hints or "pending" in hints, "smoke hints do not flag live smoke as pending"
+
+
+def test_gcp_readme_documents_public_invoker_and_cloud_run_uri_contract():
+    readme = _read(GCP_DIR / "README.md")
+    lowered = readme.lower()
+    # Default endpoint is the Cloud Run service URI.
+    assert "cloud run" in lowered and "uri" in lowered, "README does not document the Cloud Run URI default endpoint"
+    # Opt-in public invoker documented by name + role + member.
+    assert "enable_public_invoker" in readme, "README does not document enable_public_invoker"
+    assert "roles/run.invoker" in readme, "README does not document the run.invoker role"
+    assert "allusers" in lowered, "README does not document the allUsers public binding"
+    # Optional custom domain mapping documented.
+    assert "enable_custom_domain" in readme, "README does not document enable_custom_domain"
+    # Live apply/smoke still pending.
+    assert "live" in lowered and "smoke" in lowered, "README drops the live apply/smoke gap"
+    # Raw secrets remain a bootstrap concern.
+    assert "bootstrap" in lowered
+    assert "raw" in lowered
+
+
+def test_gcp_tfvars_documents_public_invoker_and_optional_custom_domain():
+    tfvars = _read(GCP_DIR / "terraform.tfvars.example")
+    assert "enable_public_invoker" in tfvars, "tfvars example does not surface enable_public_invoker"
+    assert "enable_custom_domain" in tfvars, "tfvars example does not surface enable_custom_domain"
+    lowered = tfvars.lower()
+    assert "optional" in lowered or "invoker" in lowered, "tfvars does not explain the optional public-endpoint path"

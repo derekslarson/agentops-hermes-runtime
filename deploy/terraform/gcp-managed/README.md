@@ -31,11 +31,12 @@ worker additionally advertises its per-instance run-slot bound
 ## Apply
 
 > **Completeness caveat:** Running `apply` provisions the resource skeleton and
-> wires the customer images + shared runtime env, but this module is still
-> **scaffold-level** and the parity gaps below (notably no load balancer / DNS
-> for the control-plane) mean it **does not yet yield a reachable working
-> deployment**. Close the parity gaps before expecting a serving endpoint, and
-> note that no live GCP apply/smoke has been captured.
+> wires the customer images + shared runtime env. The default public API endpoint
+> is the Cloud Run control-plane service **URI** (see "Public API endpoint"
+> below); it is reachable without IAM auth only when `enable_public_invoker` is
+> set. This module is still **scaffold-level** (placeholder images, parity gaps
+> below), and **no live `PLAN_ONLY=0` GCP apply/smoke has been captured** — a
+> successful `plan` is not a captured live deployment.
 
 All commands run from inside this module directory. With Terraform:
 
@@ -87,6 +88,24 @@ so **no live GCP apply/smoke is captured** — a successful plan is not a captur
 live deployment. The helper never accepts or echoes raw integration secret
 values; bootstrap (M16) owns those.
 
+## Public API endpoint
+
+The control-plane has **no provisioned load balancer / DNS**, so the default
+public API endpoint is the Cloud Run control-plane service **URI** (surfaced as
+the `cloud_run_api_url` output; `agentops_api_url` and the webhook URLs derive
+from it). Two non-secret toggles control public exposure:
+
+- **`enable_public_invoker`** (default `false`): when `true`, grants
+  `allUsers` `roles/run.invoker` on the **control-plane only** so the API is
+  reachable without IAM auth. Default `false` keeps the service IAM-gated
+  (private). The worker/scheduler never receive this binding.
+- **`enable_custom_domain`** (default `false`) + **`domain`**: when both are
+  set, a Cloud Run domain mapping is created for the control-plane at `domain`,
+  and `agentops_api_url` becomes `https://<domain>`. With `enable_custom_domain`
+  unset, the endpoint stays the Cloud Run service URI.
+
+A live `PLAN_ONLY=0` GCP apply/smoke against a real project is still pending.
+
 ## Bring your own network / managed resources
 
 Set the `existing_*` variables (`existing_vpc_id`, `existing_subnet_ids`,
@@ -137,8 +156,11 @@ module in the following areas:
 - **Autoscaling policy:** Cloud Run min/max instances are set, but no explicit
   CPU target-tracking policy equivalent to the AWS Application Auto Scaling
   policy is configured.
-- **Load balancer / DNS:** custom domain mapping for the control-plane is not
-  yet provisioned, so an apply does not expose a reachable serving endpoint.
+- **Load balancer / DNS:** the default endpoint is the Cloud Run service URI;
+  no external HTTP(S) load balancer or managed DNS fronts the control-plane.
+  Optional public access (`enable_public_invoker`) and an optional Cloud Run
+  domain mapping (`enable_custom_domain` + `domain`) are wired (see "Public API
+  endpoint"), but a load-balancer/CDN front door is not.
 - **Live apply/smoke:** no live `PLAN_ONLY=0` GCP apply/smoke has been captured;
   a successful `plan` is not a captured live deployment.
 

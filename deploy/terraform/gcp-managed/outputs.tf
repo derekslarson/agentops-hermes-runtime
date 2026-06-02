@@ -6,12 +6,27 @@
 ###############################################################################
 
 locals {
-  api_base_url = "https://${var.domain}"
+  # The default public API endpoint is the Cloud Run control-plane service URI
+  # (there is no provisioned load balancer / DNS). Reachability still requires
+  # public unauthenticated access (var.enable_public_invoker); otherwise the
+  # service is IAM-gated.
+  cloud_run_api_url = google_cloud_run_v2_service.control_plane.uri
+
+  # Effective API URL the customer hands out. When a custom domain is explicitly
+  # configured (var.enable_custom_domain + var.domain → Cloud Run domain
+  # mapping), the effective URL is the custom HTTPS domain; otherwise it stays
+  # the Cloud Run service URI. Bootstrap and webhook URLs derive from this base.
+  api_base_url = var.enable_custom_domain && var.domain != "" ? "https://${var.domain}" : local.cloud_run_api_url
 }
 
 output "agentops_api_url" {
-  description = "Base URL of the AgentOps API / control-plane."
+  description = "Effective base URL of the AgentOps API / control-plane (custom HTTPS domain when configured, otherwise the Cloud Run service URI)."
   value       = local.api_base_url
+}
+
+output "cloud_run_api_url" {
+  description = "Raw Cloud Run control-plane service URI (always available, regardless of the optional custom domain)."
+  value       = local.cloud_run_api_url
 }
 
 output "bootstrap_url" {
@@ -88,8 +103,10 @@ output "worker_service_name" {
 output "smoke_test_hints" {
   description = "Commands/URLs to verify the deployment after bootstrap."
   value = {
-    api_health = "curl ${local.api_base_url}/healthz"
-    api_ready  = "curl ${local.api_base_url}/readyz"
-    note       = "After bootstrap, send a test Slack/GitHub/Linear/Jira event and confirm a worker run is claimed from the Pub/Sub subscription."
+    api_health    = "curl ${local.api_base_url}/healthz"
+    api_ready     = "curl ${local.api_base_url}/readyz"
+    endpoint_note = "The default API endpoint is the Cloud Run control-plane service URI (cloud_run_api_url). It is reachable without IAM auth only when enable_public_invoker = true (allUsers roles/run.invoker on the control-plane); otherwise the service is IAM-gated."
+    domain_note   = "A custom domain is OPTIONAL: set enable_custom_domain = true with domain to create a Cloud Run domain mapping. With it unset the endpoint stays the Cloud Run service URI. A live PLAN_ONLY=0 GCP apply/smoke against a real project is still pending — treat the first real apply as the smoke test."
+    note          = "After bootstrap, send a test Slack/GitHub/Linear/Jira event and confirm a worker run is claimed from the Pub/Sub subscription."
   }
 }

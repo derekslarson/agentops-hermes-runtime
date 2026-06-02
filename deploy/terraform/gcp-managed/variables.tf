@@ -28,8 +28,27 @@ variable "region" {
 }
 
 variable "domain" {
-  description = "Public domain for the AgentOps API/control-plane."
+  description = "OPTIONAL custom domain for the AgentOps API/control-plane. Empty (default) keeps the Cloud Run control-plane service URI as the public API endpoint; set it together with enable_custom_domain to create a Cloud Run domain mapping. Non-secret."
   type        = string
+  default     = ""
+}
+
+# --- Public API endpoint contract -------------------------------------------
+#
+# The control-plane has no provisioned load balancer / DNS, so the default
+# public API endpoint is the Cloud Run service URI. These non-secret toggles
+# opt into public unauthenticated access and an optional custom-domain mapping.
+
+variable "enable_public_invoker" {
+  description = "When true, grant allUsers roles/run.invoker on the CONTROL-PLANE Cloud Run service so its API is reachable without IAM auth. Default false keeps the service IAM-gated (private). Non-secret toggle; the worker/scheduler never get this binding."
+  type        = bool
+  default     = false
+}
+
+variable "enable_custom_domain" {
+  description = "When true (and domain is set), create a Cloud Run domain mapping for the control-plane at var.domain. Default false uses the Cloud Run service URI as the endpoint. Non-secret toggle."
+  type        = bool
+  default     = false
 }
 
 # --- Container images --------------------------------------------------------

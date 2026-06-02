@@ -259,3 +259,33 @@ resource "google_project_iam_member" "runtime_cloudsql" {
   role    = "roles/cloudsql.client"
   member  = "serviceAccount:${google_service_account.runtime.email}"
 }
+
+###############################################################################
+# Public API endpoint — opt-in unauthenticated invoker + optional custom domain
+#
+# The control-plane has no provisioned load balancer / DNS, so the default
+# public endpoint is the Cloud Run service URI (surfaced via outputs). Public
+# unauthenticated access is OFF by default; set enable_public_invoker to grant
+# allUsers roles/run.invoker on the CONTROL-PLANE only. A custom domain mapping
+# is created only when enable_custom_domain is set together with a domain.
+###############################################################################
+
+resource "google_cloud_run_v2_service_iam_member" "control_plane_public" {
+  count    = var.enable_public_invoker ? 1 : 0
+  location = google_cloud_run_v2_service.control_plane.location
+  name     = google_cloud_run_v2_service.control_plane.name
+  role     = "roles/run.invoker"
+  member   = "allUsers"
+}
+
+resource "google_cloud_run_domain_mapping" "control_plane" {
+  count    = var.enable_custom_domain && var.domain != "" ? 1 : 0
+  location = var.region
+  name     = var.domain
+  metadata {
+    namespace = var.project
+  }
+  spec {
+    route_name = google_cloud_run_v2_service.control_plane.name
+  }
+}

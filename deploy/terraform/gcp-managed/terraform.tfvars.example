@@ -9,7 +9,16 @@
 name_prefix = "agentops"
 project     = "my-gcp-project"
 region      = "us-central1"
-domain      = "agentops.example.com"
+
+# --- Public API endpoint (non-secret toggles) -------------------------------
+# The default public API endpoint is the Cloud Run control-plane service URI
+# (no load balancer / DNS is provisioned). Reachability without IAM auth is
+# OPT-IN: set enable_public_invoker = true to grant allUsers roles/run.invoker
+# on the control-plane only. A custom domain is OPTIONAL: set enable_custom_domain
+# = true together with domain to create a Cloud Run domain mapping.
+# enable_public_invoker = false
+# enable_custom_domain  = false
+# domain                = "agentops.example.com"
 
 # --- Container images (non-secret refs) -------------------------------------
 # Override with the runtime images you build/push. These are image references,
