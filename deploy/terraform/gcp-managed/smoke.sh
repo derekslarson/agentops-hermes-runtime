@@ -111,6 +111,22 @@ if [ "$PLAN_ONLY" != "0" ]; then
   exit 0
 fi
 
+# --- apply-path preflight: public unauthenticated invoker must be enabled -----
+# The control-plane API is IAM-gated unless enable_public_invoker is true
+# (allUsers roles/run.invoker). With the default (false), a PLAN_ONLY=0 live
+# smoke would apply resources and then fail the unauthenticated /healthz probe
+# below with 403. Inspect the effective (tfvars/TF_VAR/default) value and fail
+# closed BEFORE the apply side effect unless it is true. Plan-only never reaches
+# here, so it stays permissive. This is a non-secret input preflight.
+if ! invoker_value="$(printf 'var.enable_public_invoker\n' | "$TF" console 2>/dev/null)"; then
+  echo "error: could not inspect enable_public_invoker with ${TF} console before PLAN_ONLY=0 apply/smoke" >&2
+  exit 1
+fi
+if [ "$invoker_value" != "true" ]; then
+  echo "error: enable_public_invoker is not true — a PLAN_ONLY=0 live smoke would apply resources and then fail the unauthenticated /healthz probe with 403 (the Cloud Run API is IAM-gated). Set enable_public_invoker = true in terraform.tfvars or TF_VAR_enable_public_invoker=true before PLAN_ONLY=0 apply/smoke." >&2
+  exit 1
+fi
+
 # --- apply-path preflight: refuse placeholder ':replace-me' images -----------
 # The image variables ship with ':replace-me' placeholder defaults so a plan is
 # exercisable, but an apply built from them can never yield a working deployment.

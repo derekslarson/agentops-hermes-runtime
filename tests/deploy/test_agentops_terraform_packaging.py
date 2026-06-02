@@ -1149,6 +1149,150 @@ def test_smoke_scripts_health_probe_does_not_reference_raw_secrets():
             assert token not in lowered, f"{token} referenced in {script.parent.name}/smoke.sh"
 
 
+# --- GCP apply-path public-invoker preflight (M15 slice) --------------------
+#
+# The gcp-managed public API endpoint is IAM-gated unless enable_public_invoker
+# is true (allUsers roles/run.invoker on the control-plane). A PLAN_ONLY=0 live
+# smoke run with the default (false) would apply resources and then fail the
+# post-apply /healthz probe with 403. The helper must fail closed BEFORE the
+# apply side effect when the effective enable_public_invoker input is not true,
+# while staying permissive in plan-only mode. This is a non-secret input
+# preflight; raw app/integration secret values remain a bootstrap (M16) concern.
+
+
+def _make_smoke_stub_bin(tmp: Path) -> Path:
+    """Build stub terraform/gcloud/curl executables for driving smoke.sh.
+
+    The terraform stub no-ops init/validate/plan, evaluates `terraform console`
+    for `var.enable_public_invoker` from the TF_VAR_* env (mirroring real
+    default-false / TF_VAR override behavior), returns a non-placeholder image
+    for image preflight, and records that `apply` was reached by touching
+    $APPLY_MARKER before exiting non-zero (so a reached apply is observable
+    without provisioning anything).
+    """
+    bin_dir = tmp / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+
+    terraform = bin_dir / "terraform"
+    terraform.write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        "  console)\n"
+        '    q="$(cat)"\n'
+        '    case "$q" in\n'
+        "      *enable_public_invoker*) printf '%s\\n' \"${TF_VAR_enable_public_invoker:-false}\" ;;\n"
+        "      *image*) printf 'gcr.io/example/app:v1\\n' ;;\n"
+        "      *) printf '\\n' ;;\n"
+        "    esac\n"
+        "    ;;\n"
+        "  output)\n"
+        '    if [ "${2:-}" = "-raw" ]; then printf \'http://api.example.test\\n\'; else printf \'hint\\n\'; fi\n'
+        "    ;;\n"
+        "  apply)\n"
+        '    : >"$APPLY_MARKER"\n'
+        "    exit 1\n"
+        "    ;;\n"
+        "  *) : ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    terraform.chmod(0o755)
+
+    gcloud = bin_dir / "gcloud"
+    gcloud.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [ "${1:-}" = "auth" ] && [ "${2:-}" = "list" ]; then printf \'tester@example.com\\n\'; fi\n',
+        encoding="utf-8",
+    )
+    gcloud.chmod(0o755)
+
+    curl = bin_dir / "curl"
+    curl.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    curl.chmod(0o755)
+
+    return bin_dir
+
+
+def _run_gcp_smoke(bin_dir: Path, apply_marker: Path, extra_env: dict[str, str]):
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+        "PLAN_ONLY": "0",
+        "TF_VAR_project": "example-project",
+        "TF_VAR_region": "us-central1",
+        "APPLY_MARKER": str(apply_marker),
+    }
+    env.pop("TF_VAR_enable_public_invoker", None)
+    env.update(extra_env)
+    return subprocess.run(
+        ["bash", str(GCP_SMOKE_SCRIPT)],
+        env=env,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+
+
+def test_gcp_smoke_script_blocks_apply_unless_public_invoker_enabled(tmp_path):
+    assert GCP_SMOKE_SCRIPT.is_file(), "missing gcp-managed/smoke.sh"
+    apply_marker = tmp_path / "applied"
+    bin_dir = _make_smoke_stub_bin(tmp_path)
+
+    # --- blocked: public invoker NOT enabled → fail closed BEFORE apply -------
+    blocked = _run_gcp_smoke(bin_dir, apply_marker, {})
+    assert blocked.returncode != 0, "smoke.sh did not fail with public invoker disabled"
+    assert not apply_marker.exists(), (
+        "smoke.sh reached terraform apply with public invoker disabled "
+        f"(stdout={blocked.stdout!r} stderr={blocked.stderr!r})"
+    )
+    assert "enable_public_invoker" in blocked.stderr, (
+        "smoke.sh did not explain the enable_public_invoker requirement "
+        f"(stderr={blocked.stderr!r})"
+    )
+
+    # --- permitted: enabled via TF_VAR → reaches apply preflight --------------
+    if apply_marker.exists():
+        apply_marker.unlink()
+    permitted = _run_gcp_smoke(
+        bin_dir, apply_marker, {"TF_VAR_enable_public_invoker": "true"}
+    )
+    assert apply_marker.exists(), (
+        "smoke.sh did not reach apply when public invoker was enabled "
+        f"(stdout={permitted.stdout!r} stderr={permitted.stderr!r})"
+    )
+
+
+def test_gcp_smoke_script_public_invoker_preflight_permits_plan_only(tmp_path):
+    # Plan-only (the safe default) must stay permissive: the public-invoker
+    # apply-path gate must not block a PLAN_ONLY=1 run even with the default
+    # (disabled) public invoker.
+    assert GCP_SMOKE_SCRIPT.is_file(), "missing gcp-managed/smoke.sh"
+    apply_marker = tmp_path / "applied"
+    bin_dir = _make_smoke_stub_bin(tmp_path)
+
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+        "PLAN_ONLY": "1",
+        "TF_VAR_project": "example-project",
+        "TF_VAR_region": "us-central1",
+        "APPLY_MARKER": str(apply_marker),
+    }
+    env.pop("TF_VAR_enable_public_invoker", None)
+    result = subprocess.run(
+        ["bash", str(GCP_SMOKE_SCRIPT)],
+        env=env,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+    assert result.returncode == 0, (
+        "plan-only smoke.sh failed even though apply is not requested "
+        f"(stdout={result.stdout!r} stderr={result.stderr!r})"
+    )
+    assert not apply_marker.exists(), "plan-only run must never reach apply"
+
+
 def test_readmes_document_post_apply_healthz_probe():
     for module_dir in (AWS_DIR, GCP_DIR):
         readme = _read(module_dir / "README.md")

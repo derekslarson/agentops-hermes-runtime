@@ -157,6 +157,14 @@ Before a `PLAN_ONLY=0` apply/smoke you must replace the placeholder
 `scheduler_image`) with real image references — the apply path inspects the
 effective image values and fails closed if any placeholder remains.
 
+The `PLAN_ONLY=0` apply path also requires `enable_public_invoker = true`. The
+control-plane API is IAM-gated by default, so the helper's unauthenticated
+`${agentops_api_url}/healthz` probe would 403 right after a default apply. The
+helper inspects the effective `enable_public_invoker` input and **fails closed
+before apply** unless it is `true` — set `enable_public_invoker = true` in
+`terraform.tfvars` (or `TF_VAR_enable_public_invoker=true`) for a live smoke.
+This is a non-secret input only; the default (plan-only) path stays permissive.
+
 On the `PLAN_ONLY=0` apply path, after a healthy `/healthz` probe, the helper
 also writes a module-local **non-secret smoke transcript** (`smoke-transcript-<UTC
 timestamp>.log`) recording the provider/profile, a UTC timestamp, the effective
