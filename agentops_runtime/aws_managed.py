@@ -18,16 +18,21 @@ This is a SPIKE, not a real AWS deployment:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Mapping
 
 from agent.runtime_backends import (
     _LOCAL_BACKEND_TYPES,
     BackendCapability,
     RuntimeBackendRegistry,
 )
-from agent.runtime_supervisor import LocalRunSupervisor
+from agent.runtime_context import RuntimeContext
+from agent.runtime_supervisor import LocalRunSupervisor, RunResult
 
 AWS_MANAGED_PROFILE = "aws-managed"
+
+# Handler receives the bound RuntimeContext and the queued payload.
+AwsManagedHandler = Callable[[RuntimeContext, Mapping[str, Any]], Any]
 
 
 def _positive_int(name: str, value: object) -> int:
@@ -74,6 +79,55 @@ class EcsWorkerFleetPlan:
         """Return a new plan with a different per-task run-slot bound."""
 
         return replace(self, max_concurrent_runs=max_concurrent_runs)
+
+
+@dataclass(frozen=True, slots=True)
+class AwsManagedWorkItem:
+    """An AWS-shaped queued work item (SQS/EventBridge envelope) to execute.
+
+    ``message_id`` is the non-secret queue message identifier. ``receipt_handle``
+    is the SQS delete/visibility credential and is deliberately kept off the
+    :class:`RuntimeContext` so it never reaches scope metadata or audit — only
+    the non-secret ``message_id`` is surfaced as ``work_item_id``.
+    """
+
+    message_id: str
+    run_type: str
+    run_id: str
+    org_id: str
+    workspace_id: str
+    user_id: str
+    conversation_id: str
+    agent_profile_id: str
+    project_id: str
+    job_id: str | None = None
+    receipt_handle: str | None = field(default=None, repr=False)
+    delivery_ref: str | None = None
+    payload: Mapping[str, Any] = field(default_factory=dict)
+    backend_profile: str = AWS_MANAGED_PROFILE
+
+    def __post_init__(self) -> None:
+        if self.backend_profile != AWS_MANAGED_PROFILE:
+            raise ValueError("backend_profile must be aws-managed")
+
+    def to_context(self) -> RuntimeContext:
+        """Map the queued item to an ``aws-managed`` agentops RuntimeContext."""
+
+        return RuntimeContext(
+            mode="agentops",
+            org_id=self.org_id,
+            workspace_id=self.workspace_id,
+            user_id=self.user_id,
+            conversation_id=self.conversation_id,
+            agent_profile_id=self.agent_profile_id,
+            project_id=self.project_id,
+            run_id=self.run_id,
+            run_type=self.run_type,
+            job_id=self.job_id,
+            backend_profile=self.backend_profile,
+            delivery_ref=self.delivery_ref,
+            metadata={"work_item_id": self.message_id},
+        )
 
 
 def configure_aws_managed_runtime_backends(
@@ -129,10 +183,45 @@ def build_aws_managed_run_supervisor(
     return supervisor, registry
 
 
+def run_aws_managed_work_item(
+    work_item: AwsManagedWorkItem,
+    handler: AwsManagedHandler,
+    *,
+    supervisor: LocalRunSupervisor | None = None,
+    registry: RuntimeBackendRegistry | None = None,
+    worker_id: str = "aws-managed-worker",
+    max_concurrent_runs: int = 1,
+) -> RunResult:
+    """Run an AWS-shaped queued item through the shared runtime lifecycle.
+
+    The item is mapped to an ``aws-managed`` :class:`RuntimeContext` and executed
+    via :meth:`LocalRunSupervisor.run_to_completion`, so it claims the same
+    per-run lease and records the same lifecycle audit as the local and Compose
+    paths. When no supervisor is supplied one is built against the ``aws-managed``
+    registry with the given per-task ``max_concurrent_runs`` bound — independent
+    of any whole-fleet ``desired_task_count``. The handler receives the bound
+    context and the queued payload.
+    """
+
+    context = work_item.to_context()
+    if supervisor is None:
+        if registry is None:
+            registry = build_aws_managed_test_registry()
+        supervisor = LocalRunSupervisor(
+            worker_id=worker_id,
+            max_concurrent_runs=max_concurrent_runs,
+            registry=registry,
+        )
+    payload = dict(work_item.payload)
+    return supervisor.run_to_completion(context, lambda: handler(context, payload))
+
+
 __all__ = [
     "AWS_MANAGED_PROFILE",
+    "AwsManagedWorkItem",
     "EcsWorkerFleetPlan",
     "build_aws_managed_run_supervisor",
     "build_aws_managed_test_registry",
     "configure_aws_managed_runtime_backends",
+    "run_aws_managed_work_item",
 ]
