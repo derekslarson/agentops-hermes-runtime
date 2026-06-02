@@ -99,7 +99,10 @@ scripts/out/
 
 # Managed-cloud smoke transcripts — per-operator live-smoke evidence written by
 # deploy/terraform/*/smoke.sh on the apply path. Operator artifacts, never source.
+# The .log.tmp form is the atomic-write temp file: if a smoke run is interrupted
+# between the temp write and the rename, a partial transcript must not be committed.
 smoke-transcript-*.log
+smoke-transcript-*.log.tmp
 
 # Generated non-secret image tfvars overrides — written by
 # deploy/terraform/*-managed/publish-images.sh on the WRITE_TFVARS=1 live path.

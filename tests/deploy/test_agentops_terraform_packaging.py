@@ -2472,6 +2472,30 @@ def test_root_gitignore_ignores_smoke_transcript_logs():
     ), "root .gitignore does not ignore smoke-transcript-*.log operator evidence artifacts"
 
 
+def test_root_gitignore_ignores_smoke_transcript_temp_artifact():
+    # The smoke helpers write the transcript atomically: they build it into a
+    # `${TRANSCRIPT}.tmp` temp file (smoke-transcript-<UTC>.log.tmp) and only
+    # rename it into place once fully written. If a smoke run is interrupted
+    # (Ctrl-C / a hung `terraform output`) between the temp write and the `mv`,
+    # the partial `.tmp` transcript is left behind. The `smoke-transcript-*.log`
+    # ignore does NOT cover the `.log.tmp` suffix, so that partial operator
+    # evidence could be accidentally committed — exactly what the atomic write
+    # was meant to prevent. The temp artifact must be git-ignored too.
+    for module_dir in (AWS_DIR, GCP_DIR):
+        # The scripts derive the temp name as "${TRANSCRIPT}.tmp"; assert that
+        # invariant so this test stays anchored to the real script behavior.
+        script = _read(module_dir / "smoke.sh")
+        assert 'TRANSCRIPT_TMP="${TRANSCRIPT}.tmp"' in script, (
+            f"{module_dir.name}/smoke.sh no longer writes the transcript via a "
+            '"${TRANSCRIPT}.tmp" temp file — update this test'
+        )
+        temp_path = f"deploy/terraform/{module_dir.name}/smoke-transcript-20240101T000000Z.log.tmp"
+        assert _git_check_ignore(temp_path), (
+            f"root .gitignore does not ignore the partial smoke transcript temp "
+            f"artifact {temp_path}"
+        )
+
+
 # --- image publishing helpers (publish-images.sh) — M15 slice ---------------
 #
 # A module-local executable helper an operator runs to build/tag/push the three
