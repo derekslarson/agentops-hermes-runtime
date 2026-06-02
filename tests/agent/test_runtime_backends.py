@@ -256,6 +256,27 @@ def test_capability_options_are_passed_to_the_factory_without_context_binding():
     assert seen["options"] == {"scope": "user"}
 
 
+def test_set_capability_options_merges_options_and_invalidates_cached_instance():
+    seen = []
+
+    def factory(options):
+        seen.append(dict(options))
+        return LocalMemoryBackend()
+
+    registry = RuntimeBackendRegistry(config={"backends": {"options": {"memory": {"scope": "user"}}}})
+    registry.register(BackendCapability.MEMORY, factory, profile="local")
+    original = registry.get(BackendCapability.MEMORY)
+
+    registry.set_capability_options(BackendCapability.MEMORY, {"base_url": "https://api.internal"})
+    replacement = registry.get(BackendCapability.MEMORY)
+
+    assert replacement is not original
+    assert seen == [
+        {"scope": "user"},
+        {"scope": "user", "base_url": "https://api.internal"},
+    ]
+
+
 def test_register_replaces_cached_backend_for_profile():
     registry = RuntimeBackendRegistry()
     original = registry.get(BackendCapability.MEMORY)

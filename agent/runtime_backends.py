@@ -1651,6 +1651,38 @@ class RuntimeBackendRegistry:
                 return capability_options
         return {}
 
+    def set_capability_options(
+        self,
+        capability: BackendCapability | str,
+        options: Mapping[str, Any],
+        *,
+        merge: bool = True,
+    ) -> None:
+        """Set static factory options for a backend capability.
+
+        Backend factory options are deployment configuration, not tenant scope.
+        Updating them invalidates cached instances for the capability so the next
+        ``get(...)`` call constructs a backend from the new options.
+        """
+
+        cap = _coerce_capability(capability)
+        new_options = dict(options)
+        with self._lock:
+            backends_config = dict(self._backends_config)
+            existing_options = backends_config.get("options")
+            all_options = dict(existing_options) if isinstance(existing_options, Mapping) else {}
+            if merge:
+                current = all_options.get(cap.value)
+                merged = dict(current) if isinstance(current, Mapping) else {}
+                merged.update(new_options)
+                all_options[cap.value] = merged
+            else:
+                all_options[cap.value] = new_options
+            backends_config["options"] = all_options
+            self._backends_config = backends_config
+            for cache_key in [key for key in self._instances if key[0] == cap]:
+                self._instances.pop(cache_key, None)
+
     def _instrument_for_audit(self, capability: BackendCapability, instance: Any) -> Any:
         method_names = _AUDITED_BACKEND_METHODS.get(capability)
         if not method_names:
