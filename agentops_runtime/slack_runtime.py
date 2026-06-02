@@ -156,6 +156,89 @@ def route_slack_turn(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class SlackTurnResult:
+    """Outcome of a hermetic end-to-end Slack runtime turn."""
+
+    route: SlackTurnRoute
+    run: Any
+    delivered: tuple[Mapping[str, Any], ...]
+
+
+def _with_run_id(context: RuntimeContext, run_id: str | None) -> RuntimeContext:
+    """Return a context copy bound to the routed run id (other scope unchanged)."""
+
+    if not run_id or context.run_id == run_id:
+        return context
+    data = context.to_dict()
+    data["run_id"] = run_id
+    return RuntimeContext(**data)
+
+
+def run_slack_turn(
+    event: Mapping[str, Any],
+    *,
+    context: RuntimeContext,
+    text: str,
+    handler: Callable[[list[Any]], Any],
+    supervisor: Any,
+    registry: RuntimeBackendRegistry | None = None,
+    delivery: SlackDeliveryBackend | None = None,
+    lock_ttl_seconds: float = 300.0,
+    warm_idle_timeout_seconds: float = 300.0,
+    result_timeout: float | None = 30.0,
+) -> SlackTurnResult:
+    """Run one Slack turn end-to-end through the native runtime surfaces.
+
+    This is the AgentOps Slack ingress orchestrator: the incoming turn is routed
+    through the selected ``ConversationRouter``, which resolves the Slack
+    conversation and picks/creates the warm run that owns it. The turn is then
+    executed under a RuntimeContext bound to that routed ``run_id`` so the handler
+    runs as the selected warm run rather than only observing router bookkeeping.
+    When the supervisor exposes the warm-turn path the turn is processed through
+    :meth:`LocalRunSupervisor.submit_warm_turn` so a follow-up in the same Slack
+    thread is handled by the active warm run's context/owner; a generic
+    supervisor without that path falls back to ``process_turn`` under the same
+    routed context. Either way the scoped transcript is persisted to the selected
+    ``SessionBackend`` (whose scope excludes per-run identity, so state resumes
+    across worker restarts), and any outbound reply is delivered back to the
+    originating Slack thread via the injected :class:`SlackDeliveryBackend`. It
+    imports no Slack SDK and carries no credentials; production wiring injects the
+    registry, supervisor, and delivery sender.
+    """
+
+    if context is None:
+        raise ValueError("Slack turn requires a RuntimeContext")
+    route = route_slack_turn(event, context=context, text=text, registry=registry)
+    run_context = _with_run_id(context, route.run_id)
+    message = {
+        "role": "user",
+        "content": text,
+        "platform": "slack",
+        "user_id": run_context.user_id,
+        "channel_id": run_context.external_channel_id,
+        "thread_ts": run_context.external_thread_id,
+        "message_ts": _slack_value(event, "ts", "trigger_id"),
+    }
+    submit_warm_turn = getattr(supervisor, "submit_warm_turn", None)
+    if callable(submit_warm_turn) and run_context.run_type == "conversation":
+        run = submit_warm_turn(
+            run_context,
+            message,
+            handler,
+            idle_timeout_seconds=warm_idle_timeout_seconds,
+            lock_ttl_seconds=lock_ttl_seconds,
+        ).result(timeout=result_timeout)
+    else:
+        run = supervisor.process_turn(run_context, message, handler, lock_ttl_seconds=lock_ttl_seconds)
+    delivered: list[Mapping[str, Any]] = []
+    if delivery is not None and run.error is None and run.value:
+        for outbound in run.value:
+            delivery.deliver(run_context, outbound)
+            delivered.append(outbound)
+    return SlackTurnResult(route=route, run=run, delivered=tuple(delivered))
+
+
 def build_slack_runtime_context(
     event: Mapping[str, Any],
     *,
