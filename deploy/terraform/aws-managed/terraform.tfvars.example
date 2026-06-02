@@ -29,7 +29,9 @@ db_instance_class = "db.t4g.medium"
 # These are OPTIONAL, non-secret references. With both empty the deployment
 # serves over HTTP at the ALB DNS name. Set acm_certificate_arn to add an HTTPS
 # listener on 443 (TLS terminates with your ACM certificate) so agentops_api_url
-# becomes https://<domain>; set route53_zone_id to alias <domain> at the ALB.
+# becomes https://<domain>. Set route53_zone_id alone (no certificate) to alias
+# <domain> at the ALB over the existing HTTP listener — agentops_api_url then
+# becomes http://<domain> (HTTP, not HTTPS, until you also supply a certificate).
 # acm_certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/abcd-1234"
 # route53_zone_id     = "Z0123456789ABCDEFGHIJ"
 

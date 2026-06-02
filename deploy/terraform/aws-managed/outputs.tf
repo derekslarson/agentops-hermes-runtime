@@ -13,20 +13,26 @@ locals {
   # must supply public ALB subnets (see existing_alb_subnet_ids).
   alb_http_url = "http://${aws_lb.this.dns_name}"
 
-  # Effective API URL the customer hands out. When a custom-domain certificate is
-  # supplied (var.acm_certificate_arn → HTTPS listener on 443), the effective URL
-  # is the HTTPS custom domain; otherwise it stays the ALB HTTP URL. Bootstrap and
-  # webhook URLs derive from this effective base.
-  api_base_url = var.acm_certificate_arn != "" ? "https://${var.domain}" : local.alb_http_url
+  # Effective API URL the customer hands out:
+  #   * acm_certificate_arn set       → https://<domain> (HTTPS listener on 443)
+  #   * route53_zone_id set, no cert  → http://<domain>  (Route53 alias over the
+  #                                     existing HTTP listener — no TLS yet)
+  #   * neither set                   → ALB DNS HTTP URL
+  # Bootstrap and webhook URLs derive from this effective base.
+  api_base_url = (
+    var.acm_certificate_arn != "" ? "https://${var.domain}" :
+    var.route53_zone_id != "" ? "http://${var.domain}" :
+    local.alb_http_url
+  )
 }
 
 output "agentops_api_url" {
-  description = "Effective base URL of the AgentOps API / control-plane (custom HTTPS domain when a certificate is configured, otherwise the ALB HTTP URL)."
+  description = "Effective base URL of the AgentOps API / control-plane (HTTPS custom domain with ACM, HTTP custom domain with Route53-only, otherwise ALB HTTP URL)."
   value       = local.api_base_url
 }
 
 output "alb_http_url" {
-  description = "Raw ALB HTTP URL (always available, regardless of optional custom-domain HTTPS)."
+  description = "Raw ALB HTTP URL (always available, regardless of optional custom-domain DNS/TLS inputs)."
   value       = local.alb_http_url
 }
 
@@ -113,7 +119,7 @@ output "smoke_test_hints" {
     api_health = "curl ${local.api_base_url}/healthz"
     api_ready  = "curl ${local.api_base_url}/readyz"
     dns_note   = "URLs resolve to the ALB DNS name over HTTP by default. When this module creates the VPC it also creates public ALB subnets with public routing (IGW + default route), so the endpoint is internet-reachable; a bring-your-own VPC must supply public ALB subnets via existing_alb_subnet_ids."
-    tls_note   = "Custom-domain HTTPS is OPTIONAL: set acm_certificate_arn to add a 443 HTTPS listener (TLS/ACM) and route53_zone_id to alias ${var.domain} at the ALB. With both empty the deployment stays on the ALB-DNS HTTP path. An applied end-to-end smoke test against a live AWS account is still pending — treat the first real apply as the smoke test."
+    tls_note   = "Custom-domain HTTPS is OPTIONAL and the effective URL follows the inputs: acm_certificate_arn set → https://${var.domain} (443 HTTPS/ACM listener); route53_zone_id set WITHOUT a certificate → http://${var.domain} (Route53 alias over the existing HTTP listener, no TLS); both empty → the ALB-DNS HTTP URL. An applied end-to-end smoke test against a live AWS account is still pending — treat the first real apply as the smoke test."
     note       = "After bootstrap, send a test Slack/GitHub/Linear/Jira event and confirm a worker run is claimed from the runs queue."
   }
 }

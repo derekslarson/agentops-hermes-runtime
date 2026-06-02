@@ -55,13 +55,21 @@ custom domain over **HTTPS**, set these two **optional**, non-secret inputs:
   on the ALB security group, and the `agentops_api_url` output flips to
   `https://<domain>`. This is a certificate **reference**, not a secret value.
 - `route53_zone_id` — a Route53 hosted zone id for `domain`. When set, the module
-  creates an **alias record** pointing `domain` at the ALB DNS/zone.
+  creates an **alias record** pointing `domain` at the ALB DNS/zone. Set **without**
+  `acm_certificate_arn` (route53 **only**), the custom domain is served over **HTTP**
+  at `http://<domain>` (the alias points at the existing HTTP listener — there is no
+  TLS until you also supply a certificate).
 
-Leave both empty (the default) to stay on the ALB-DNS HTTP path. The raw ALB HTTP
-URL is always available via the `alb_http_url` output regardless of these inputs.
-The effective `agentops_api_url`, `bootstrap_url`, and webhook URLs derive from
-the HTTPS custom domain when a certificate is configured, otherwise from the ALB
-HTTP URL.
+The effective `agentops_api_url` (and the `bootstrap_url`/webhook URLs derived from
+it) follows the three cases honestly:
+
+- `acm_certificate_arn` set → `https://<domain>` (HTTPS listener on 443).
+- `route53_zone_id` set, no certificate → `http://<domain>` (Route53 alias over the
+  HTTP listener — HTTP, not HTTPS).
+- neither set (the default) → the ALB-DNS HTTP URL.
+
+The raw ALB HTTP URL is always available via the `alb_http_url` output regardless
+of these inputs.
 
 All commands run from inside this module directory. With Terraform:
 

@@ -1051,6 +1051,93 @@ def test_tfvars_example_documents_optional_tls_dns():
     assert "optional" in lowered or "https" in lowered, "tfvars does not explain the optional HTTPS path"
 
 
+# --- AWS Route53-only HTTP custom-domain URL contract (M15 slice) -----------
+#
+# The optional DNS path is honest about its scheme. There are three effective
+# customer-facing URL cases:
+#   * acm_certificate_arn set                  → https://<domain> (443 listener)
+#   * route53_zone_id set, acm cert empty      → http://<domain>  (Route53 alias
+#                                                 over the existing HTTP listener)
+#   * neither set                              → ALB DNS HTTP URL
+# Previously a route53-only deployment aliased <domain> at the ALB but still
+# advertised the raw ALB DNS HTTP URL, which is inconsistent with the alias.
+
+
+def _local_expr(text: str, name: str) -> str:
+    # Capture a local's assigned expression: from `<name>` up to the end of the
+    # enclosing locals block (a `}` on its own line). The conditional is small.
+    start = text.find(name)
+    if start == -1:
+        return ""
+    end = text.find("\n}", start)
+    return text[start : end if end != -1 else len(text)]
+
+
+def test_aws_effective_api_url_three_way_tls_dns_selection():
+    outputs = _read(AWS_DIR / "outputs.tf")
+    expr = _local_expr(outputs, "api_base_url")
+    assert expr, "missing api_base_url local"
+
+    # HTTPS custom domain when an ACM certificate is supplied.
+    assert 'var.acm_certificate_arn != ""' in expr, "api_base_url does not branch on the certificate"
+    assert "https://${var.domain}" in expr, "api_base_url has no HTTPS custom-domain branch"
+
+    # HTTP custom domain when only a Route53 zone is supplied (alias over HTTP).
+    assert 'var.route53_zone_id != ""' in expr, "api_base_url does not branch on the route53 zone"
+    assert "http://${var.domain}" in expr, "api_base_url has no HTTP custom-domain branch for route53-only"
+
+    # ALB DNS HTTP URL when neither is supplied.
+    assert "local.alb_http_url" in expr, "api_base_url has no ALB-HTTP fallback branch"
+
+    # The certificate (HTTPS) wins over a bare route53 zone (HTTP).
+    assert expr.index("acm_certificate_arn") < expr.index("route53_zone_id"), (
+        "HTTPS certificate branch must take precedence over the route53-only HTTP branch"
+    )
+
+
+def test_aws_route53_only_zone_yields_http_custom_domain_url():
+    outputs = _read(AWS_DIR / "outputs.tf")
+    expr = _local_expr(outputs, "api_base_url")
+    assert expr, "missing api_base_url local"
+
+    # The route53-only branch produces the HTTP custom domain (not the raw ALB
+    # DNS URL): the alias record is the only thing standing the domain up over
+    # the existing HTTP listener.
+    http_idx = expr.find("http://${var.domain}")
+    zone_idx = expr.find('var.route53_zone_id != ""')
+    assert http_idx != -1 and zone_idx != -1, "route53-only HTTP branch is missing"
+    # The route53 condition is evaluated for the HTTP-domain branch.
+    assert zone_idx < http_idx, "http custom-domain URL is not selected by the route53 zone condition"
+
+
+def test_aws_readme_documents_route53_only_http_custom_domain():
+    readme = _read(AWS_DIR / "README.md")
+    lowered = readme.lower()
+    assert "route53_zone_id" in readme, "README does not document route53_zone_id"
+    # Honest about the scheme: a route53-only deployment (no ACM cert) serves the
+    # custom domain over HTTP.
+    assert "http://<domain>" in lowered or "http://" in lowered, "README does not show the HTTP custom-domain URL"
+    # Explicitly ties the route53-only path to the http custom domain, not HTTPS.
+    assert "without" in lowered or "only" in lowered, "README does not isolate the route53-only (no cert) case"
+
+
+def test_aws_tfvars_documents_route53_only_http_custom_domain():
+    tfvars = _read(AWS_DIR / "terraform.tfvars.example")
+    assert "route53_zone_id" in tfvars, "tfvars example does not surface route53_zone_id"
+    lowered = tfvars.lower()
+    # The example explains that route53 alone aliases the domain over HTTP.
+    assert "http://" in lowered, "tfvars does not document the route53-only HTTP custom-domain URL"
+
+
+def test_aws_smoke_hints_surface_route53_only_http_custom_domain_selection():
+    outputs = _read(AWS_DIR / "outputs.tf")
+    hints = _output_block(outputs, "smoke_test_hints").lower()
+    assert hints, "missing smoke_test_hints output"
+    # Hints surface the route53-only HTTP custom-domain path / effective URL choice.
+    assert "route53" in hints, "smoke hints do not mention the route53-only path"
+    assert "http://" in hints, "smoke hints do not surface the HTTP custom-domain URL selection"
+
+
 # --- AWS live-smoke helper (smoke.sh) — M15 slice ---------------------------
 #
 # A module-local executable helper an operator runs from deploy/terraform/aws-managed
