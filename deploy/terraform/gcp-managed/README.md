@@ -58,6 +58,43 @@ tofu plan
 tofu apply
 ```
 
+## Image-publishing helper (`publish-images.sh`)
+
+`publish-images.sh` is a module-local helper that builds, tags, and pushes the
+three runtime container images (control-plane / worker / scheduler) to Google
+Artifact Registry and prints the non-secret `terraform.tfvars` image lines you
+paste before a `PLAN_ONLY=0 ./smoke.sh` apply. It is the supported path to
+produce **real** image references that replace the `:replace-me` placeholders
+without ever handing app/integration secrets to Terraform.
+
+It is **side-effect-safe by default**: with `DRY_RUN=1` (the default) it only
+**prints** the `docker`/`gcloud` commands it would run — it never builds, logs
+in, tags, pushes, creates/configures the Artifact Registry repository, or
+modifies Terraform vars. Set `DRY_RUN=0` for a live publish; the live path
+**fails closed before any side effect** if the `gcloud` or `docker` CLI is
+missing or no gcloud account is active (verified with `gcloud auth list`).
+Inputs are env-only and non-secret: `PROJECT` (autodetected via `gcloud config`
+when unset), `AR_LOCATION` (default `us-central1`), `AR_REPO` (default
+`agentops-hermes-runtime`), `IMAGE_TAG` (default: UTC timestamp), and
+`CREATE_REPO=1` to also create/configure the Artifact Registry repo on the live
+path (dry-run always prints that command). The `*_CONTEXT` docker build contexts
+(`CONTROL_PLANE_CONTEXT` / `WORKER_CONTEXT` / `SCHEDULER_CONTEXT`) default to the
+**repo root** (`../../..` from this module dir, where the `Dockerfile` lives —
+the helper `cd`s into the module dir, so they must not default to `.`) and are
+overridable via env.
+
+```bash
+cd deploy/terraform/gcp-managed
+./publish-images.sh                              # DRY_RUN=1 (default): print commands only
+DRY_RUN=0 CREATE_REPO=1 ./publish-images.sh      # live build/tag/push to Artifact Registry
+```
+
+After a live publish it prints three lines like
+`control_plane_image = "…"` / `worker_image = "…"` / `scheduler_image = "…"`.
+Copy them into `terraform.tfvars`, then run `PLAN_ONLY=0 ./smoke.sh` to apply
+with real images (the smoke helper refuses to apply while any `:replace-me`
+placeholder remains).
+
 ## Live-smoke helper (`./smoke.sh`)
 
 `./smoke.sh` is a module-local helper you run from inside this directory after

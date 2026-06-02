@@ -1778,3 +1778,294 @@ def test_root_gitignore_ignores_smoke_transcript_logs():
     assert (
         "smoke-transcript-*.log" in lines
     ), "root .gitignore does not ignore smoke-transcript-*.log operator evidence artifacts"
+
+
+# --- image publishing helpers (publish-images.sh) — M15 slice ---------------
+#
+# A module-local executable helper an operator runs to build/tag/push the three
+# runtime container images and emit the non-secret terraform.tfvars image lines
+# (control_plane_image / worker_image / scheduler_image) to paste before a
+# PLAN_ONLY=0 ./smoke.sh apply. It must be side-effect-safe by default
+# (DRY_RUN=1 prints the docker/cloud commands without building, logging in,
+# tagging, pushing, creating repositories, or modifying Terraform vars), fail
+# closed before any side effect when prerequisites/config are missing, and never
+# accept or echo raw app/integration secret values.
+
+AWS_PUBLISH_SCRIPT = AWS_DIR / "publish-images.sh"
+GCP_PUBLISH_SCRIPT = GCP_DIR / "publish-images.sh"
+
+IMAGE_TFVARS_VARS = ("control_plane_image", "worker_image", "scheduler_image")
+
+
+def _executable_lines(text: str) -> list[str]:
+    # Non-empty, non-comment lines — the lines that actually run.
+    return [
+        line for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
+def _prints_image_tfvars_lines(text: str) -> None:
+    # Each image variable is emitted as an HCL `name = "..."` assignment an
+    # operator can paste straight into terraform.tfvars (not as a raw export or
+    # bare value), and the printed value is the registry image ref, not a
+    # placeholder.
+    for var_name in IMAGE_TFVARS_VARS:
+        printed = [
+            line
+            for line in text.splitlines()
+            if var_name in line and "=" in line and '"' in line and "echo" in line
+        ]
+        assert printed, f"publish-images.sh does not print a tfvars '{var_name} = \"...\"' line"
+
+
+def test_publish_image_helpers_exist_executable_and_strict():
+    for script in (AWS_PUBLISH_SCRIPT, GCP_PUBLISH_SCRIPT):
+        assert script.is_file(), f"missing {script.parent.name}/publish-images.sh"
+        assert script.stat().st_mode & 0o111, f"{script.parent.name}/publish-images.sh is not executable"
+        text = _read(script)
+        assert text.startswith("#!"), f"{script.parent.name}/publish-images.sh has no shebang"
+        assert "set -euo pipefail" in text, f"{script.parent.name}/publish-images.sh is not in strict mode"
+
+
+def test_publish_image_helpers_dry_run_by_default():
+    for script in (AWS_PUBLISH_SCRIPT, GCP_PUBLISH_SCRIPT):
+        text = _read(script)
+        # DRY_RUN defaults to 1 — side-effect-safe unless explicitly opted out.
+        assert 'DRY_RUN="${DRY_RUN:-1}"' in text, (
+            f"{script.parent.name}/publish-images.sh does not default DRY_RUN to 1"
+        )
+
+
+def test_publish_image_helpers_gate_side_effects_behind_dry_run():
+    # All build/login/tag/push/repository side effects must be routed through a
+    # wrapper whose execute branch is guarded by DRY_RUN=0, so the default run
+    # only prints commands. No bare docker/push/create invocations may run
+    # directly at top level.
+    for script in (AWS_PUBLISH_SCRIPT, GCP_PUBLISH_SCRIPT):
+        text = _read(script)
+        name = script.parent.name
+
+        # A run-or-echo wrapper exists and only executes when DRY_RUN=0.
+        assert "run()" in text or "run ()" in text, f"{name}: no run() wrapper for side effects"
+        run_fn = text[text.find("run()") : text.find("run()") + 220]
+        assert 'DRY_RUN" = "0"' in run_fn, (
+            f"{name}: run() wrapper does not gate execution on DRY_RUN=0"
+        )
+
+        # No side-effecting command runs directly (un-wrapped) at the start of an
+        # executable line — every docker/push/create goes through the wrapper.
+        for line in _executable_lines(text):
+            stripped = line.strip()
+            assert not stripped.startswith("docker "), (
+                f"{name}: un-wrapped docker invocation runs outside the DRY_RUN wrapper: {stripped}"
+            )
+
+
+def test_publish_image_helpers_do_not_modify_terraform_vars():
+    # DRY_RUN must not write Terraform vars; in fact the helper only prints the
+    # tfvars lines and never writes terraform.tfvars in either mode.
+    for script in (AWS_PUBLISH_SCRIPT, GCP_PUBLISH_SCRIPT):
+        text = _read(script)
+        name = script.parent.name
+        for redirect in ("> terraform.tfvars", ">terraform.tfvars", ">> terraform.tfvars", ">>terraform.tfvars"):
+            assert redirect not in text, f"{name}: publish-images.sh writes terraform.tfvars ({redirect})"
+
+
+def test_publish_image_helpers_print_three_tfvars_image_lines():
+    for script in (AWS_PUBLISH_SCRIPT, GCP_PUBLISH_SCRIPT):
+        _prints_image_tfvars_lines(_read(script))
+
+
+def test_publish_image_helpers_avoid_raw_app_integration_secrets():
+    for script in (AWS_PUBLISH_SCRIPT, GCP_PUBLISH_SCRIPT):
+        lowered = _read(script).lower()
+        for token in RAW_SECRET_TOKENS:
+            assert token not in lowered, f"{token} referenced in {script.parent.name}/publish-images.sh"
+
+
+def test_aws_publish_requires_tools_and_verifies_creds_before_side_effects():
+    text = _read(AWS_PUBLISH_SCRIPT)
+
+    # Live path requires aws + docker and verifies credentials.
+    assert "command -v aws" in text, "aws publish-images.sh does not require the aws CLI"
+    assert "command -v docker" in text, "aws publish-images.sh does not require docker"
+    assert "get-caller-identity" in text, "aws publish-images.sh does not verify AWS credentials"
+
+    # The credential/tool checks must precede the first side effect. The first
+    # real side effect is a docker build routed through the run wrapper.
+    first_side_effect = text.find("run docker build")
+    assert first_side_effect != -1, "aws publish-images.sh never builds an image"
+    assert text.find("command -v aws") < first_side_effect, "aws CLI check must precede build"
+    assert text.find("command -v docker") < first_side_effect, "docker check must precede build"
+    assert text.find("get-caller-identity") < first_side_effect, "credential check must precede build"
+
+    # Fails closed on missing prerequisites/config.
+    assert "exit 1" in text, "aws publish-images.sh does not fail closed"
+
+
+def test_aws_publish_supports_ecr_refs_tag_and_repository_defaults():
+    text = _read(AWS_PUBLISH_SCRIPT)
+
+    # ECR registry/login + per-service repository refs + a default image tag.
+    assert "dkr.ecr" in text, "aws publish-images.sh does not build an ECR registry ref"
+    assert "get-login-password" in text, "aws publish-images.sh does not log in to ECR"
+    assert "IMAGE_TAG" in text, "aws publish-images.sh has no IMAGE_TAG input"
+    assert "AWS_ACCOUNT_ID" in text, "aws publish-images.sh has no AWS_ACCOUNT_ID input"
+    assert "AWS_REGION" in text, "aws publish-images.sh has no AWS_REGION input"
+    # Repository creation is an ECR side effect that must be gated (printed in
+    # dry-run, executed only on the live path through the wrapper).
+    assert "create-repository" in text, "aws publish-images.sh cannot ensure ECR repositories"
+    assert "run " in text[: text.find("create-repository") + len("create-repository") + 200] or "run sh -c" in text, (
+        "aws publish-images.sh does not route repository creation through the DRY_RUN wrapper"
+    )
+    # Defaults reference the agentops/hermes runtime naming, not a raw secret.
+    lowered = text.lower()
+    assert "agentops" in lowered and "hermes" in lowered, (
+        "aws publish-images.sh repository defaults are not based on agentops/hermes runtime"
+    )
+
+
+def test_aws_publish_is_module_local():
+    text = _read(AWS_PUBLISH_SCRIPT)
+    assert 'cd "$(dirname "$0")"' in text, "aws publish-images.sh is not module-local"
+    assert "-chdir=deploy/terraform" not in text, "aws publish-images.sh uses a root-relative -chdir"
+
+
+def test_gcp_publish_requires_tools_and_verifies_account_before_side_effects():
+    text = _read(GCP_PUBLISH_SCRIPT)
+
+    # Live path requires gcloud + docker and verifies an active account.
+    assert "command -v gcloud" in text, "gcp publish-images.sh does not require gcloud"
+    assert "command -v docker" in text, "gcp publish-images.sh does not require docker"
+    assert "auth" in text and "list" in text, "gcp publish-images.sh does not verify an active gcloud account"
+
+    first_side_effect = text.find("run docker build")
+    assert first_side_effect != -1, "gcp publish-images.sh never builds an image"
+    assert text.find("command -v gcloud") < first_side_effect, "gcloud check must precede build"
+    assert text.find("command -v docker") < first_side_effect, "docker check must precede build"
+    assert text.find("gcloud auth") < first_side_effect, "account check must precede build"
+
+    assert "exit 1" in text, "gcp publish-images.sh does not fail closed"
+
+
+def test_gcp_publish_supports_artifact_registry_refs_and_gated_repo_create():
+    text = _read(GCP_PUBLISH_SCRIPT)
+
+    # Artifact Registry repo/location/image refs + a default image tag.
+    assert "pkg.dev" in text, "gcp publish-images.sh does not build an Artifact Registry ref"
+    assert "IMAGE_TAG" in text, "gcp publish-images.sh has no IMAGE_TAG input"
+    assert "AR_LOCATION" in text or "LOCATION" in text, "gcp publish-images.sh has no Artifact Registry location input"
+    assert "AR_REPO" in text or "REPO" in text, "gcp publish-images.sh has no Artifact Registry repo input"
+    assert "configure-docker" in text, "gcp publish-images.sh does not configure docker auth for Artifact Registry"
+
+    # Repo create/configure happens only behind an explicit flag, or is printed
+    # in dry-run — never executed unconditionally on the live path.
+    assert "artifacts repositories create" in text, "gcp publish-images.sh cannot create the Artifact Registry repo"
+    assert "CREATE_REPO" in text, "gcp publish-images.sh has no explicit repo-create flag"
+    create_idx = text.find("artifacts repositories create")
+    guard_region = text[:create_idx]
+    assert "CREATE_REPO" in guard_region and ("DRY_RUN" in guard_region), (
+        "gcp publish-images.sh repo create is not gated on an explicit flag / dry-run"
+    )
+
+    lowered = text.lower()
+    assert "agentops" in lowered and "hermes" in lowered, (
+        "gcp publish-images.sh repository defaults are not based on agentops/hermes runtime"
+    )
+
+
+def test_gcp_publish_is_module_local():
+    text = _read(GCP_PUBLISH_SCRIPT)
+    assert 'cd "$(dirname "$0")"' in text, "gcp publish-images.sh is not module-local"
+    assert "-chdir=deploy/terraform" not in text, "gcp publish-images.sh uses a root-relative -chdir"
+
+
+def test_readmes_document_publish_image_helpers():
+    for module_dir in (AWS_DIR, GCP_DIR):
+        readme = _read(module_dir / "README.md")
+        lowered = readme.lower()
+        name = module_dir.name
+        assert "publish-images.sh" in readme, f"{name}: README does not document publish-images.sh"
+        # DRY_RUN default is documented honestly.
+        assert "dry_run" in lowered, f"{name}: README does not document the DRY_RUN default"
+        # Live-run prerequisite checks are documented.
+        assert "docker" in lowered, f"{name}: README does not mention the docker prerequisite"
+        # Copying the printed image variable lines into terraform.tfvars before
+        # the PLAN_ONLY=0 apply is documented.
+        assert "terraform.tfvars" in readme, f"{name}: README does not tell operators to copy image lines into terraform.tfvars"
+        assert "plan_only=0" in lowered, f"{name}: README does not tie publish-images.sh to PLAN_ONLY=0 ./smoke.sh"
+
+
+# --- docker build contexts default to the repo root, not the module dir ------
+#
+# Both helpers `cd "$(dirname "$0")"` into the Terraform module directory before
+# building. The Dockerfile lives at the repository ROOT, so defaulting the three
+# CONTROL_PLANE_CONTEXT / WORKER_CONTEXT / SCHEDULER_CONTEXT build contexts to
+# "." would build the (Dockerfile-less) module directory. From
+# deploy/terraform/<module> the repo root is "../../.." — the defaults must
+# point there while still honoring explicit env overrides.
+
+PUBLISH_CONTEXT_VARS = ("CONTROL_PLANE_CONTEXT", "WORKER_CONTEXT", "SCHEDULER_CONTEXT")
+
+# deploy/terraform/<module> -> repo root is three levels up.
+REPO_ROOT_FROM_MODULE = "../../.."
+
+
+def _env_default(text: str, var_name: str) -> str:
+    import re
+
+    # Matches  VAR="${VAR:-<default>}"  and captures the <default> token.
+    match = re.search(
+        re.escape(var_name) + r'="\$\{' + re.escape(var_name) + r":-([^}]*)\}\"",
+        text,
+    )
+    return match.group(1) if match else "<no-default-found>"
+
+
+def test_publish_helpers_default_build_contexts_to_repo_root_not_module_dir():
+    for script in (AWS_PUBLISH_SCRIPT, GCP_PUBLISH_SCRIPT):
+        text = _read(script)
+        name = script.parent.name
+
+        # The helper changes into the module dir before building, so a "." build
+        # context would target the module dir (no Dockerfile) instead of the
+        # repo root.
+        assert 'cd "$(dirname "$0")"' in text, f"{name}: helper is not module-local"
+
+        for var_name in PUBLISH_CONTEXT_VARS:
+            default = _env_default(text, var_name)
+            assert default != ".", (
+                f"{name}: {var_name} defaults to '.' (the module dir), but the "
+                f"Dockerfile lives at the repo root"
+            )
+            assert default == REPO_ROOT_FROM_MODULE, (
+                f"{name}: {var_name} defaults to '{default}', expected the repo "
+                f"root '{REPO_ROOT_FROM_MODULE}' relative to the module dir"
+            )
+
+
+def test_publish_helpers_allow_env_override_of_build_contexts():
+    # The repo-root default must still be overridable via the env var (the
+    # `${VAR:-default}` form), not hard-coded.
+    for script in (AWS_PUBLISH_SCRIPT, GCP_PUBLISH_SCRIPT):
+        text = _read(script)
+        name = script.parent.name
+        for var_name in PUBLISH_CONTEXT_VARS:
+            assert f'"${{{var_name}:-' in text, (
+                f"{name}: {var_name} is not overridable via an env default"
+            )
+
+
+def test_publish_helper_readmes_document_repo_root_build_context_default():
+    for module_dir in (AWS_DIR, GCP_DIR):
+        readme = _read(module_dir / "README.md")
+        lowered = readme.lower()
+        name = module_dir.name
+        # The build contexts are documented as defaulting to the repo root and
+        # being overridable.
+        assert "_context" in lowered, (
+            f"{name}: README does not document the *_CONTEXT build-context overrides"
+        )
+        assert "repo" in lowered and "root" in lowered, (
+            f"{name}: README does not say the build context defaults to the repo root"
+        )

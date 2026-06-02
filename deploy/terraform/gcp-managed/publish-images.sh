@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+#
+# AgentOps Hermes Runtime — gcp-managed image-publishing helper.
+#
+# Builds, tags, and pushes the three runtime container images
+# (control-plane / worker / scheduler) to Google Artifact Registry and prints
+# the non-secret terraform.tfvars lines (control_plane_image / worker_image /
+# scheduler_image) to paste before a `PLAN_ONLY=0 ./smoke.sh` apply. This gives
+# operators a path to produce REAL image refs that replace the ':replace-me'
+# placeholders without ever handing app/integration secrets to Terraform.
+#
+# Side-effect-safe by default: with DRY_RUN=1 (the default) it only PRINTS the
+# docker/gcloud commands it would run — it never builds, logs in, tags, pushes,
+# creates/configures repositories, or modifies Terraform vars. Set DRY_RUN=0 for
+# a live publish; the live path requires the gcloud + docker CLIs and verifies an
+# active gcloud account before any side effect, failing closed if a
+# prerequisite/config is missing.
+#
+# Inputs (all env, all non-secret):
+#   DRY_RUN          1 (default) prints commands; 0 performs the live publish.
+#   PROJECT          GCP project id. Autodetected via `gcloud config` on the live
+#                    path when unset; a placeholder is used in dry-run.
+#   AR_LOCATION      Artifact Registry location (default: us-central1).
+#   AR_REPO          Artifact Registry repository (default: agentops-hermes-runtime).
+#   IMAGE_TAG        Image tag (default: UTC timestamp).
+#   CREATE_REPO      1 to also create/configure the Artifact Registry repo on the
+#                    live path (default 0). Dry-run always prints the command.
+#   CONTROL_PLANE_IMAGE_NAME / WORKER_IMAGE_NAME / SCHEDULER_IMAGE_NAME
+#                    image names within the repo (defaults based on the agentops
+#                    hermes runtime).
+#   CONTROL_PLANE_CONTEXT / WORKER_CONTEXT / SCHEDULER_CONTEXT
+#                    docker build contexts. Default: the repo root ("../../.."
+#                    from this module dir), where the Dockerfile lives — this
+#                    helper cd's into the module dir, so "." would build the
+#                    (Dockerfile-less) module directory.
+#
+# This helper never accepts or echoes raw app/integration secret values.
+
+set -euo pipefail
+
+# Operate from the module directory this script lives in (module-local; no
+# root-relative -chdir).
+cd "$(dirname "$0")"
+
+DRY_RUN="${DRY_RUN:-1}"
+
+IMAGE_TAG="${IMAGE_TAG:-$(date -u +%Y%m%d%H%M%S)}"
+AR_LOCATION="${AR_LOCATION:-us-central1}"
+AR_REPO="${AR_REPO:-agentops-hermes-runtime}"
+CREATE_REPO="${CREATE_REPO:-0}"
+
+CONTROL_PLANE_IMAGE_NAME="${CONTROL_PLANE_IMAGE_NAME:-hermes-control-plane}"
+WORKER_IMAGE_NAME="${WORKER_IMAGE_NAME:-hermes-worker}"
+SCHEDULER_IMAGE_NAME="${SCHEDULER_IMAGE_NAME:-hermes-scheduler}"
+
+# Build contexts default to the repo root (where the Dockerfile lives), since
+# this helper has cd'd into the module dir above. Overridable via env.
+CONTROL_PLANE_CONTEXT="${CONTROL_PLANE_CONTEXT:-../../..}"
+WORKER_CONTEXT="${WORKER_CONTEXT:-../../..}"
+SCHEDULER_CONTEXT="${SCHEDULER_CONTEXT:-../../..}"
+
+# --- side-effect wrapper -----------------------------------------------------
+# Executes its arguments only on the live path (DRY_RUN=0); otherwise prints the
+# command it WOULD run. Every build/login/tag/push/repository side effect is
+# routed through this, so the default dry-run never touches anything.
+run() {
+  if [ "$DRY_RUN" = "0" ]; then
+    "$@"
+  else
+    echo "+ $*"
+  fi
+}
+
+# --- live-path prerequisites / config (fail closed before side effects) ------
+if [ "$DRY_RUN" = "0" ]; then
+  if ! command -v gcloud >/dev/null 2>&1; then
+    echo "error: the 'gcloud' CLI is required for a live publish (DRY_RUN=0)" >&2
+    exit 1
+  fi
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "error: 'docker' is required for a live publish (DRY_RUN=0)" >&2
+    exit 1
+  fi
+  if ! gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null | grep -q .; then
+    echo "error: no active gcloud account — run 'gcloud auth login' first" >&2
+    exit 1
+  fi
+  PROJECT="${PROJECT:-$(gcloud config get-value project 2>/dev/null)}"
+  if [ -z "${PROJECT}" ] || [ "${PROJECT}" = "(unset)" ]; then
+    echo "error: PROJECT must be set (or 'gcloud config set project <id>') for a live publish" >&2
+    exit 1
+  fi
+else
+  # Dry-run placeholder so the printed commands are concrete and readable.
+  PROJECT="${PROJECT:-<GCP_PROJECT>}"
+fi
+
+REGISTRY="${AR_LOCATION}-docker.pkg.dev/${PROJECT}/${AR_REPO}"
+
+CONTROL_PLANE_IMAGE="${REGISTRY}/${CONTROL_PLANE_IMAGE_NAME}:${IMAGE_TAG}"
+WORKER_IMAGE="${REGISTRY}/${WORKER_IMAGE_NAME}:${IMAGE_TAG}"
+SCHEDULER_IMAGE="${REGISTRY}/${SCHEDULER_IMAGE_NAME}:${IMAGE_TAG}"
+
+# --- optional repo create + docker auth config -------------------------------
+# Repository creation is only performed on the live path when CREATE_REPO=1, and
+# is always printed in dry-run so operators can see the exact command.
+if [ "${CREATE_REPO}" = "1" ] || [ "$DRY_RUN" != "0" ]; then
+  run gcloud artifacts repositories create "${AR_REPO}" --repository-format=docker --location="${AR_LOCATION}" --project="${PROJECT}"
+fi
+run gcloud auth configure-docker "${AR_LOCATION}-docker.pkg.dev" --quiet
+
+# --- per-service: build, tag, push -------------------------------------------
+publish_image() {
+  context="$1"
+  image="$2"
+  run docker build -t "${image}" "${context}"
+  run docker push "${image}"
+}
+
+publish_image "${CONTROL_PLANE_CONTEXT}" "${CONTROL_PLANE_IMAGE}"
+publish_image "${WORKER_CONTEXT}" "${WORKER_IMAGE}"
+publish_image "${SCHEDULER_CONTEXT}" "${SCHEDULER_IMAGE}"
+
+# --- non-secret terraform.tfvars image lines ---------------------------------
+# Print (never write) the three image variable assignments to paste into
+# terraform.tfvars before a PLAN_ONLY=0 ./smoke.sh apply. No secret values here.
+if [ "$DRY_RUN" = "0" ]; then
+  echo "Pushed images — paste these non-secret lines into terraform.tfvars:"
+else
+  echo "DRY_RUN=1 — these are the non-secret terraform.tfvars lines a live publish would print:"
+fi
+echo "control_plane_image = \"${CONTROL_PLANE_IMAGE}\""
+echo "worker_image        = \"${WORKER_IMAGE}\""
+echo "scheduler_image     = \"${SCHEDULER_IMAGE}\""
