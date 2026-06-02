@@ -23,12 +23,19 @@ closed) if any service is unreachable, returns a non-200 status, or reports
 
 ```bash
 docker compose up --build -d
+docker compose --profile smoke run --rm smoke
+```
+
+The `smoke` one-shot service runs inside the Compose network, so it reaches
+`worker` and `scheduler` by their service DNS names even though those services
+publish no host ports. The same check can also be run manually from the API
+container:
+
+```bash
 docker compose exec api \
   python -m agentops_runtime.compose_health_smoke
 ```
 
-The check runs inside the Compose network, so it reaches `worker` and `scheduler`
-by their service DNS names even though those services publish no host ports.
 Service URLs default to the in-network Compose names and can be overridden via
 `AGENTOPS_API_URL`, `AGENTOPS_WORKER_URL`, `AGENTOPS_SCHEDULER_URL`, and
 `AGENTOPS_SECRET_STORE_URL` to run the same check from a sidecar or the host.

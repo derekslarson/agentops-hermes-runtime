@@ -66,11 +66,29 @@ def test_compose_profile_documents_scale_and_smoke_commands_without_raw_secrets(
     assert "AGENTOPS_WORKER_MAX_CONCURRENT_RUNS=" in env_text
     assert "docker compose --scale worker=3" in readme_text
     assert "docker compose up" in readme_text
+    assert "docker compose --profile smoke run --rm smoke" in readme_text
     assert "python -m agentops_runtime.compose_health_smoke" in readme_text
     assert "-f deploy/compose/docker-compose.yml" not in readme_text
     assert "raw app/integration secrets" in readme_text
     assert "SLACK_BOT_TOKEN=" not in env_text
     assert "OPENAI_API_KEY=" not in env_text
+
+
+def test_compose_profile_includes_one_shot_smoke_service():
+    services = _compose()["services"]
+    smoke = services["smoke"]
+
+    assert smoke["profiles"] == ["smoke"]
+    assert smoke["command"] == ["python", "-m", "agentops_runtime.compose_health_smoke"]
+    assert "container_name" not in smoke
+    for dependency in ("api", "worker", "scheduler", "local-secrets"):
+        assert smoke["depends_on"][dependency]["condition"] == "service_healthy"
+
+    env = "\n".join(smoke["environment"])
+    assert "AGENTOPS_API_URL=http://api:8710" in env
+    assert "AGENTOPS_WORKER_URL=http://worker:8711" in env
+    assert "AGENTOPS_SCHEDULER_URL=http://scheduler:8712" in env
+    assert "AGENTOPS_SECRET_STORE_URL=http://local-secrets:8713" in env
 
 
 def test_agentops_runtime_compose_service_is_packaged_in_wheels():

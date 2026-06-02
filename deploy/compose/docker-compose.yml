@@ -151,6 +151,27 @@ services:
       retries: 12
       start_period: 5s
 
+  smoke:
+    profiles: ["smoke"]
+    build:
+      context: ../..
+    image: agentops-hermes-runtime:local
+    command: ["python", "-m", "agentops_runtime.compose_health_smoke"]
+    depends_on:
+      api:
+        condition: service_healthy
+      worker:
+        condition: service_healthy
+      scheduler:
+        condition: service_healthy
+      local-secrets:
+        condition: service_healthy
+    environment:
+      - AGENTOPS_API_URL=http://api:8710
+      - AGENTOPS_WORKER_URL=http://worker:8711
+      - AGENTOPS_SCHEDULER_URL=http://scheduler:8712
+      - AGENTOPS_SECRET_STORE_URL=http://local-secrets:8713
+
 volumes:
   agentops-postgres:
   agentops-redis:
