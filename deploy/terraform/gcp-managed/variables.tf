@@ -27,6 +27,30 @@ variable "domain" {
   type        = string
 }
 
+# --- Container images --------------------------------------------------------
+#
+# Customer-supplied runtime container images for each Cloud Run service. Defaults
+# are obvious placeholders meant to be overridden with the images the customer
+# builds/pushes; they are NOT secret values.
+
+variable "control_plane_image" {
+  description = "Container image for the API / control-plane service (e.g. <registry>/hermes-control-plane:<tag>)."
+  type        = string
+  default     = "agentops/hermes-control-plane:replace-me"
+}
+
+variable "worker_image" {
+  description = "Container image for the worker fleet service (e.g. <registry>/hermes-worker:<tag>)."
+  type        = string
+  default     = "agentops/hermes-worker:replace-me"
+}
+
+variable "scheduler_image" {
+  description = "Container image for the scheduler service (e.g. <registry>/hermes-scheduler:<tag>)."
+  type        = string
+  default     = "agentops/hermes-scheduler:replace-me"
+}
+
 # --- Capacity ----------------------------------------------------------------
 
 variable "desired_task_count" {

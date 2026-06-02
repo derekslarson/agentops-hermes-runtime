@@ -54,6 +54,28 @@ locals {
     "model-provider",
     "database",
   ]
+
+  # Effective backend refs the runtime containers read. Bring-your-own values
+  # win when provided; otherwise the module-created resources are used.
+  effective_artifact_bucket = local.create_artifact_store ? google_storage_bucket.artifacts[0].name : var.existing_artifact_bucket
+  effective_secret_prefix   = var.existing_secret_prefix != "" ? var.existing_secret_prefix : local.prefix
+  # Non-secret Cloud SQL connection name (the secret container below carries the
+  # raw connection string filled by bootstrap, not a value passed here).
+  effective_database_connection_name = local.create_database ? google_sql_database_instance.this[0].connection_name : var.existing_database_arn
+
+  # Non-secret runtime refs shared by all three services. These are container
+  # ENV entries (names + refs), never raw secret values: the database entry
+  # carries the Secret Manager container ref that bootstrap fills (plus the
+  # non-secret Cloud SQL connection name), not a connection string.
+  runtime_common_env = [
+    { name = "AGENTOPS_RUNTIME_PROFILE", value = "gcp-managed" },
+    { name = "AGENTOPS_QUEUE_TOPIC", value = google_pubsub_topic.runs.id },
+    { name = "AGENTOPS_QUEUE_SUBSCRIPTION", value = google_pubsub_subscription.runs.id },
+    { name = "AGENTOPS_ARTIFACT_BUCKET", value = local.effective_artifact_bucket },
+    { name = "AGENTOPS_SECRET_PREFIX", value = local.effective_secret_prefix },
+    { name = "AGENTOPS_DATABASE_SECRET_REF", value = google_secret_manager_secret.containers["database"].id },
+    { name = "AGENTOPS_DATABASE_CONNECTION_NAME", value = local.effective_database_connection_name },
+  ]
 }
 
 # API / control-plane service.
@@ -62,7 +84,14 @@ resource "google_cloud_run_v2_service" "control_plane" {
   location = var.region
   template {
     containers {
-      image = "TODO-control-plane-image" # set after building the API/control-plane image
+      image = var.control_plane_image
+      dynamic "env" {
+        for_each = local.runtime_common_env
+        content {
+          name  = env.value.name
+          value = env.value.value
+        }
+      }
     }
     dynamic "vpc_access" {
       for_each = local.byo_network ? [1] : []
@@ -86,7 +115,14 @@ resource "google_cloud_run_v2_service" "worker" {
       max_instance_count = var.max_task_count
     }
     containers {
-      image = "TODO-worker-image"
+      image = var.worker_image
+      dynamic "env" {
+        for_each = local.runtime_common_env
+        content {
+          name  = env.value.name
+          value = env.value.value
+        }
+      }
       env {
         name  = "AGENTOPS_WORKER_MAX_CONCURRENT_RUNS"
         value = tostring(var.max_concurrent_runs)
@@ -110,7 +146,14 @@ resource "google_cloud_run_v2_service" "scheduler" {
   location = var.region
   template {
     containers {
-      image = "TODO-scheduler-image"
+      image = var.scheduler_image
+      dynamic "env" {
+        for_each = local.runtime_common_env
+        content {
+          name  = env.value.name
+          value = env.value.value
+        }
+      }
     }
     dynamic "vpc_access" {
       for_each = local.byo_network ? [1] : []

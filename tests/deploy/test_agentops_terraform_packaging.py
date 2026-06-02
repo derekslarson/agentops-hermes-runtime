@@ -1152,3 +1152,123 @@ def test_readmes_document_post_apply_healthz_probe():
         lowered = readme.lower()
         assert "/healthz" in readme, f"{module_dir.name}: README does not mention the /healthz probe"
         assert "probe" in lowered, f"{module_dir.name}: README does not describe the post-apply probe"
+
+
+# --- GCP Cloud Run container images + shared runtime env (M15 slice) ---------
+#
+# Parity with the AWS task-definition slice: the GCP Cloud Run containers must
+# consume customer-supplied non-secret image variables (no TODO literals) and
+# carry a shared non-secret runtime env (profile + queue/topic/subscription /
+# artifact / secret-prefix / database refs) on all three services, while the
+# worker preserves its per-instance run-slot bound.
+
+GCP_SERVICE_NAMES = ("control_plane", "worker", "scheduler")
+GCP_IMAGE_VARS = ("control_plane_image", "worker_image", "scheduler_image")
+GCP_TODO_IMAGE_LITERALS = (
+    "TODO-control-plane-image",
+    "TODO-worker-image",
+    "TODO-scheduler-image",
+)
+
+
+def test_gcp_variables_expose_non_secret_container_image_inputs():
+    variables = _read(GCP_DIR / "variables.tf")
+    for var_name in GCP_IMAGE_VARS:
+        block = _variable_block(variables, var_name)
+        assert block, f"missing image variable {var_name}"
+        # Placeholder default/example is provided so the contract is usable...
+        assert "default" in block, f"{var_name} has no placeholder default"
+        # ...but the image input is not a secret value.
+        lowered = block.lower()
+        for token in RAW_SECRET_TOKENS:
+            assert token not in lowered, f"{token} leaked into {var_name}"
+
+
+def test_gcp_cloud_run_services_consume_image_variables_not_todo():
+    main = _read(GCP_DIR / "main.tf")
+
+    # The literal TODO image placeholders must be gone.
+    for todo in GCP_TODO_IMAGE_LITERALS:
+        assert todo not in main, f"{todo} still present"
+
+    # Each service's container points at its image variable.
+    for name in GCP_SERVICE_NAMES:
+        block = _resource_block(main, "google_cloud_run_v2_service", name)
+        assert block, f"missing google_cloud_run_v2_service {name}"
+        assert (
+            f"var.{name}_image" in block
+        ), f"{name} service does not consume var.{name}_image"
+
+
+def test_gcp_all_services_share_non_secret_runtime_env():
+    main = _read(GCP_DIR / "main.tf")
+    for name in GCP_SERVICE_NAMES:
+        block = _resource_block(main, "google_cloud_run_v2_service", name)
+        assert block, f"missing google_cloud_run_v2_service {name}"
+        assert (
+            "local.runtime_common_env" in block
+        ), f"{name} service does not include the shared runtime env"
+
+
+def test_gcp_worker_preserves_max_concurrent_runs_env():
+    main = _read(GCP_DIR / "main.tf")
+
+    worker = _resource_block(main, "google_cloud_run_v2_service", "worker")
+    assert worker, "missing worker service"
+    assert "AGENTOPS_WORKER_MAX_CONCURRENT_RUNS" in worker
+    assert "var.max_concurrent_runs" in worker
+
+    # The per-instance run-slot bound is worker-specific, not on the other services.
+    for other in ("control_plane", "scheduler"):
+        block = _resource_block(main, "google_cloud_run_v2_service", other)
+        assert (
+            "AGENTOPS_WORKER_MAX_CONCURRENT_RUNS" not in block
+        ), f"{other} should not advertise the worker run-slot bound"
+
+
+def test_gcp_runtime_common_env_carries_profile_and_backend_refs():
+    main = _read(GCP_DIR / "main.tf")
+    env = _list_local(main, "runtime_common_env")
+    assert env, "missing runtime_common_env local list"
+
+    # AGENTOPS_RUNTIME_PROFILE=gcp-managed
+    assert "AGENTOPS_RUNTIME_PROFILE" in env
+    assert "gcp-managed" in env
+
+    # Queue topic + subscription refs wired to the real Pub/Sub resources.
+    assert "AGENTOPS_QUEUE" in env
+    assert "google_pubsub_topic.runs" in env
+    assert "google_pubsub_subscription.runs" in env
+
+    # Artifact store ref (BYO-aware bucket).
+    assert "AGENTOPS_ARTIFACT_BUCKET" in env
+    assert "artifact" in env.lower()
+
+    # Secret prefix/refs.
+    assert "AGENTOPS_SECRET_PREFIX" in env
+
+    # Database ref points at the database secret container, not a raw value, and
+    # surfaces the non-secret Cloud SQL connection name.
+    assert "AGENTOPS_DATABASE" in env
+    assert 'google_secret_manager_secret.containers["database"]' in env
+    assert "connection_name" in env.lower()
+
+
+def test_gcp_tfvars_example_documents_container_image_refs():
+    tfvars = _read(GCP_DIR / "terraform.tfvars.example")
+    for var_name in GCP_IMAGE_VARS:
+        assert var_name in tfvars, f"tfvars example does not surface {var_name}"
+
+
+def test_gcp_readme_documents_image_refs_and_keeps_honesty():
+    readme = _read(GCP_DIR / "README.md")
+    lowered = readme.lower()
+    # Image refs are documented by name.
+    for var_name in GCP_IMAGE_VARS:
+        assert var_name in readme, f"README does not document {var_name}"
+    # GCP remains scaffold-level; live apply/smoke is still pending.
+    assert "scaffold" in lowered
+    assert "parity" in lowered
+    # Raw integration secrets remain a bootstrap concern, not Terraform inputs.
+    assert "bootstrap" in lowered
+    assert "raw" in lowered

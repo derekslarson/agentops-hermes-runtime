@@ -14,12 +14,28 @@ OpenTofu, and receive the same bootstrap and webhook outputs.
 - Artifact store — GCS bucket
 - Secret Manager secret **containers** (no raw values)
 
+## Container images
+
+The Cloud Run services run customer-supplied, **non-secret** image references set
+via `control_plane_image`, `worker_image`, and `scheduler_image` (placeholder
+defaults like `agentops/hermes-control-plane:replace-me`). Override them with the
+images you build and push. These are image references, not secret values.
+
+Each service also carries a shared non-secret runtime env
+(`local.runtime_common_env`): `AGENTOPS_RUNTIME_PROFILE=gcp-managed`, the Pub/Sub
+topic/subscription refs, the artifact bucket, the secret prefix, and the database
+**secret container ref** plus the non-secret Cloud SQL connection name. The
+worker additionally advertises its per-instance run-slot bound
+(`AGENTOPS_WORKER_MAX_CONCURRENT_RUNS`). No raw secret value is passed as env.
+
 ## Apply
 
-> **Completeness caveat:** Running `apply` provisions the resource skeleton but
-> **does not yield a working deployment** while `main.tf` still carries `TODO`
-> container image references. Fill those in (and close the parity gaps below)
-> before expecting running services.
+> **Completeness caveat:** Running `apply` provisions the resource skeleton and
+> wires the customer images + shared runtime env, but this module is still
+> **scaffold-level** and the parity gaps below (notably no load balancer / DNS
+> for the control-plane) mean it **does not yet yield a reachable working
+> deployment**. Close the parity gaps before expecting a serving endpoint, and
+> note that no live GCP apply/smoke has been captured.
 
 All commands run from inside this module directory. With Terraform:
 
@@ -106,8 +122,9 @@ module in the following areas:
   CPU target-tracking policy equivalent to the AWS Application Auto Scaling
   policy is configured.
 - **Load balancer / DNS:** custom domain mapping for the control-plane is not
-  yet provisioned.
-- **Container images:** service images are `TODO-*` placeholders.
+  yet provisioned, so an apply does not expose a reachable serving endpoint.
+- **Live apply/smoke:** no live `PLAN_ONLY=0` GCP apply/smoke has been captured;
+  a successful `plan` is not a captured live deployment.
 
 Track these to reach full parity with `aws-managed` before treating the GCP
 profile as production-ready.
