@@ -82,3 +82,85 @@ def test_slack_runtime_context_rejects_missing_required_scope(slack_event):
 
     with pytest.raises(ValueError, match="team"):
         build_slack_runtime_context(broken, config={"agentops": {"enabled": True}})
+
+
+def test_slack_turn_routing_reuses_active_run_for_followups_in_same_thread(slack_event):
+    from agent.runtime_backends import BackendCapability, LocalConversationRouter, RuntimeBackendRegistry
+    from agentops_runtime.slack_runtime import build_slack_runtime_context, route_slack_turn
+
+    registry = RuntimeBackendRegistry()
+    registry.register(
+        BackendCapability.CONVERSATION_ROUTER,
+        lambda options: LocalConversationRouter(),
+        profile="compose-self-hosted",
+    )
+    context = build_slack_runtime_context(slack_event, config={"agentops": {"enabled": True}})
+
+    first = route_slack_turn(slack_event, context=context, text="first", registry=registry)
+    followup = route_slack_turn(
+        {**slack_event, "ts": "1710000000.000200"},
+        context=context,
+        text="followup",
+        registry=registry,
+    )
+
+    assert first.conversation_id == "slack:T_acme:C_support:1710000000.000000"
+    assert first.run_id == followup.run_id
+    assert first.routed_to_active_run is False
+    assert followup.routed_to_active_run is True
+    assert followup.turn["text"] == "followup"
+    assert followup.turn["delivery_ref"] == context.delivery_ref
+
+
+def test_slack_delivery_backend_targets_context_thread_without_leaking_other_threads(slack_event):
+    from agentops_runtime.slack_runtime import SlackDeliveryBackend, build_slack_runtime_context
+
+    deliveries = []
+
+    def send_like_native_slack_adapter(channel, text, reply_to=None, metadata=None):
+        deliveries.append((channel, text, reply_to, metadata))
+
+    backend = SlackDeliveryBackend(send_like_native_slack_adapter)
+    thread_context = build_slack_runtime_context(slack_event, config={"agentops": {"enabled": True}})
+    other_context = build_slack_runtime_context(
+        {**slack_event, "ts": "1710000001.000000", "thread_ts": "1710000001.000000"},
+        config={"agentops": {"enabled": True}},
+    )
+
+    backend.deliver(thread_context, {"text": "thread reply"})
+    backend.deliver(other_context, {"text": "other reply"})
+
+    assert deliveries == [
+        ("C_support", "thread reply", None, {"thread_id": "1710000000.000000", "thread_ts": "1710000000.000000"}),
+        ("C_support", "other reply", None, {"thread_id": "1710000001.000000", "thread_ts": "1710000001.000000"}),
+    ]
+
+
+def test_slack_delivery_backend_executes_async_native_sender(slack_event):
+    from agentops_runtime.slack_runtime import SlackDeliveryBackend, build_slack_runtime_context
+
+    deliveries = []
+
+    async def async_send(channel, text, reply_to=None, metadata=None):
+        deliveries.append((channel, text, reply_to, metadata))
+
+    backend = SlackDeliveryBackend(async_send)
+    context = build_slack_runtime_context(slack_event, config={"agentops": {"enabled": True}})
+
+    backend.deliver(context, {"text": "async reply"})
+
+    assert deliveries == [
+        ("C_support", "async reply", None, {"thread_id": "1710000000.000000", "thread_ts": "1710000000.000000"})
+    ]
+
+
+def test_slack_turn_routing_default_registry_handles_default_compose_profile(slack_event):
+    from agentops_runtime.slack_runtime import build_slack_runtime_context, route_slack_turn
+
+    context = build_slack_runtime_context(slack_event, config={"agentops": {"enabled": True}})
+
+    first = route_slack_turn(slack_event, context=context, text="first")
+    followup = route_slack_turn({**slack_event, "ts": "1710000000.000200"}, context=context, text="followup")
+
+    assert first.run_id == followup.run_id
+    assert followup.routed_to_active_run is True
