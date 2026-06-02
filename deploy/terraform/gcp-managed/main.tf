@@ -45,6 +45,11 @@ locals {
   effective_vpc_id     = local.create_vpc ? google_compute_network.this[0].id : var.existing_vpc_id
   effective_subnet_ids = local.create_vpc ? [google_compute_subnetwork.this[0].id] : var.existing_subnet_ids
 
+  # Opt-in External HTTPS Load Balancer front door for the control-plane. Only
+  # built when explicitly enabled together with a domain; the default endpoint
+  # stays the Cloud Run service URI.
+  create_lb = var.enable_load_balancer_custom_domain && var.domain != ""
+
   # Secret CONTAINERS created here; raw values are written by bootstrap.
   secret_names = [
     "bootstrap-token",
@@ -272,11 +277,12 @@ resource "google_project_iam_member" "runtime_cloudsql" {
 ###############################################################################
 # Public API endpoint — opt-in unauthenticated invoker + optional custom domain
 #
-# The control-plane has no provisioned load balancer / DNS, so the default
-# public endpoint is the Cloud Run service URI (surfaced via outputs). Public
-# unauthenticated access is OFF by default; set enable_public_invoker to grant
-# allUsers roles/run.invoker on the CONTROL-PLANE only. A custom domain mapping
-# is created only when enable_custom_domain is set together with a domain.
+# By default, without enable_load_balancer_custom_domain, the public endpoint is
+# the Cloud Run service URI (surfaced via outputs). Public unauthenticated access
+# is OFF by default; set enable_public_invoker to grant allUsers roles/run.invoker
+# on the CONTROL-PLANE only. A lightweight Cloud Run custom domain mapping is
+# created only when enable_custom_domain is set together with a domain; the
+# alternative External HTTPS Load Balancer custom-domain path is below.
 ###############################################################################
 
 resource "google_cloud_run_v2_service_iam_member" "control_plane_public" {
@@ -297,4 +303,89 @@ resource "google_cloud_run_domain_mapping" "control_plane" {
   spec {
     route_name = google_cloud_run_v2_service.control_plane.name
   }
+}
+
+###############################################################################
+# Optional External HTTPS Load Balancer — control-plane front door
+#
+# An opt-in alternative to the Cloud Run domain mapping above: a global External
+# HTTPS Load Balancer fronts the CONTROL-PLANE service only via a serverless
+# NEG -> backend service -> URL map -> target HTTPS proxy -> global forwarding
+# rule, terminated by a Google-managed SSL certificate for var.domain. An
+# optional Cloud DNS A record points var.domain at the reserved global IP.
+# Everything is gated on local.create_lb (enable_load_balancer_custom_domain +
+# domain); the worker/scheduler are never fronted. No secret values are
+# introduced here — raw integration secrets remain a bootstrap (M16) concern.
+###############################################################################
+
+# Serverless NEG targeting the control-plane Cloud Run service.
+resource "google_compute_region_network_endpoint_group" "control_plane" {
+  count                 = local.create_lb ? 1 : 0
+  name                  = "${local.prefix}-cp-neg"
+  region                = var.region
+  network_endpoint_type = "SERVERLESS"
+  cloud_run {
+    service = google_cloud_run_v2_service.control_plane.name
+  }
+}
+
+# Backend service wrapping the serverless NEG.
+resource "google_compute_backend_service" "control_plane" {
+  count                 = local.create_lb ? 1 : 0
+  name                  = "${local.prefix}-cp-backend"
+  load_balancing_scheme = "EXTERNAL_MANAGED"
+  protocol              = "HTTPS"
+  backend {
+    group = google_compute_region_network_endpoint_group.control_plane[0].id
+  }
+}
+
+# URL map routing all traffic to the control-plane backend.
+resource "google_compute_url_map" "control_plane" {
+  count           = local.create_lb ? 1 : 0
+  name            = "${local.prefix}-cp-urlmap"
+  default_service = google_compute_backend_service.control_plane[0].id
+}
+
+# Google-managed SSL certificate for the custom domain.
+resource "google_compute_managed_ssl_certificate" "control_plane" {
+  count = local.create_lb ? 1 : 0
+  name  = "${local.prefix}-cp-cert"
+  managed {
+    domains = [var.domain]
+  }
+}
+
+# Target HTTPS proxy binding the URL map to the managed certificate.
+resource "google_compute_target_https_proxy" "control_plane" {
+  count            = local.create_lb ? 1 : 0
+  name             = "${local.prefix}-cp-https-proxy"
+  url_map          = google_compute_url_map.control_plane[0].id
+  ssl_certificates = [google_compute_managed_ssl_certificate.control_plane[0].id]
+}
+
+# Reserved global IP for the load balancer (also used for the optional DNS A record).
+resource "google_compute_global_address" "control_plane" {
+  count = local.create_lb ? 1 : 0
+  name  = "${local.prefix}-cp-lb-ip"
+}
+
+# Global forwarding rule serving HTTPS (443) at the reserved global IP.
+resource "google_compute_global_forwarding_rule" "control_plane" {
+  count                 = local.create_lb ? 1 : 0
+  name                  = "${local.prefix}-cp-fwd"
+  load_balancing_scheme = "EXTERNAL_MANAGED"
+  target                = google_compute_target_https_proxy.control_plane[0].id
+  ip_address            = google_compute_global_address.control_plane[0].id
+  port_range            = "443"
+}
+
+# Optional Cloud DNS A record pointing the custom domain at the load balancer IP.
+resource "google_dns_record_set" "control_plane" {
+  count        = local.create_lb && var.create_dns_record && var.managed_zone != "" ? 1 : 0
+  name         = "${var.domain}."
+  type         = "A"
+  ttl          = 300
+  managed_zone = var.managed_zone
+  rrdatas      = [google_compute_global_address.control_plane[0].address]
 }

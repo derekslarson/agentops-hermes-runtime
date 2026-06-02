@@ -182,10 +182,10 @@ values; bootstrap (M16) owns those.
 
 ## Public API endpoint
 
-The control-plane has **no provisioned load balancer / DNS**, so the default
-public API endpoint is the Cloud Run control-plane service **URI** (surfaced as
-the `cloud_run_api_url` output; `agentops_api_url` and the webhook URLs derive
-from it). Two non-secret toggles control public exposure:
+By default, without `enable_load_balancer_custom_domain`, the public API
+endpoint is the Cloud Run control-plane service **URI** (surfaced as the
+`cloud_run_api_url` output; `agentops_api_url` and the webhook URLs derive from
+the effective API base URL). Two non-secret toggles control public exposure:
 
 - **`enable_public_invoker`** (default `false`): when `true`, grants
   `allUsers` `roles/run.invoker` on the **control-plane only** so the API is
@@ -195,6 +195,31 @@ from it). Two non-secret toggles control public exposure:
   set, a Cloud Run domain mapping is created for the control-plane at `domain`,
   and `agentops_api_url` becomes `https://<domain>`. With `enable_custom_domain`
   unset, the endpoint stays the Cloud Run service URI.
+
+### Optional External HTTPS Load Balancer / DNS
+
+For a full front door (instead of the lightweight Cloud Run domain mapping),
+set **`enable_load_balancer_custom_domain`** (default `false`) together with
+**`domain`** to provision an opt-in **global External HTTPS Load Balancer** in
+front of the **control-plane only**:
+
+serverless **network endpoint group** → backend service → URL map → target
+HTTPS proxy → global forwarding rule (HTTPS/443), terminated by a
+**Google-managed SSL certificate** for `domain`. The worker/scheduler are never
+fronted. When enabled, `agentops_api_url` becomes `https://<domain>` and the
+reserved load-balancer IP is surfaced as the `load_balancer_ip` output.
+
+DNS is optional and non-secret:
+
+- **`create_dns_record`** (default `false`) + **`managed_zone`**: when both are
+  set (and the load balancer is enabled), a Cloud DNS **A record** is created
+  pointing `domain` at `load_balancer_ip`. Otherwise point your own DNS at the
+  `load_balancer_ip` output. The Google-managed certificate provisions only
+  after `domain` resolves to that IP, so the HTTPS endpoint becomes healthy a
+  few minutes after DNS propagates.
+
+These are all non-secret toggles; raw app/integration secret values remain a
+bootstrap (M16) concern, never Terraform inputs.
 
 A live `PLAN_ONLY=0` GCP apply/smoke against a real project is still pending.
 
@@ -253,11 +278,13 @@ module in the following areas:
 - **Autoscaling policy:** Cloud Run min/max instances are set, but no explicit
   CPU target-tracking policy equivalent to the AWS Application Auto Scaling
   policy is configured.
-- **Load balancer / DNS:** the default endpoint is the Cloud Run service URI;
-  no external HTTP(S) load balancer or managed DNS fronts the control-plane.
-  Optional public access (`enable_public_invoker`) and an optional Cloud Run
-  domain mapping (`enable_custom_domain` + `domain`) are wired (see "Public API
-  endpoint"), but a load-balancer/CDN front door is not.
+- **Load balancer / DNS:** closed. The default endpoint is still the Cloud Run
+  service URI, and an opt-in global External HTTPS Load Balancer (`enable_load_balancer_custom_domain`
+  + `domain`) now fronts the control-plane with a Google-managed SSL certificate
+  and an optional Cloud DNS record (`create_dns_record` + `managed_zone`), in
+  addition to the lightweight Cloud Run domain mapping (`enable_custom_domain`).
+  See "Public API endpoint". A CDN/Cloud Armor edge policy on top of the load
+  balancer is still not configured.
 - **Live apply/smoke:** no live `PLAN_ONLY=0` GCP apply/smoke has been captured;
   a successful `plan` is not a captured live deployment.
 
@@ -267,7 +294,7 @@ profile as production-ready.
 ## Outputs
 
 After apply, `terraform output` (or `tofu output`) surfaces the same contract as
-`aws-managed`: `agentops_api_url`, `bootstrap_url`, `bootstrap_token_secret_ref`,
-the Slack/GitHub/Linear/Jira webhook URLs, `secret_refs`, `queue_refs`,
-`artifact_refs`, `database_refs`, `network_refs`, `worker_service_name`, and
-`smoke_test_hints`.
+`aws-managed`: `agentops_api_url`, `cloud_run_api_url`, `load_balancer_ip`,
+`bootstrap_url`, `bootstrap_token_secret_ref`, the Slack/GitHub/Linear/Jira
+webhook URLs, `secret_refs`, `queue_refs`, `artifact_refs`, `database_refs`,
+`network_refs`, `worker_service_name`, and `smoke_test_hints`.

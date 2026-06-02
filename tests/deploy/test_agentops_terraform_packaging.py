@@ -2054,6 +2054,266 @@ def test_readmes_document_smoke_transcript_artifact():
         assert "shar" in lowered, f"{module_dir.name}: README does not say to review before sharing"
 
 
+# --- GCP opt-in External HTTPS Load Balancer + DNS (M15 slice) --------------
+#
+# Closes the load-balancer/DNS parity gap with a small, OPT-IN External HTTPS
+# Load Balancer that fronts the CONTROL-PLANE Cloud Run service only:
+#   serverless NEG -> backend service -> URL map -> target HTTPS proxy ->
+#   global forwarding rule, plus a Google-managed SSL certificate and an
+#   optional Cloud DNS A record.
+# The whole front door is gated behind explicit non-secret toggles
+# (enable_load_balancer_custom_domain + domain, create_dns_record + managed_zone)
+# so the default endpoint stays the Cloud Run service URI. Raw app/integration
+# secret values remain a bootstrap (M16) concern, and no live PLAN_ONLY=0
+# apply/smoke is claimed.
+
+GCP_LB_RESOURCES = (
+    ("google_compute_region_network_endpoint_group", "control_plane"),
+    ("google_compute_backend_service", "control_plane"),
+    ("google_compute_url_map", "control_plane"),
+    ("google_compute_target_https_proxy", "control_plane"),
+    ("google_compute_global_forwarding_rule", "control_plane"),
+    ("google_compute_managed_ssl_certificate", "control_plane"),
+    ("google_compute_global_address", "control_plane"),
+)
+
+
+def test_gcp_create_lb_local_gates_on_toggle_and_domain():
+    main = _read(GCP_DIR / "main.tf")
+    line = next(
+        (ln for ln in main.splitlines() if ln.strip().startswith("create_lb")),
+        "",
+    )
+    assert line, "missing create_lb local"
+    assert "var.enable_load_balancer_custom_domain" in line
+    assert 'var.domain != ""' in line
+
+
+def test_gcp_load_balancer_resources_are_opt_in_and_front_control_plane_only():
+    main = _read(GCP_DIR / "main.tf")
+    for resource_type, name in GCP_LB_RESOURCES:
+        block = _resource_block(main, resource_type, name)
+        assert block, f"missing {resource_type} {name}"
+        # Opt-in only: every LB resource is conditional on the LB toggle.
+        assert "count" in block, f"{resource_type} {name} is not conditional"
+        assert "local.create_lb" in block, f"{resource_type} {name} not gated on create_lb"
+
+    # The serverless NEG fronts the CONTROL-PLANE Cloud Run service specifically.
+    neg = _resource_block(
+        main, "google_compute_region_network_endpoint_group", "control_plane"
+    )
+    assert "SERVERLESS" in neg, "NEG is not a serverless NEG"
+    assert "cloud_run" in neg, "serverless NEG has no cloud_run target"
+    assert (
+        "google_cloud_run_v2_service.control_plane.name" in neg
+    ), "serverless NEG does not reference the control-plane Cloud Run service"
+
+    # The worker/scheduler services must never be fronted by a load balancer.
+    for other in ("worker", "scheduler"):
+        for resource_type, _ in GCP_LB_RESOURCES:
+            assert not _resource_block(
+                main, resource_type, other
+            ), f"{other} must not be fronted by a load balancer ({resource_type})"
+
+
+def test_gcp_load_balancer_chain_is_wired_neg_to_forwarding_rule():
+    main = _read(GCP_DIR / "main.tf")
+
+    backend = _resource_block(main, "google_compute_backend_service", "control_plane")
+    assert (
+        "google_compute_region_network_endpoint_group.control_plane" in backend
+    ), "backend service does not reference the serverless NEG"
+
+    url_map = _resource_block(main, "google_compute_url_map", "control_plane")
+    assert (
+        "google_compute_backend_service.control_plane" in url_map
+    ), "url map does not route to the backend service"
+
+    proxy = _resource_block(main, "google_compute_target_https_proxy", "control_plane")
+    assert (
+        "google_compute_url_map.control_plane" in proxy
+    ), "target HTTPS proxy does not use the URL map"
+    assert (
+        "google_compute_managed_ssl_certificate.control_plane" in proxy
+    ), "target HTTPS proxy does not use the managed SSL certificate"
+
+    rule = _resource_block(
+        main, "google_compute_global_forwarding_rule", "control_plane"
+    )
+    assert (
+        "google_compute_target_https_proxy.control_plane" in rule
+    ), "forwarding rule does not target the HTTPS proxy"
+    assert "443" in rule, "forwarding rule does not serve HTTPS (443)"
+    assert (
+        "google_compute_global_address.control_plane" in rule
+    ), "forwarding rule does not use the reserved global address"
+
+
+def test_gcp_managed_ssl_certificate_covers_the_custom_domain():
+    main = _read(GCP_DIR / "main.tf")
+    cert = _resource_block(
+        main, "google_compute_managed_ssl_certificate", "control_plane"
+    )
+    assert cert, "missing google_compute_managed_ssl_certificate control_plane"
+    assert "managed" in cert, "certificate is not a Google-managed certificate"
+    assert "var.domain" in cert, "managed SSL certificate does not cover var.domain"
+
+
+def test_gcp_optional_dns_record_is_gated_and_points_at_the_load_balancer():
+    main = _read(GCP_DIR / "main.tf")
+    record = _resource_block(main, "google_dns_record_set", "control_plane")
+    assert record, "missing optional google_dns_record_set control_plane"
+    assert "count" in record, "DNS record is not conditional"
+    assert "var.create_dns_record" in record, "DNS record not gated on create_dns_record"
+    assert "var.managed_zone" in record, "DNS record does not use the managed zone"
+    assert "var.domain" in record, "DNS record does not name the custom domain"
+    assert '"A"' in record, "DNS record is not an A record"
+    assert (
+        "google_compute_global_address.control_plane" in record
+    ), "DNS record does not point at the load balancer global address"
+
+
+def test_gcp_load_balancer_variables_are_optional_non_secret_toggles():
+    variables = _read(GCP_DIR / "variables.tf")
+
+    enable = _variable_block(variables, "enable_load_balancer_custom_domain")
+    assert enable, "missing enable_load_balancer_custom_domain variable"
+    assert "bool" in enable, "enable_load_balancer_custom_domain is not a bool toggle"
+    assert "default     = false" in enable or "default = false" in enable
+
+    create_dns = _variable_block(variables, "create_dns_record")
+    assert create_dns, "missing create_dns_record variable"
+    assert "bool" in create_dns, "create_dns_record is not a bool toggle"
+    assert "default     = false" in create_dns or "default = false" in create_dns
+
+    managed_zone = _variable_block(variables, "managed_zone")
+    assert managed_zone, "missing managed_zone variable"
+    assert 'default     = ""' in managed_zone or 'default = ""' in managed_zone
+
+    for block in (enable, create_dns, managed_zone):
+        lowered = block.lower()
+        for token in RAW_SECRET_TOKENS:
+            assert token not in lowered, f"{token} leaked into a load-balancer variable"
+
+
+def test_gcp_custom_domain_front_doors_are_mutually_exclusive():
+    variables = _read(GCP_DIR / "variables.tf")
+    enable = _variable_block(variables, "enable_load_balancer_custom_domain")
+    assert "validation" in enable, "load-balancer custom-domain toggle lacks validation"
+    assert "var.enable_custom_domain" in enable, "validation does not consider Cloud Run domain mapping toggle"
+    assert "var.enable_load_balancer_custom_domain" in enable
+    assert "cannot both be true" in enable.lower() or "mutually exclusive" in enable.lower()
+
+
+def test_gcp_public_endpoint_docs_are_qualified_by_default_or_opt_in_lb():
+    for module_file in ("main.tf", "variables.tf", "outputs.tf"):
+        text = _read(GCP_DIR / module_file).lower()
+        stale_phrases = (
+            "has no provisioned load balancer / dns",
+            "there is no provisioned load balancer / dns",
+            "no provisioned load balancer / dns",
+        )
+        for phrase in stale_phrases:
+            assert phrase not in text, f"{module_file} still contains stale unconditional wording: {phrase}"
+        assert "enable_load_balancer_custom_domain" in text, f"{module_file} does not mention the opt-in LB path"
+
+    readme = _read(GCP_DIR / "README.md").lower()
+    for phrase in stale_phrases:
+        assert phrase not in readme, f"README.md still contains stale unconditional wording: {phrase}"
+    assert "default" in readme and "cloud run service uri" in readme
+    assert "enable_load_balancer_custom_domain" in readme
+
+
+def test_gcp_effective_api_url_prefers_load_balanced_custom_domain_when_opted_in():
+    outputs = _read(GCP_DIR / "outputs.tf")
+    # The effective API URL accounts for the opt-in load-balanced custom domain...
+    assert (
+        "enable_load_balancer_custom_domain" in outputs
+    ), "effective API URL ignores the load-balancer custom-domain toggle"
+    # ...and still falls back to the Cloud Run service URI by default.
+    assert "google_cloud_run_v2_service.control_plane.uri" in outputs
+    api_url = _output_block(outputs, "agentops_api_url")
+    assert "local.api_base_url" in api_url
+
+
+def test_gcp_outputs_expose_load_balancer_address_when_opted_in():
+    outputs = _read(GCP_DIR / "outputs.tf")
+    assert 'output "load_balancer_ip"' in outputs, "missing load_balancer_ip output"
+    block = _output_block(outputs, "load_balancer_ip")
+    assert (
+        "google_compute_global_address.control_plane" in block
+    ), "load_balancer_ip is not derived from the LB global address"
+    # Empty when the load balancer is not opted in (count-gated resource).
+    assert "local.create_lb" in block, "load_balancer_ip does not handle the not-opted-in case"
+
+
+def test_gcp_smoke_hints_mention_optional_load_balancer_and_dns():
+    outputs = _read(GCP_DIR / "outputs.tf")
+    hints = _output_block(outputs, "smoke_test_hints").lower()
+    assert hints, "missing smoke_test_hints output"
+    assert (
+        "load balancer" in hints or "load-balanced" in hints
+    ), "smoke hints do not mention the optional load balancer"
+    assert "dns" in hints, "smoke hints do not mention the optional DNS record"
+    assert "optional" in hints, "smoke hints do not flag the load balancer/DNS as optional"
+    # Live apply/smoke is still pending.
+    assert "pending" in hints or "smoke" in hints
+
+
+def test_gcp_load_balancer_secret_hygiene_preserved():
+    # The load-balancer slice must not introduce secret versions or raw inputs.
+    main = _read(GCP_DIR / "main.tf")
+    variables = _read(GCP_DIR / "variables.tf").lower()
+    assert "google_secret_manager_secret_version" not in main
+    for token in RAW_SECRET_TOKENS:
+        assert f'variable "{token}"' not in variables, token
+
+
+def test_gcp_readme_documents_opt_in_load_balancer_and_dns_contract():
+    readme = _read(GCP_DIR / "README.md")
+    lowered = readme.lower()
+    # Opt-in LB/DNS documented by name.
+    assert "enable_load_balancer_custom_domain" in readme
+    assert "create_dns_record" in readme
+    assert "managed_zone" in readme
+    # The LB chain + managed certificate are described.
+    assert "load balancer" in lowered
+    assert "managed" in lowered and ("ssl" in lowered or "certificate" in lowered)
+    assert "network endpoint group" in lowered or "serverless neg" in lowered
+    # Honest: live apply/smoke remains pending.
+    assert "live" in lowered and "smoke" in lowered
+    # Raw secrets remain a bootstrap concern, not Terraform inputs.
+    assert "bootstrap" in lowered
+    assert "raw" in lowered
+
+
+def test_gcp_readme_parity_section_no_longer_lists_load_balancer_as_missing():
+    readme = _read(GCP_DIR / "README.md")
+    idx = readme.lower().find("parity gaps")
+    assert idx != -1, "missing parity gaps section"
+    section = readme[idx:].lower()
+    # The LB/DNS bullet must no longer claim no front door is provided.
+    assert (
+        "a load-balancer/cdn front door is not" not in section
+    ), "parity section still lists the load-balancer front door as missing"
+    assert (
+        "no external http(s) load balancer or managed dns fronts the control-plane"
+        not in section
+    ), "parity section still says no external HTTPS LB/DNS fronts the control-plane"
+    # The honest live-smoke gap stays.
+    assert "live" in section and "smoke" in section
+
+
+def test_gcp_tfvars_documents_optional_load_balancer_and_dns():
+    tfvars = _read(GCP_DIR / "terraform.tfvars.example")
+    assert "enable_load_balancer_custom_domain" in tfvars
+    assert "create_dns_record" in tfvars
+    assert "managed_zone" in tfvars
+    lowered = tfvars.lower()
+    for token in RAW_SECRET_TOKENS:
+        assert token not in lowered, f"{token} leaked into tfvars example"
+
+
 # --- smoke transcript artifacts are git-ignored (M15 slice) -----------------
 #
 # The module-local smoke-transcript-<UTC>.log files are per-operator evidence

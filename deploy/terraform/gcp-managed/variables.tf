@@ -35,9 +35,10 @@ variable "domain" {
 
 # --- Public API endpoint contract -------------------------------------------
 #
-# The control-plane has no provisioned load balancer / DNS, so the default
-# public API endpoint is the Cloud Run service URI. These non-secret toggles
-# opt into public unauthenticated access and an optional custom-domain mapping.
+# By default, without enable_load_balancer_custom_domain, the public API endpoint
+# is the Cloud Run service URI. These non-secret toggles opt into public
+# unauthenticated access, a lightweight Cloud Run custom-domain mapping, or the
+# alternative External HTTPS Load Balancer custom-domain path below.
 
 variable "enable_public_invoker" {
   description = "When true, grant allUsers roles/run.invoker on the CONTROL-PLANE Cloud Run service so its API is reachable without IAM auth. Default false keeps the service IAM-gated (private). Non-secret toggle; the worker/scheduler never get this binding."
@@ -49,6 +50,38 @@ variable "enable_custom_domain" {
   description = "When true (and domain is set), create a Cloud Run domain mapping for the control-plane at var.domain. Default false uses the Cloud Run service URI as the endpoint. Non-secret toggle."
   type        = bool
   default     = false
+}
+
+# --- Optional External HTTPS Load Balancer front door ------------------------
+#
+# An alternative to the lightweight Cloud Run domain mapping: front the
+# control-plane with a global External HTTPS Load Balancer (serverless NEG ->
+# backend service -> URL map -> target HTTPS proxy -> global forwarding rule)
+# terminated by a Google-managed SSL certificate for var.domain, with an
+# optional Cloud DNS A record. All non-secret toggles; default off keeps the
+# Cloud Run service URI as the endpoint.
+
+variable "enable_load_balancer_custom_domain" {
+  description = "When true (and domain is set), front the CONTROL-PLANE Cloud Run service with a global External HTTPS Load Balancer (serverless NEG -> backend service -> URL map -> target HTTPS proxy -> global forwarding rule) terminated by a Google-managed SSL certificate for var.domain. Default false keeps the Cloud Run service URI as the endpoint. Non-secret toggle; the worker/scheduler are never fronted."
+  type        = bool
+  default     = false
+
+  validation {
+    condition     = !(var.enable_load_balancer_custom_domain && var.enable_custom_domain)
+    error_message = "enable_load_balancer_custom_domain and enable_custom_domain are mutually exclusive and cannot both be true for the same domain."
+  }
+}
+
+variable "create_dns_record" {
+  description = "When true (and the load balancer + managed_zone are set), create a Cloud DNS A record pointing var.domain at the load balancer's global IP. Default false leaves DNS to the operator. Non-secret toggle."
+  type        = bool
+  default     = false
+}
+
+variable "managed_zone" {
+  description = "OPTIONAL Cloud DNS managed-zone name used to create the var.domain A record when create_dns_record is true. Empty (default) creates no DNS record. Non-secret."
+  type        = string
+  default     = ""
 }
 
 # --- Container images --------------------------------------------------------

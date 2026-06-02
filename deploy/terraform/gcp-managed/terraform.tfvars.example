@@ -23,6 +23,17 @@ region      = "us-central1"
 # enable_custom_domain  = false
 # domain                = "agentops.example.com"
 
+# --- Optional External HTTPS Load Balancer front door (non-secret toggles) --
+# An alternative to the lightweight Cloud Run domain mapping: front the
+# control-plane with a global External HTTPS Load Balancer (serverless NEG ->
+# backend service -> URL map -> target HTTPS proxy -> global forwarding rule)
+# terminated by a Google-managed SSL certificate for `domain`. Optionally create
+# a Cloud DNS A record pointing `domain` at the load balancer IP. Leave all off
+# (default) to keep the Cloud Run service URI as the endpoint.
+# enable_load_balancer_custom_domain = false
+# create_dns_record                  = false
+# managed_zone                       = "my-managed-zone"
+
 # --- Container images (non-secret refs) -------------------------------------
 # Override with the runtime images you build/push. These are image references,
 # not secret values.
