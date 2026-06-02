@@ -13,6 +13,7 @@ COMPOSE_DIR = REPO_ROOT / "deploy" / "compose"
 COMPOSE_FILE = COMPOSE_DIR / "docker-compose.yml"
 ENV_EXAMPLE = COMPOSE_DIR / ".env.example"
 README = COMPOSE_DIR / "README.md"
+SMOKE_SCRIPT = COMPOSE_DIR / "smoke.sh"
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 
 
@@ -89,6 +90,18 @@ def test_compose_profile_includes_one_shot_smoke_service():
     assert "AGENTOPS_WORKER_URL=http://worker:8711" in env
     assert "AGENTOPS_SCHEDULER_URL=http://scheduler:8712" in env
     assert "AGENTOPS_SECRET_STORE_URL=http://local-secrets:8713" in env
+
+
+def test_compose_profile_includes_live_smoke_script_from_compose_dir():
+    script = SMOKE_SCRIPT.read_text(encoding="utf-8")
+    readme_text = README.read_text(encoding="utf-8")
+
+    assert "docker compose up --build -d" in script
+    assert "docker compose --profile smoke run --rm smoke" in script
+    assert "docker compose down" in script
+    assert "docker info" in script
+    assert "-f deploy/compose/docker-compose.yml" not in script
+    assert "./smoke.sh" in readme_text
 
 
 def test_agentops_runtime_compose_service_is_packaged_in_wheels():

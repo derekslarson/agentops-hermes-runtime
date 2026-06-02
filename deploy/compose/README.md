@@ -22,9 +22,13 @@ closed) if any service is unreachable, returns a non-200 status, or reports
 `"ok": false`:
 
 ```bash
-docker compose up --build -d
-docker compose --profile smoke run --rm smoke
+./smoke.sh
 ```
+
+`smoke.sh` starts the stack with `docker compose up --build -d`, runs
+`docker compose --profile smoke run --rm smoke`, and then tears the stack down
+with `docker compose down --remove-orphans`. If Docker is already running and
+you want to keep the stack up after the check, run those commands manually.
 
 The `smoke` one-shot service runs inside the Compose network, so it reaches
 `worker` and `scheduler` by their service DNS names even though those services
