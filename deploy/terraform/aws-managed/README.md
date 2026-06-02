@@ -83,6 +83,32 @@ tofu plan
 tofu apply
 ```
 
+## Live-smoke helper (`smoke.sh`)
+
+`smoke.sh` is a module-local helper that an operator runs from inside this
+directory after configuring `terraform.tfvars` and AWS credentials. It **fails
+closed before any side effect** when neither the `terraform` nor `tofu`
+(OpenTofu) CLI is available, or when AWS credentials/config are unavailable
+(verified with `aws sts get-caller-identity`). It uses the same module-local
+commands as above (no root-relative `-chdir`), auto-detecting whichever CLI is
+installed.
+
+It defaults to a safe **plan-only** mode (`PLAN_ONLY=1`): `init` + `validate` +
+`plan` with no apply. Set `PLAN_ONLY=0` to also `apply` and then print the
+post-apply smoke hints/outputs (`agentops_api_url`, `smoke_test_hints`).
+
+```bash
+cd deploy/terraform/aws-managed
+cp terraform.tfvars.example terraform.tfvars   # edit account/region/capacity
+./smoke.sh                 # PLAN_ONLY=1 (default): init + validate + plan
+PLAN_ONLY=0 ./smoke.sh     # apply, then print agentops_api_url + smoke_test_hints
+```
+
+The helper never accepts or echoes raw app/integration secret values; bootstrap
+(M16) owns those. **No live AWS apply/smoke has been captured for this module
+yet** — treat the first real `PLAN_ONLY=0 ./smoke.sh` against an account as the
+smoke test.
+
 ## Bring your own network / managed resources
 
 Set the `existing_*` variables to reuse infrastructure instead of creating new

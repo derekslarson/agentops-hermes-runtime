@@ -905,3 +905,95 @@ def test_tfvars_example_documents_optional_tls_dns():
     # These stay commented/optional so the default apply is ALB-HTTP.
     lowered = tfvars.lower()
     assert "optional" in lowered or "https" in lowered, "tfvars does not explain the optional HTTPS path"
+
+
+# --- AWS live-smoke helper (smoke.sh) — M15 slice ---------------------------
+#
+# A module-local executable helper an operator runs from deploy/terraform/aws-managed
+# after configuring tfvars + AWS credentials. It must fail closed BEFORE any side
+# effect when the Terraform/OpenTofu CLI is missing or AWS credentials/config are
+# unavailable, default to a safe plan-only mode, use module-local commands (no
+# root-relative -chdir), and surface post-apply smoke hints/outputs. It must never
+# accept or echo raw app/integration secret values.
+
+
+SMOKE_SCRIPT = AWS_DIR / "smoke.sh"
+
+
+def test_aws_smoke_script_exists_is_executable_and_strict():
+    assert SMOKE_SCRIPT.is_file(), "missing aws-managed/smoke.sh live-smoke helper"
+    mode = SMOKE_SCRIPT.stat().st_mode
+    assert mode & 0o111, "smoke.sh is not executable"
+    text = _read(SMOKE_SCRIPT)
+    assert text.startswith("#!"), "smoke.sh has no shebang"
+    # Strict bash so a failed prerequisite check actually aborts the run.
+    assert "set -euo pipefail" in text, "smoke.sh is not in strict mode"
+
+
+def test_aws_smoke_script_requires_a_terraform_or_opentofu_cli():
+    text = _read(SMOKE_SCRIPT)
+    # Detects an available CLI (terraform or OpenTofu) rather than assuming one.
+    assert "command -v" in text, "smoke.sh does not detect a CLI with command -v"
+    assert "terraform" in text and "tofu" in text, "smoke.sh does not consider both terraform and tofu"
+
+
+def test_aws_smoke_script_fails_closed_on_missing_prereqs_before_side_effects():
+    text = _read(SMOKE_SCRIPT)
+    # Verifies AWS credentials/config before doing anything with side effects.
+    assert "get-caller-identity" in text, "smoke.sh does not verify AWS credentials/config"
+
+    # The credential and CLI checks must run BEFORE any side-effecting CLI
+    # invocation. Anchor on `-input=false`, which only appears on the real
+    # init/plan/apply command lines (never in prose), so the ordering check is
+    # not fooled by the words "plan"/"apply" in comments.
+    cred_idx = text.find("get-caller-identity")
+    cli_idx = text.find("command -v")
+    first_side_effect = text.find("-input=false")
+    assert cred_idx != -1 and cli_idx != -1
+    assert first_side_effect != -1, "smoke.sh never runs a CLI command"
+    assert cli_idx < first_side_effect, "CLI check must run before any side effect"
+    assert cred_idx < first_side_effect, "credential check must run before any side effect"
+
+    # plan and apply are both reachable commands.
+    assert "apply" in text, "smoke.sh never runs apply"
+    assert "plan" in text, "smoke.sh never runs plan"
+
+    # Fails closed (non-zero exit) when a prerequisite is missing.
+    assert "exit 1" in text, "smoke.sh does not fail closed with a non-zero exit"
+
+
+def test_aws_smoke_script_uses_module_local_commands_not_root_relative_chdir():
+    text = _read(SMOKE_SCRIPT)
+    # No root-relative -chdir hack — the helper runs from the module directory.
+    assert "-chdir=deploy/terraform" not in text
+    for command in ("init", "validate", "plan"):
+        assert command in text, f"smoke.sh does not run {command}"
+
+
+def test_aws_smoke_script_defaults_to_safe_plan_only_mode():
+    text = _read(SMOKE_SCRIPT)
+    # Apply is opt-in; the default is a side-effect-light plan.
+    assert "PLAN_ONLY" in text, "smoke.sh does not expose a PLAN_ONLY mode"
+
+
+def test_aws_smoke_script_surfaces_post_apply_smoke_hints_and_outputs():
+    text = _read(SMOKE_SCRIPT)
+    assert "output" in text, "smoke.sh does not surface terraform outputs"
+    assert "agentops_api_url" in text, "smoke.sh does not surface agentops_api_url"
+    assert "smoke_test_hints" in text, "smoke.sh does not surface smoke_test_hints"
+
+
+def test_aws_smoke_script_does_not_accept_or_echo_raw_secrets():
+    text = _read(SMOKE_SCRIPT).lower()
+    for token in RAW_SECRET_TOKENS:
+        assert token not in text, f"{token} referenced in smoke.sh"
+
+
+def test_aws_readme_documents_smoke_script():
+    readme = _read(AWS_DIR / "README.md")
+    lowered = readme.lower()
+    assert "smoke.sh" in readme, "README does not document the smoke.sh helper"
+    # Default plan-only safety is documented honestly.
+    assert "plan_only" in lowered, "README does not document the PLAN_ONLY default"
+    # The helper is run from inside the module directory.
+    assert "./smoke.sh" in readme, "README does not show running ./smoke.sh from the module dir"
