@@ -210,6 +210,20 @@ hold infrastructure details and may carry sensitive values, so they are
 operator-local and must not be committed (the root `.gitignore` already ignores
 them).
 
+Optionally set `CLEAN_TERRAFORM_ARTIFACTS=1` to have the helper clean up its own
+scratch after a **successful plan-only run**: it removes only those local
+working artifacts (`.terraform/`, `.terraform.lock.hcl`, `*.tfstate[.*]`,
+`*.tfplan`, `crash.log`/`crash.*.log`) and never touches source (`*.tf`), inputs
+(`terraform.tfvars`, generated `*.auto.tfvars`), this README, or any
+`smoke-transcript-*.log` evidence. It defaults to `0` (**off** — artifacts are
+left in place) and never runs after a failed preflight (it only runs once the
+plan succeeds) or on the apply path (`PLAN_ONLY=0` keeps its state and
+transcript). It involves no raw app/integration secret values.
+
+```bash
+CLEAN_TERRAFORM_ARTIFACTS=1 ./smoke.sh   # plan-only, then remove local Terraform/OpenTofu scratch
+```
+
 ## Public API endpoint
 
 By default, without `enable_load_balancer_custom_domain`, the public API

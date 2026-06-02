@@ -40,6 +40,7 @@ set -euo pipefail
 
 PLAN_ONLY="${PLAN_ONLY:-1}"
 DESTROY_ON_FAILURE="${DESTROY_ON_FAILURE:-0}"
+CLEAN_TERRAFORM_ARTIFACTS="${CLEAN_TERRAFORM_ARTIFACTS:-0}"
 
 # Operate on the module directory this script lives in (module-local commands;
 # no root-relative -chdir hacks).
@@ -119,8 +120,26 @@ fi
 "$TF" validate
 "$TF" plan -input=false
 
+# --- optional: clean local Terraform/OpenTofu working artifacts --------------
+# CLEAN_TERRAFORM_ARTIFACTS=1 (opt-in; default 0) removes the local
+# Terraform/OpenTofu working artifacts this helper's init/validate/plan create
+# (.terraform/, .terraform.lock.hcl, state/plan/crash files) after a SUCCESSFUL
+# plan-only run, without touching source (.tf), inputs (terraform.tfvars,
+# generated *.auto.tfvars), the README, or smoke-transcript evidence. set -e
+# aborts earlier on a failed preflight or plan, so a failed run never cleans, and
+# it is only reached on the plan-only path (the apply path keeps its state and
+# transcript). No raw app/integration secret values are involved.
+clean_terraform_artifacts() {
+  rm -rf .terraform
+  rm -f .terraform.lock.hcl ./*.tfstate ./*.tfstate.* ./*.tfplan crash.log crash.*.log
+  echo "CLEAN_TERRAFORM_ARTIFACTS=1 — removed local Terraform/OpenTofu working artifacts (.terraform/, lock, state/plan/crash)." >&2
+}
+
 if [ "$PLAN_ONLY" != "0" ]; then
   echo "PLAN_ONLY=$PLAN_ONLY — stopping after plan. Re-run with PLAN_ONLY=0 to apply." >&2
+  if [ "$CLEAN_TERRAFORM_ARTIFACTS" = "1" ]; then
+    clean_terraform_artifacts
+  fi
   exit 0
 fi
 

@@ -3994,3 +3994,245 @@ def test_smoke_scripts_document_destroy_on_failure_default_off():
         assert "default" in lowered, (
             f"{module_dir.name}: live-smoke section does not state the safe default (no destroy)"
         )
+
+
+# --- opt-in local Terraform/OpenTofu artifact cleanup (CLEAN_TERRAFORM_ARTIFACTS) — M15 slice ---
+#
+# A smoke/plan run leaves module-local Terraform/OpenTofu working artifacts
+# (.terraform/, .terraform.lock.hcl, *.tfstate[.*], *.tfplan, crash[.*].log). They
+# are git-ignored, but an operator who runs only a plan-only smoke may want the
+# helper to clean up its own scratch afterwards. CLEAN_TERRAFORM_ARTIFACTS=1
+# (opt-in; default off) removes ONLY those working artifacts after a successful
+# plan-only run — never the source (.tf), inputs (terraform.tfvars / generated
+# *.auto.tfvars), README, or smoke-transcript evidence — and never runs after a
+# failed preflight (before Terraform is invoked) or on the apply path (apply keeps
+# its state and transcript). No raw app/integration secrets are involved.
+
+
+def _cleanup_region(text: str) -> str:
+    start = text.find("clean_terraform_artifacts() {")
+    if start == -1:
+        return ""
+    end = text.find("\n}", start)
+    return text[start : end + 2] if end != -1 else text[start:]
+
+
+def _assert_smoke_artifact_cleanup_static(script_path: Path) -> None:
+    text = _read(script_path)
+    name = script_path.parent.name
+
+    # Opt-in via CLEAN_TERRAFORM_ARTIFACTS, defaulting OFF.
+    assert (
+        'CLEAN_TERRAFORM_ARTIFACTS="${CLEAN_TERRAFORM_ARTIFACTS:-0}"' in text
+    ), f"{name}: smoke.sh does not default CLEAN_TERRAFORM_ARTIFACTS off"
+
+    region = _cleanup_region(text)
+    assert region, f"{name}: smoke.sh has no clean_terraform_artifacts cleanup region"
+
+    # Removes exactly the Terraform/OpenTofu working artifacts.
+    assert "rm -rf .terraform" in region, f"{name}: cleanup does not remove the .terraform/ working dir"
+    assert ".terraform.lock.hcl" in region, f"{name}: cleanup does not remove the lock file"
+    assert "*.tfstate" in region, f"{name}: cleanup does not remove tfstate files"
+    assert "*.tfstate.*" in region, f"{name}: cleanup does not remove tfstate backups"
+    assert "*.tfplan" in region, f"{name}: cleanup does not remove tfplan files"
+    assert "crash.log" in region, f"{name}: cleanup does not remove crash.log"
+    assert "crash.*.log" in region, f"{name}: cleanup does not remove crash.*.log"
+
+    # Never removes source / inputs / evidence.
+    assert "terraform.tfvars" not in region, f"{name}: cleanup must not touch terraform.tfvars"
+    assert "auto.tfvars" not in region, f"{name}: cleanup must not touch generated image tfvars"
+    assert "README" not in region, f"{name}: cleanup must not touch the README"
+    assert "smoke-transcript" not in region, f"{name}: cleanup must not touch smoke transcripts"
+    # No bare source-.tf removal (only the *.tfstate/*.tfplan globs are allowed).
+    for forbidden in ("*.tf\n", "*.tf ", '*.tf"', "*.tf'", "main.tf", "variables.tf"):
+        assert forbidden not in region, f"{name}: cleanup must not remove source .tf files ({forbidden!r})"
+
+
+def test_aws_smoke_script_artifact_cleanup_is_opt_in_and_scoped():
+    _assert_smoke_artifact_cleanup_static(SMOKE_SCRIPT)
+
+
+def test_gcp_smoke_script_artifact_cleanup_is_opt_in_and_scoped():
+    _assert_smoke_artifact_cleanup_static(GCP_SMOKE_SCRIPT)
+
+
+def test_smoke_artifact_cleanup_does_not_reference_raw_secrets():
+    for script in (SMOKE_SCRIPT, GCP_SMOKE_SCRIPT):
+        region = _cleanup_region(_read(script)).lower()
+        assert region, f"{script.parent.name}: smoke.sh has no cleanup region"
+        for token in RAW_SECRET_TOKENS:
+            assert token not in region, f"{token} referenced in {script.parent.name} cleanup"
+
+
+# Working artifacts that the opt-in cleanup must remove, and source/input/evidence
+# files it must always preserve.
+CLEANUP_WORKING_ARTIFACTS = (
+    ".terraform.lock.hcl",
+    "terraform.tfstate",
+    "terraform.tfstate.backup",
+    "run.tfplan",
+    "crash.log",
+    "crash.2026.log",
+)
+CLEANUP_PRESERVED_FILES = (
+    "terraform.tfvars",
+    "image.auto.tfvars",
+    "README.md",
+    "main.tf",
+    "smoke-transcript-20260101T000000Z.log",
+)
+CLEANUP_REQUIRED_INPUT_ENV = {
+    "aws-managed": {"TF_VAR_region": "us-east-1", "TF_VAR_domain": "example.test"},
+    "gcp-managed": {"TF_VAR_project": "example-project", "TF_VAR_region": "us-central1"},
+}
+
+
+def _make_artifact_cleanup_stub_bin(tmp: Path) -> Path:
+    """Stub terraform/tofu/aws/gcloud so a plan-only smoke run succeeds with no
+    real side effects. terraform/tofu no-op init/validate/plan; aws and gcloud
+    satisfy the credential/auth preflights."""
+    bin_dir = tmp / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+
+    for tool in ("terraform", "tofu"):
+        path = bin_dir / tool
+        path.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        path.chmod(0o755)
+
+    aws = bin_dir / "aws"
+    aws.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    aws.chmod(0o755)
+
+    gcloud = bin_dir / "gcloud"
+    gcloud.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [ "${1:-}" = "auth" ] && [ "${2:-}" = "list" ]; then printf \'tester@example.com\\n\'; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    gcloud.chmod(0o755)
+    return bin_dir
+
+
+def _setup_cleanup_module(tmp_path: Path, script_path: Path) -> Path:
+    mod = tmp_path / "module"
+    mod.mkdir()
+    shutil.copy(script_path, mod / "smoke.sh")
+    (mod / "smoke.sh").chmod(0o755)
+
+    art_dir = mod / ".terraform"
+    art_dir.mkdir()
+    (art_dir / "providers").write_text("x", encoding="utf-8")
+    for fname in CLEANUP_WORKING_ARTIFACTS:
+        (mod / fname).write_text("artifact", encoding="utf-8")
+    # Preserved files must NOT define the required inputs, so the preflight outcome
+    # is controlled solely by the TF_VAR_* env supplied per run.
+    for fname in CLEANUP_PRESERVED_FILES:
+        (mod / fname).write_text("desired_task_count = 2\n", encoding="utf-8")
+    return mod
+
+
+def _run_cleanup_smoke(mod: Path, bin_dir: Path, script_path: Path, clean, with_required_inputs: bool):
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+        "PLAN_ONLY": "1",
+    }
+    env.pop("CLEAN_TERRAFORM_ARTIFACTS", None)
+    if clean is not None:
+        env["CLEAN_TERRAFORM_ARTIFACTS"] = clean
+    for var in ("TF_VAR_region", "TF_VAR_domain", "TF_VAR_project"):
+        env.pop(var, None)
+    if with_required_inputs:
+        env.update(CLEANUP_REQUIRED_INPUT_ENV[script_path.parent.name])
+    return subprocess.run(
+        ["bash", str(mod / "smoke.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+
+
+def _assert_cleanup_removes_only_working_artifacts(tmp_path: Path, script_path: Path) -> None:
+    mod = _setup_cleanup_module(tmp_path, script_path)
+    bin_dir = _make_artifact_cleanup_stub_bin(tmp_path)
+    result = _run_cleanup_smoke(mod, bin_dir, script_path, clean="1", with_required_inputs=True)
+    assert result.returncode == 0, (
+        f"plan-only smoke with CLEAN_TERRAFORM_ARTIFACTS=1 failed "
+        f"(stdout={result.stdout!r} stderr={result.stderr!r})"
+    )
+    assert not (mod / ".terraform").exists(), "cleanup did not remove the .terraform/ working dir"
+    for fname in CLEANUP_WORKING_ARTIFACTS:
+        assert not (mod / fname).exists(), f"cleanup did not remove working artifact {fname}"
+    for fname in CLEANUP_PRESERVED_FILES:
+        assert (mod / fname).exists(), f"cleanup wrongly removed preserved file {fname}"
+
+
+def test_aws_smoke_cleanup_removes_only_working_artifacts_after_plan_only(tmp_path):
+    _assert_cleanup_removes_only_working_artifacts(tmp_path, SMOKE_SCRIPT)
+
+
+def test_gcp_smoke_cleanup_removes_only_working_artifacts_after_plan_only(tmp_path):
+    _assert_cleanup_removes_only_working_artifacts(tmp_path, GCP_SMOKE_SCRIPT)
+
+
+def _assert_cleanup_default_off_preserves_artifacts(tmp_path: Path, script_path: Path) -> None:
+    mod = _setup_cleanup_module(tmp_path, script_path)
+    bin_dir = _make_artifact_cleanup_stub_bin(tmp_path)
+    result = _run_cleanup_smoke(mod, bin_dir, script_path, clean=None, with_required_inputs=True)
+    assert result.returncode == 0, (
+        f"plan-only smoke (default cleanup off) failed "
+        f"(stdout={result.stdout!r} stderr={result.stderr!r})"
+    )
+    assert (mod / ".terraform").exists(), "default-off run wrongly removed .terraform/"
+    for fname in CLEANUP_WORKING_ARTIFACTS:
+        assert (mod / fname).exists(), f"default-off run wrongly removed {fname}"
+
+
+def test_aws_smoke_cleanup_defaults_off(tmp_path):
+    _assert_cleanup_default_off_preserves_artifacts(tmp_path, SMOKE_SCRIPT)
+
+
+def test_gcp_smoke_cleanup_defaults_off(tmp_path):
+    _assert_cleanup_default_off_preserves_artifacts(tmp_path, GCP_SMOKE_SCRIPT)
+
+
+def _assert_cleanup_skipped_on_preflight_failure(tmp_path: Path, script_path: Path) -> None:
+    mod = _setup_cleanup_module(tmp_path, script_path)
+    bin_dir = _make_artifact_cleanup_stub_bin(tmp_path)
+    # No required inputs → the preflight fails closed BEFORE Terraform is invoked,
+    # even with cleanup opted in. Nothing must be cleaned.
+    result = _run_cleanup_smoke(mod, bin_dir, script_path, clean="1", with_required_inputs=False)
+    assert result.returncode != 0, "missing required inputs must fail closed before plan"
+    assert (mod / ".terraform").exists(), "cleanup ran after a failed preflight (before Terraform was invoked)"
+    for fname in CLEANUP_WORKING_ARTIFACTS:
+        assert (mod / fname).exists(), f"cleanup removed {fname} after a failed preflight"
+
+
+def test_aws_smoke_cleanup_skipped_on_failed_preflight(tmp_path):
+    _assert_cleanup_skipped_on_preflight_failure(tmp_path, SMOKE_SCRIPT)
+
+
+def test_gcp_smoke_cleanup_skipped_on_failed_preflight(tmp_path):
+    _assert_cleanup_skipped_on_preflight_failure(tmp_path, GCP_SMOKE_SCRIPT)
+
+
+def test_readmes_document_artifact_cleanup_option_default_off():
+    for module_dir in (AWS_DIR, GCP_DIR):
+        section = _smoke_section(_read(module_dir / "README.md"))
+        assert section, f"{module_dir.name}: README has no live-smoke helper section"
+        assert "CLEAN_TERRAFORM_ARTIFACTS" in section, (
+            f"{module_dir.name}: live-smoke section does not document CLEAN_TERRAFORM_ARTIFACTS"
+        )
+        lowered = section.lower()
+        # Default off and scoped to the plan-only working artifacts.
+        assert "default" in lowered, (
+            f"{module_dir.name}: live-smoke section does not state the safe default (off)"
+        )
+        assert "artifact" in lowered, (
+            f"{module_dir.name}: live-smoke section does not describe the working-artifact cleanup"
+        )
+        assert "plan-only" in lowered or "plan only" in lowered, (
+            f"{module_dir.name}: live-smoke section does not tie the cleanup to the plan-only path"
+        )
