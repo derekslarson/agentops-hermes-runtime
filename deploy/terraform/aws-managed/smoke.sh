@@ -10,7 +10,12 @@
 #
 # Modes:
 #   PLAN_ONLY=1 (default)  init + validate + plan only — no apply.
-#   PLAN_ONLY=0            init + validate + plan + apply, then print smoke outputs.
+#   PLAN_ONLY=0            init + validate + plan + apply, then probe the live API
+#                          (${agentops_api_url}/healthz) and print smoke outputs.
+#
+# On the apply path the helper proves the provisioned API endpoint responds: it
+# fetches the bare agentops_api_url output and curls ${agentops_api_url}/healthz,
+# failing closed (non-zero) on an unhealthy/unreachable response.
 #
 # This helper never accepts or echoes raw app/integration secret values; bootstrap
 # (M16) owns those and writes them into the secret backend after apply.
@@ -54,7 +59,25 @@ if [ "$PLAN_ONLY" != "0" ]; then
   exit 0
 fi
 
+# --- apply-path prerequisite: curl for the post-apply health probe -----------
+# Required only on the apply path (plan-only never probes). Fail clearly BEFORE
+# the apply side effect if curl is unavailable.
+if ! command -v curl >/dev/null 2>&1; then
+  echo "error: 'curl' is required to probe the API health endpoint after apply" >&2
+  exit 1
+fi
+
 "$TF" apply -input=false -auto-approve
+
+# --- post-apply API health probe ---------------------------------------------
+# Prove the provisioned API endpoint responds before declaring success.
+API_URL="$("$TF" output -raw agentops_api_url)"
+echo "Probing ${API_URL}/healthz ..."
+if ! curl -fsS --max-time 30 "${API_URL}/healthz" >/dev/null; then
+  echo "error: API health probe failed — ${API_URL}/healthz did not respond healthy" >&2
+  exit 1
+fi
+echo "API health probe OK — ${API_URL}/healthz responded healthy"
 
 # --- post-apply smoke hints/outputs ------------------------------------------
 echo "Apply complete — smoke hints/outputs:"

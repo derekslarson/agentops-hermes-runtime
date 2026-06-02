@@ -52,13 +52,18 @@ closed *before* any Terraform/OpenTofu side effect when:
 - no gcloud account is active (a read-only `gcloud auth list` check).
 
 It defaults to a safe **`PLAN_ONLY=1`** mode (`init` + `validate` + `plan`, no
-apply). Set `PLAN_ONLY=0` to run `apply` and then print the `agentops_api_url`
-and `smoke_test_hints` outputs:
+apply). Set `PLAN_ONLY=0` to run `apply`, then **probe the live API** and surface
+the `agentops_api_url` and `smoke_test_hints` outputs. On the apply path the
+helper fetches the bare `agentops_api_url` output and curls
+`${agentops_api_url}/healthz`, **failing closed (non-zero)** if the endpoint is
+unhealthy or unreachable. `curl` is required on the apply path (the helper fails
+clearly before applying if it is missing); the plan-only default never probes and
+so never needs `curl`.
 
 ```bash
 cd deploy/terraform/gcp-managed
 ./smoke.sh              # plan-only (default)
-PLAN_ONLY=0 ./smoke.sh  # opt-in apply, then surface smoke outputs
+PLAN_ONLY=0 ./smoke.sh  # opt-in apply, probe ${agentops_api_url}/healthz, surface outputs
 ```
 
 Honest caveat: this module is still scaffold-level (see the parity gaps below),

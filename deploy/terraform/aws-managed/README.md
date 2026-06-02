@@ -94,14 +94,20 @@ commands as above (no root-relative `-chdir`), auto-detecting whichever CLI is
 installed.
 
 It defaults to a safe **plan-only** mode (`PLAN_ONLY=1`): `init` + `validate` +
-`plan` with no apply. Set `PLAN_ONLY=0` to also `apply` and then print the
-post-apply smoke hints/outputs (`agentops_api_url`, `smoke_test_hints`).
+`plan` with no apply. Set `PLAN_ONLY=0` to also `apply`, then **probe the live
+API** and print the post-apply smoke hints/outputs (`agentops_api_url`,
+`smoke_test_hints`). On the apply path the helper fetches the bare
+`agentops_api_url` output and curls `${agentops_api_url}/healthz`, **failing
+closed (non-zero)** if the endpoint is unhealthy or unreachable — so a live smoke
+transcript proves the provisioned API responds. `curl` is required on the apply
+path (the helper fails clearly before applying if it is missing); the plan-only
+default never probes and so never needs `curl`.
 
 ```bash
 cd deploy/terraform/aws-managed
 cp terraform.tfvars.example terraform.tfvars   # edit account/region/capacity
 ./smoke.sh                 # PLAN_ONLY=1 (default): init + validate + plan
-PLAN_ONLY=0 ./smoke.sh     # apply, then print agentops_api_url + smoke_test_hints
+PLAN_ONLY=0 ./smoke.sh     # apply, probe ${agentops_api_url}/healthz, print outputs
 ```
 
 The helper never accepts or echoes raw app/integration secret values; bootstrap

@@ -1057,3 +1057,98 @@ def test_gcp_readme_documents_smoke_script_and_plan_only_default():
     assert "plan_only" in lowered, "GCP README does not document the PLAN_ONLY default"
     assert "./smoke.sh" in readme, "GCP README does not show running ./smoke.sh from the module dir"
     assert "gcloud" in lowered, "GCP README does not document the gcloud prerequisite"
+
+
+# --- post-apply API /healthz probe (M15 slice) ------------------------------
+#
+# On the opt-in apply path (PLAN_ONLY=0) the smoke helpers must PROVE the
+# provisioned API endpoint responds before the run is considered successful:
+# fetch the bare `agentops_api_url` output (`output -raw`), probe
+# `${agentops_api_url}/healthz` with curl, and fail closed (non-zero) on an
+# unhealthy/unreachable response. The probe runs only AFTER apply (not before
+# prerequisites/plan), curl is required before applying when PLAN_ONLY=0, and the
+# plan-only default must not require curl. No raw app/integration secrets.
+
+
+def _healthz_line(text: str) -> str:
+    # The line that actually probes the endpoint (an executable `curl ` call to
+    # /healthz), not a header comment that merely mentions it.
+    for line in text.splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        if "/healthz" in line and "curl " in line:
+            return line
+    return ""
+
+
+def _assert_smoke_health_probe(script_path: Path, plan_guard: str) -> None:
+    text = _read(script_path)
+    name = script_path.parent.name
+
+    # Fetch the bare API URL via `output -raw agentops_api_url`.
+    assert (
+        "output -raw agentops_api_url" in text
+    ), f"{name}: smoke.sh does not fetch the bare agentops_api_url via output -raw"
+
+    # Probe ${agentops_api_url}/healthz with curl.
+    assert "/healthz" in text, f"{name}: smoke.sh does not probe the /healthz endpoint"
+    health_line = _healthz_line(text)
+    assert "curl" in health_line, f"{name}: /healthz is not probed with curl"
+    # curl must fail on unhealthy HTTP responses (e.g. -f/--fail/-fsS), not just
+    # on connection errors.
+    assert (
+        "--fail" in health_line or "-f" in health_line
+    ), f"{name}: curl health probe does not fail on unhealthy HTTP status (no -f/--fail)"
+
+    apply_idx = text.find("apply -input=false")
+    # Anchor on the executable probe line, not the header comment mention.
+    health_idx = text.find(health_line)
+    url_idx = text.find("output -raw agentops_api_url")
+    curl_req_idx = text.find("command -v curl")
+    guard_idx = text.find(plan_guard)
+    fail_closed_idx = text.rfind("exit 1")
+
+    assert apply_idx != -1, f"{name}: smoke.sh never runs apply"
+    assert guard_idx != -1, f"{name}: smoke.sh has no PLAN_ONLY guard"
+    assert curl_req_idx != -1, f"{name}: smoke.sh does not require curl with command -v"
+
+    # The probe runs only AFTER apply (not before prerequisites/plan).
+    assert apply_idx < url_idx, f"{name}: API URL fetched before apply"
+    assert apply_idx < health_idx, f"{name}: /healthz probed before apply"
+    # URL is fetched before it is probed.
+    assert url_idx < health_idx, f"{name}: /healthz probed before fetching the API URL"
+
+    # curl is required before applying (fail clearly before the apply side effect)...
+    assert curl_req_idx < apply_idx, f"{name}: curl requirement is not checked before apply"
+    # ...but only on the apply path — the plan-only default must not require curl.
+    assert (
+        curl_req_idx > guard_idx
+    ), f"{name}: curl is required even on the plan-only path (check precedes the PLAN_ONLY guard)"
+
+    # Fail closed (non-zero) after apply when the probe is unhealthy/unreachable.
+    assert (
+        fail_closed_idx > health_idx
+    ), f"{name}: no fail-closed exit 1 after the /healthz probe"
+
+
+def test_aws_smoke_script_probes_healthz_after_apply_and_fails_closed():
+    _assert_smoke_health_probe(SMOKE_SCRIPT, plan_guard='PLAN_ONLY" != "0"')
+
+
+def test_gcp_smoke_script_probes_healthz_after_apply_and_fails_closed():
+    _assert_smoke_health_probe(GCP_SMOKE_SCRIPT, plan_guard='PLAN_ONLY" != "0"')
+
+
+def test_smoke_scripts_health_probe_does_not_reference_raw_secrets():
+    for script in (SMOKE_SCRIPT, GCP_SMOKE_SCRIPT):
+        lowered = _read(script).lower()
+        for token in RAW_SECRET_TOKENS:
+            assert token not in lowered, f"{token} referenced in {script.parent.name}/smoke.sh"
+
+
+def test_readmes_document_post_apply_healthz_probe():
+    for module_dir in (AWS_DIR, GCP_DIR):
+        readme = _read(module_dir / "README.md")
+        lowered = readme.lower()
+        assert "/healthz" in readme, f"{module_dir.name}: README does not mention the /healthz probe"
+        assert "probe" in lowered, f"{module_dir.name}: README does not describe the post-apply probe"
