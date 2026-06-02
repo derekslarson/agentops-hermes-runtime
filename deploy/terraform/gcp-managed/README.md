@@ -203,10 +203,14 @@ A live `PLAN_ONLY=0` GCP apply/smoke against a real project is still pending.
 Set the `existing_*` variables (`existing_vpc_id`, `existing_subnet_ids`,
 `existing_database_arn`, `existing_artifact_bucket`, `existing_secret_prefix`)
 to reuse infrastructure. For the database, artifact bucket, and secret prefix,
-leaving the value empty creates a new resource. For the network,
-`existing_vpc_id` + `existing_subnet_ids` attach the services via Direct VPC
-egress when set; when empty the services use Cloud Run default egress — creating
-a *new* private network/subnets is a parity gap (see below), not done here.
+leaving the value empty creates a new resource. For the network, leaving
+`existing_vpc_id` empty (the default) **creates a new private VPC network and a
+regional subnet** (`private_subnet_cidr`, default `10.8.0.0/24`); the Cloud Run
+services attach to it via Direct VPC egress. Supplying `existing_vpc_id` +
+`existing_subnet_ids` attaches the services to that bring-your-own network
+instead. Either way the services run with Direct VPC egress onto the effective
+network, surfaced through the `network_refs` output (`module_created` is `true`
+for the module-created network, `false` for BYO).
 A bring-your-own VPC requires bring-your-own subnets:
 `existing_subnet_ids must be provided when existing_vpc_id is set`, because
 Direct VPC egress needs at least one subnet self-link. This is enforced by
@@ -246,10 +250,6 @@ resource-**scoped** bindings to exactly the backend refs in
 This GCP module is a scaffold and is intentionally behind the `aws-managed`
 module in the following areas:
 
-- **Networking:** bring-your-own VPC/subnet refs are consumed (the services
-  attach via Direct VPC egress when `existing_vpc_id` + `existing_subnet_ids`
-  are set), but creating a *new* private network / VPC connector when none is
-  provided is not yet wired.
 - **Autoscaling policy:** Cloud Run min/max instances are set, but no explicit
   CPU target-tracking policy equivalent to the AWS Application Auto Scaling
   policy is configured.

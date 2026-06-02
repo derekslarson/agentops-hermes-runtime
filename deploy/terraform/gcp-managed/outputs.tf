@@ -88,10 +88,11 @@ output "database_refs" {
 }
 
 output "network_refs" {
-  description = "Effective VPC/subnet refs the services attach to (empty unless BYO network is provided)."
+  description = "Effective VPC/subnet refs the Cloud Run services attach to via Direct VPC egress. module_created is true when the module created the private network/subnet (no BYO VPC), false when bring-your-own refs are used."
   value = {
-    vpc_id     = local.effective_vpc_id
-    subnet_ids = local.effective_subnet_ids
+    vpc_id         = local.effective_vpc_id
+    subnet_ids     = local.effective_subnet_ids
+    module_created = local.create_vpc
   }
 }
 

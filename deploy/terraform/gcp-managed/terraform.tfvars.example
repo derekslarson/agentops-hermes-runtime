@@ -36,7 +36,12 @@ max_concurrent_runs = 2
 min_task_count      = 1
 max_task_count      = 10
 
-# --- Bring-your-own-network (leave empty to create new) ---------------------
+# --- Network (leave existing_* empty to create a new private VPC + subnet) ---
+# By default (existing_vpc_id empty) the module creates a private VPC network
+# and a regional subnet (private_subnet_cidr) and attaches the Cloud Run
+# services to it via Direct VPC egress. Set both existing_* values to attach to
+# a bring-your-own network instead (a BYO VPC requires BYO subnets).
+# private_subnet_cidr = "10.8.0.0/24"
 # existing_vpc_id     = "projects/my-gcp-project/global/networks/my-vpc"
 # existing_subnet_ids = ["projects/my-gcp-project/regions/us-central1/subnetworks/my-subnet"]
 

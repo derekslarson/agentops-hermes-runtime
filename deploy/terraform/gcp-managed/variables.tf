@@ -104,13 +104,13 @@ variable "max_task_count" {
 # --- Bring-your-own-network --------------------------------------------------
 
 variable "existing_vpc_id" {
-  description = "Reuse an existing VPC network for Direct VPC egress (set together with existing_subnet_ids). When empty, services use Cloud Run default egress; creating a new private network is a documented parity gap (see README), not done here."
+  description = "Reuse an existing VPC network for Direct VPC egress (set together with existing_subnet_ids). When empty (default), the module creates a new private VPC network and the services attach to it via Direct VPC egress."
   type        = string
   default     = ""
 }
 
 variable "existing_subnet_ids" {
-  description = "Reuse existing subnet self-links for Direct VPC egress (set together with existing_vpc_id). When empty, services use Cloud Run default egress; creating new subnets is a documented parity gap (see README), not done here."
+  description = "Reuse existing subnet self-links for Direct VPC egress (set together with existing_vpc_id). When empty (default), the module creates a new regional subnet (private_subnet_cidr) on the module-created network."
   type        = list(string)
   default     = []
 
@@ -118,6 +118,12 @@ variable "existing_subnet_ids" {
     condition     = var.existing_vpc_id == "" || length(var.existing_subnet_ids) > 0
     error_message = "existing_subnet_ids must be provided when existing_vpc_id is set (Direct VPC egress requires at least one subnet self-link)."
   }
+}
+
+variable "private_subnet_cidr" {
+  description = "IPv4 CIDR range for the module-created private subnet (only used when no existing VPC/subnet is provided). Non-secret."
+  type        = string
+  default     = "10.8.0.0/24"
 }
 
 # --- Bring-your-own-managed-resource ----------------------------------------

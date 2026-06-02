@@ -246,18 +246,20 @@ def test_aws_subnet_docs_require_subnets_with_byo_vpc():
     assert "validation" in block
 
 
-def test_gcp_network_docs_match_parity_gap_no_new_network():
+def test_gcp_network_docs_describe_module_created_default():
     variables = _read(GCP_DIR / "variables.tf")
     vpc_block = _variable_block(variables, "existing_vpc_id")
     subnet_block = _variable_block(variables, "existing_subnet_ids")
 
-    # GCP does NOT create a new private network/subnets (README parity gap);
-    # the docs must not claim it does.
-    assert "creates a new one" not in vpc_block
-    assert "creates new subnets" not in subnet_block
-    for block in (vpc_block, subnet_block):
-        lowered = block.lower()
-        assert "default egress" in lowered or "parity" in lowered
+    # The module now CREATES a private network/subnet by default when no
+    # existing VPC is provided; the variable docs must say so and drop the old
+    # "default egress" / "not done here" parity-gap wording.
+    assert "creates" in vpc_block.lower()
+    assert "network" in vpc_block.lower()
+    assert "creates" in subnet_block.lower()
+    assert "subnet" in subnet_block.lower()
+    assert "default egress" not in variables.lower()
+    assert "not done here" not in variables.lower()
 
 
 def test_gcp_byo_vpc_requires_subnets_and_validation_is_documented():
@@ -284,6 +286,119 @@ def test_gcp_cross_variable_validation_requires_terraform_1_9_or_newer():
 
     assert "var.existing_vpc_id" in _variable_block(variables, "existing_subnet_ids")
     assert 'required_version = ">= 1.9"' in main
+
+
+# --- GCP module-created private network (default, no-BYO path) ---------------
+
+
+def test_gcp_creates_private_network_and_subnet_by_default():
+    # When no existing VPC is provided, the module must create its own private
+    # VPC network + regional subnet, gated to the no-BYO-network path.
+    main = _read(GCP_DIR / "main.tf")
+
+    net = _resource_block(main, "google_compute_network", "this")
+    assert net, "missing module-created google_compute_network.this"
+    assert "count" in net and "local.create_vpc" in net, "network not gated on create_vpc"
+    assert "auto_create_subnetworks = false" in net, "created VPC must own its subnets explicitly"
+
+    subnet = _resource_block(main, "google_compute_subnetwork", "this")
+    assert subnet, "missing module-created google_compute_subnetwork.this"
+    assert "count" in subnet and "local.create_vpc" in subnet, "subnet not gated on create_vpc"
+    assert "google_compute_network.this" in subnet, "subnet not attached to the created network"
+    assert "ip_cidr_range" in subnet, "subnet missing ip_cidr_range"
+    assert "var.region" in subnet, "subnet not regional to var.region"
+
+
+def test_gcp_create_vpc_local_gates_on_empty_existing_vpc():
+    main = _read(GCP_DIR / "main.tf")
+    create_local = next(
+        (ln for ln in main.splitlines() if ln.strip().startswith("create_vpc")),
+        "",
+    )
+    assert create_local, "missing create_vpc local"
+    assert 'var.existing_vpc_id == ""' in create_local
+
+
+def test_gcp_effective_network_resolves_created_or_byo():
+    # effective_vpc_id / effective_subnet_ids must resolve to the module-created
+    # network/subnet by default, and to the bring-your-own refs when provided.
+    main = _read(GCP_DIR / "main.tf")
+
+    vpc_local = next(
+        (ln for ln in main.splitlines() if ln.strip().startswith("effective_vpc_id")),
+        "",
+    )
+    assert vpc_local, "missing effective_vpc_id local"
+    assert "local.create_vpc" in vpc_local
+    assert "google_compute_network.this[0].id" in vpc_local
+    assert "var.existing_vpc_id" in vpc_local
+
+    subnet_local = next(
+        (ln for ln in main.splitlines() if ln.strip().startswith("effective_subnet_ids")),
+        "",
+    )
+    assert subnet_local, "missing effective_subnet_ids local"
+    assert "local.create_vpc" in subnet_local
+    assert "google_compute_subnetwork.this[0].id" in subnet_local
+    assert "var.existing_subnet_ids" in subnet_local
+
+
+def test_gcp_cloud_run_vpc_access_uses_effective_refs_for_all_services():
+    # Every Cloud Run service must attach to the EFFECTIVE network/subnet (the
+    # module-created one by default, BYO when provided), not only on the BYO
+    # path. The old BYO-only `byo_network` gate must be gone.
+    main = _read(GCP_DIR / "main.tf")
+    assert "byo_network" not in main, "stale BYO-only network gate still present"
+    for name in GCP_CLOUD_RUN_SERVICES:
+        block = _resource_block(main, "google_cloud_run_v2_service", name)
+        assert block, f"missing google_cloud_run_v2_service {name}"
+        assert "vpc_access" in block, f"{name} has no vpc_access block"
+        assert "local.effective_vpc_id" in block, f"{name} vpc_access ignores effective_vpc_id"
+        assert (
+            "local.effective_subnet_ids" in block
+        ), f"{name} vpc_access ignores effective_subnet_ids"
+
+
+def test_gcp_network_refs_output_indicates_module_created_or_byo():
+    outputs = _read(GCP_DIR / "outputs.tf")
+    assert 'output "network_refs"' in outputs
+    assert "local.effective_vpc_id" in outputs
+    assert "local.effective_subnet_ids" in outputs
+    # Surface whether module-created networking is in use vs. BYO refs.
+    assert "local.create_vpc" in outputs
+    assert "module_created" in outputs
+
+
+def test_gcp_byo_vpc_subnet_validation_is_preserved():
+    # Closing the new-network gap must not weaken the existing BYO guard: an
+    # existing_vpc_id still requires non-empty existing_subnet_ids.
+    variables = _read(GCP_DIR / "variables.tf")
+    subnet_block = _variable_block(variables, "existing_subnet_ids")
+    assert "validation" in subnet_block
+    assert "length(var.existing_subnet_ids) > 0" in subnet_block
+    assert "existing_subnet_ids must be provided when existing_vpc_id is set" in subnet_block
+
+
+def test_gcp_readme_drops_networking_creation_parity_gap():
+    readme = _read(GCP_DIR / "README.md")
+    lowered = readme.lower()
+    # The networking-creation gap is now closed: the module creates a private
+    # network/subnet by default, so the old "not yet wired" wording is gone.
+    assert "not yet wired" not in lowered, "networking-creation gap still listed"
+    assert "creates" in lowered and "network" in lowered
+    # Remaining honest gaps stay explicit.
+    assert "load balancer" in lowered
+    assert "dns" in lowered
+    assert "live" in lowered and "smoke" in lowered
+
+
+def test_gcp_secret_hygiene_preserved_after_network_wiring():
+    # The network slice must not introduce secret versions or raw secret inputs.
+    main = _read(GCP_DIR / "main.tf")
+    variables = _read(GCP_DIR / "variables.tf").lower()
+    assert "google_secret_manager_secret_version" not in main
+    for token in RAW_SECRET_TOKENS:
+        assert f'variable "{token}"' not in variables, token
 
 
 # --- honesty: apply path is not overstated while TODOs remain ---------------
@@ -1548,8 +1663,9 @@ def test_gcp_readme_drops_iam_parity_gap_keeps_remaining_gaps():
     assert "service account" in lowered
     assert "scoped" in lowered or "least" in lowered
 
-    # Remaining honest parity gaps stay explicit.
-    assert "private network" in lowered, "networking-creation gap dropped"
+    # Remaining honest parity gaps stay explicit. (Networking creation is now
+    # wired — see test_gcp_readme_drops_networking_creation_parity_gap — so it
+    # is no longer asserted as an open gap here.)
     assert "load balancer" in lowered, "load balancer/DNS gap dropped"
     assert "dns" in lowered, "DNS gap dropped"
     assert "live" in lowered and "smoke" in lowered, "live apply/smoke gap dropped"

@@ -36,13 +36,14 @@ locals {
   create_artifact_store = var.existing_artifact_bucket == ""
   create_database       = var.existing_database_arn == ""
 
-  # Bring-your-own-network: when an existing VPC + subnet are provided, the
-  # services attach to them via Direct VPC egress. Otherwise Cloud Run uses
-  # default egress (see README "Parity gaps" — creating a new private network /
-  # connector is not yet wired).
-  effective_vpc_id     = var.existing_vpc_id
-  effective_subnet_ids = var.existing_subnet_ids
-  byo_network          = var.existing_vpc_id != "" && length(var.existing_subnet_ids) > 0
+  # Networking: when no existing VPC is provided, the module creates its own
+  # private VPC network + regional subnet and the Cloud Run services attach to
+  # it via Direct VPC egress. When existing_vpc_id + existing_subnet_ids are
+  # provided, those bring-your-own refs are used instead. Either way the
+  # services always run with Direct VPC egress onto the effective network.
+  create_vpc           = var.existing_vpc_id == ""
+  effective_vpc_id     = local.create_vpc ? google_compute_network.this[0].id : var.existing_vpc_id
+  effective_subnet_ids = local.create_vpc ? [google_compute_subnetwork.this[0].id] : var.existing_subnet_ids
 
   # Secret CONTAINERS created here; raw values are written by bootstrap.
   secret_names = [
@@ -94,13 +95,10 @@ resource "google_cloud_run_v2_service" "control_plane" {
         }
       }
     }
-    dynamic "vpc_access" {
-      for_each = local.byo_network ? [1] : []
-      content {
-        network_interfaces {
-          network    = local.effective_vpc_id
-          subnetwork = local.effective_subnet_ids[0]
-        }
+    vpc_access {
+      network_interfaces {
+        network    = local.effective_vpc_id
+        subnetwork = local.effective_subnet_ids[0]
       }
     }
   }
@@ -130,13 +128,10 @@ resource "google_cloud_run_v2_service" "worker" {
         value = tostring(var.max_concurrent_runs)
       }
     }
-    dynamic "vpc_access" {
-      for_each = local.byo_network ? [1] : []
-      content {
-        network_interfaces {
-          network    = local.effective_vpc_id
-          subnetwork = local.effective_subnet_ids[0]
-        }
+    vpc_access {
+      network_interfaces {
+        network    = local.effective_vpc_id
+        subnetwork = local.effective_subnet_ids[0]
       }
     }
   }
@@ -158,16 +153,30 @@ resource "google_cloud_run_v2_service" "scheduler" {
         }
       }
     }
-    dynamic "vpc_access" {
-      for_each = local.byo_network ? [1] : []
-      content {
-        network_interfaces {
-          network    = local.effective_vpc_id
-          subnetwork = local.effective_subnet_ids[0]
-        }
+    vpc_access {
+      network_interfaces {
+        network    = local.effective_vpc_id
+        subnetwork = local.effective_subnet_ids[0]
       }
     }
   }
+}
+
+# Private network — created by default when no existing VPC is provided. The
+# Cloud Run services attach to it via Direct VPC egress (see the vpc_access
+# blocks above). Bring-your-own VPC/subnet refs replace these when supplied.
+resource "google_compute_network" "this" {
+  count                   = local.create_vpc ? 1 : 0
+  name                    = "${local.prefix}-vpc"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "this" {
+  count         = local.create_vpc ? 1 : 0
+  name          = "${local.prefix}-subnet"
+  region        = var.region
+  network       = google_compute_network.this[0].id
+  ip_cidr_range = var.private_subnet_cidr
 }
 
 # Managed Postgres (Cloud SQL).
