@@ -56,6 +56,7 @@ def test_compose_services_use_agentops_runtime_profile_and_backend_refs():
         assert "AGENTOPS_QUEUE_URL=" in env
         assert "AGENTOPS_ARTIFACT_ENDPOINT=" in env
         assert "AGENTOPS_SECRET_STORE_URL=" in env
+        assert "AGENTOPS_API_URL=http://api:8710" in env
 
 
 def test_compose_profile_documents_scale_and_smoke_commands_without_raw_secrets():

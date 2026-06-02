@@ -15,6 +15,7 @@ services:
       - AGENTOPS_ARTIFACT_ENDPOINT=http://minio:9000
       - AGENTOPS_ARTIFACT_BUCKET=${AGENTOPS_ARTIFACT_BUCKET:-agentops-artifacts}
       - AGENTOPS_SECRET_STORE_URL=http://local-secrets:8713
+      - AGENTOPS_API_URL=http://api:8710
     depends_on:
       postgres:
         condition: service_healthy
@@ -45,6 +46,7 @@ services:
       - AGENTOPS_ARTIFACT_ENDPOINT=http://minio:9000
       - AGENTOPS_ARTIFACT_BUCKET=${AGENTOPS_ARTIFACT_BUCKET:-agentops-artifacts}
       - AGENTOPS_SECRET_STORE_URL=http://local-secrets:8713
+      - AGENTOPS_API_URL=http://api:8710
       - AGENTOPS_WORKER_MAX_CONCURRENT_RUNS=${AGENTOPS_WORKER_MAX_CONCURRENT_RUNS:-2}
     depends_on:
       api:
@@ -72,6 +74,7 @@ services:
       - AGENTOPS_ARTIFACT_ENDPOINT=http://minio:9000
       - AGENTOPS_ARTIFACT_BUCKET=${AGENTOPS_ARTIFACT_BUCKET:-agentops-artifacts}
       - AGENTOPS_SECRET_STORE_URL=http://local-secrets:8713
+      - AGENTOPS_API_URL=http://api:8710
     depends_on:
       api:
         condition: service_healthy
@@ -140,6 +143,7 @@ services:
       - AGENTOPS_QUEUE_URL=redis://redis:6379/0
       - AGENTOPS_ARTIFACT_ENDPOINT=http://minio:9000
       - AGENTOPS_SECRET_STORE_URL=http://local-secrets:8713
+      - AGENTOPS_API_URL=http://api:8710
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8713/healthz', timeout=2).read()"]
       interval: 10s

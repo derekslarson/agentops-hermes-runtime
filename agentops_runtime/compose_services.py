@@ -17,6 +17,9 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+from agent.runtime_backends import RuntimeBackendRegistry
+from agentops_runtime.compose_backends import configure_compose_runtime_backends
+
 _SERVICE_PORTS = {
     "api": 8710,
     "worker": 8711,
@@ -45,6 +48,14 @@ def _health_payload(service: str) -> dict[str, Any]:
     }
     if service == "worker":
         payload["max_concurrent_runs"] = int(os.getenv("AGENTOPS_WORKER_MAX_CONCURRENT_RUNS", "1"))
+    if service in {"api", "worker", "scheduler"}:
+        try:
+            configure_compose_runtime_backends(RuntimeBackendRegistry(), environ=dict(os.environ))
+            payload["compose_backends_configured"] = True
+        except Exception as exc:  # noqa: BLE001 - fail closed on any wiring error
+            payload["ok"] = False
+            payload["compose_backends_configured"] = False
+            payload["backend_error"] = str(exc)
     return payload
 
 
