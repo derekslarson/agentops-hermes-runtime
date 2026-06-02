@@ -1,0 +1,29 @@
+# AgentOps Hermes Runtime — AWS managed profile example settings.
+# Copy to terraform.tfvars and edit account/region/domain/capacity values.
+#
+# NOTE: There are intentionally NO raw app/integration secret values here.
+# Terraform only creates empty secret containers; bootstrap writes the real
+# Slack/GitHub/Linear/Jira/model-provider values directly into the secret
+# backend after apply. Keeping raw values out of tfvars keeps them out of
+# Terraform/OpenTofu state.
+
+name_prefix = "agentops"
+region      = "us-east-1"
+domain      = "agentops.example.com"
+
+# Capacity.
+desired_task_count  = 2
+max_concurrent_runs = 2
+min_task_count      = 1
+max_task_count      = 10
+
+db_instance_class = "db.t4g.medium"
+
+# --- Bring-your-own-network (leave empty to create new) ---------------------
+# existing_vpc_id     = "vpc-0123456789abcdef0"
+# existing_subnet_ids = ["subnet-aaa", "subnet-bbb"]
+
+# --- Bring-your-own-managed-resource (leave empty to create new) ------------
+# existing_database_arn    = "arn:aws:rds:us-east-1:123456789012:db:my-postgres"
+# existing_artifact_bucket = "my-existing-artifacts-bucket"
+# existing_secret_prefix   = "myorg/agentops"

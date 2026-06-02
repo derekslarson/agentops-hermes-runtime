@@ -1,0 +1,27 @@
+# AgentOps Hermes Runtime — GCP managed profile example settings.
+# Copy to terraform.tfvars and edit project/region/domain/capacity values.
+#
+# NOTE: There are intentionally NO raw app/integration secret values here.
+# Terraform only creates empty Secret Manager containers; bootstrap writes the
+# real Slack/GitHub/Linear/Jira/model-provider values into the secret backend
+# after apply, keeping raw values out of Terraform/OpenTofu state.
+
+name_prefix = "agentops"
+project     = "my-gcp-project"
+region      = "us-central1"
+domain      = "agentops.example.com"
+
+# Capacity.
+desired_task_count  = 2
+max_concurrent_runs = 2
+min_task_count      = 1
+max_task_count      = 10
+
+# --- Bring-your-own-network (leave empty to create new) ---------------------
+# existing_vpc_id     = "projects/my-gcp-project/global/networks/my-vpc"
+# existing_subnet_ids = ["projects/my-gcp-project/regions/us-central1/subnetworks/my-subnet"]
+
+# --- Bring-your-own-managed-resource (leave empty to create new) ------------
+# existing_database_arn    = "my-gcp-project:us-central1:my-postgres"
+# existing_artifact_bucket = "my-existing-artifacts-bucket"
+# existing_secret_prefix   = "myorg-agentops"
