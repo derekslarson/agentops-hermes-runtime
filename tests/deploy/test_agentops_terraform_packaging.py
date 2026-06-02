@@ -4422,6 +4422,36 @@ def test_gcp_smoke_cleanup_removes_only_working_artifacts_after_plan_only(tmp_pa
     _assert_cleanup_removes_only_working_artifacts(tmp_path, GCP_SMOKE_SCRIPT)
 
 
+def _assert_cleanup_removes_conventional_plan_output(tmp_path: Path, script_path: Path) -> None:
+    # `terraform plan -out=tfplan` / `tofu plan -out=tfplan` is the canonical plan
+    # output in Terraform/OpenTofu docs and CI, producing a file literally named
+    # `tfplan` with NO extension. The cleanup's `*.tfplan` glob only matches names
+    # with a dot before `tfplan` (e.g. run.tfplan), so a bare `tfplan` plan binary
+    # survives even though the cleanup advertises removing "plan" artifacts.
+    mod = _setup_cleanup_module(tmp_path, script_path)
+    (mod / "tfplan").write_text("artifact", encoding="utf-8")
+    bin_dir = _make_artifact_cleanup_stub_bin(tmp_path)
+    result = _run_cleanup_smoke(mod, bin_dir, script_path, clean="1", with_required_inputs=True)
+    assert result.returncode == 0, (
+        f"plan-only smoke with CLEAN_TERRAFORM_ARTIFACTS=1 failed "
+        f"(stdout={result.stdout!r} stderr={result.stderr!r})"
+    )
+    assert not (mod / "tfplan").exists(), (
+        "cleanup did not remove the conventional extensionless `tfplan` plan output"
+    )
+    # Preserved files must still survive this run.
+    for fname in CLEANUP_PRESERVED_FILES:
+        assert (mod / fname).exists(), f"cleanup wrongly removed preserved file {fname}"
+
+
+def test_aws_smoke_cleanup_removes_conventional_plan_output(tmp_path):
+    _assert_cleanup_removes_conventional_plan_output(tmp_path, SMOKE_SCRIPT)
+
+
+def test_gcp_smoke_cleanup_removes_conventional_plan_output(tmp_path):
+    _assert_cleanup_removes_conventional_plan_output(tmp_path, GCP_SMOKE_SCRIPT)
+
+
 def _assert_cleanup_default_off_preserves_artifacts(tmp_path: Path, script_path: Path) -> None:
     mod = _setup_cleanup_module(tmp_path, script_path)
     bin_dir = _make_artifact_cleanup_stub_bin(tmp_path)

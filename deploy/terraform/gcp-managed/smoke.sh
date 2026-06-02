@@ -131,7 +131,7 @@ fi
 # transcript). No raw app/integration secret values are involved.
 clean_terraform_artifacts() {
   rm -rf .terraform
-  rm -f .terraform.lock.hcl ./*.tfstate ./*.tfstate.* ./*.tfplan crash.log crash.*.log
+  rm -f .terraform.lock.hcl ./*.tfstate ./*.tfstate.* ./*.tfplan ./tfplan crash.log crash.*.log
   echo "CLEAN_TERRAFORM_ARTIFACTS=1 — removed local Terraform/OpenTofu working artifacts (.terraform/, lock, state/plan/crash)." >&2
 }
 
