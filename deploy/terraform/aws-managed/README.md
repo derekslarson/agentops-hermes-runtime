@@ -37,12 +37,31 @@ production-finished install.
 >   the default apply is reachable. With a **bring-your-own VPC** you must supply
 >   at least two **public** subnets via `existing_alb_subnet_ids`; the module does
 >   not add public routing to a VPC it did not create.
-> - **Custom DNS** — pointing `domain` at the ALB (e.g. a Route53 alias record)
->   is not created here; URLs derive from the ALB DNS name, not `domain`.
-> - **TLS/ACM** — the listener is HTTP-only (port 80). HTTPS needs an ACM
->   certificate and a 443 listener.
+> - **Custom DNS / TLS (optional)** — by default URLs derive from the ALB DNS
+>   name over HTTP. You can opt into a custom-domain HTTPS path with the optional
+>   `acm_certificate_arn` and `route53_zone_id` inputs (see **Optional
+>   custom-domain HTTPS** below); leaving them empty keeps the ALB-HTTP default.
 > - **Applied smoke test** — no end-to-end `apply` against a live AWS account has
 >   been run/verified in this slice; treat the first real apply as the smoke test.
+
+## Optional custom-domain HTTPS
+
+The default path serves the API over **HTTP** at the ALB DNS name. To serve a
+custom domain over **HTTPS**, set these two **optional**, non-secret inputs:
+
+- `acm_certificate_arn` — an ACM certificate ARN for `domain`. When set, the
+  module adds an **HTTPS listener on 443** to the existing ALB (terminating TLS
+  with your certificate and forwarding to the same API target group), opens 443
+  on the ALB security group, and the `agentops_api_url` output flips to
+  `https://<domain>`. This is a certificate **reference**, not a secret value.
+- `route53_zone_id` — a Route53 hosted zone id for `domain`. When set, the module
+  creates an **alias record** pointing `domain` at the ALB DNS/zone.
+
+Leave both empty (the default) to stay on the ALB-DNS HTTP path. The raw ALB HTTP
+URL is always available via the `alb_http_url` output regardless of these inputs.
+The effective `agentops_api_url`, `bootstrap_url`, and webhook URLs derive from
+the HTTPS custom domain when a certificate is configured, otherwise from the ALB
+HTTP URL.
 
 All commands run from inside this module directory. With Terraform:
 
@@ -108,7 +127,8 @@ outputs. Do not put raw app/integration secret values in `terraform.tfvars`.
 
 After apply, `terraform output` (or `tofu output`) surfaces:
 
-- `agentops_api_url`, `bootstrap_url`, `bootstrap_token_secret_ref`
+- `agentops_api_url` (effective — HTTPS custom domain when configured, else ALB HTTP), `alb_http_url` (raw ALB HTTP URL)
+- `bootstrap_url`, `bootstrap_token_secret_ref`
 - `slack_webhook_url`, `github_webhook_url`, `linear_webhook_url`, `jira_webhook_url`
 - `secret_refs`, `queue_refs`, `artifact_refs`
 - `database_refs`, `network_refs`
@@ -126,7 +146,9 @@ control-plane with a public ALB (target group + HTTP listener on
 `api_container_port`). When the module creates the VPC it also creates public ALB
 subnets with an Internet Gateway and a public default route, so a default apply
 stands up an internet-facing ALB; a bring-your-own VPC instead supplies its own
-public/edge subnets via `existing_alb_subnet_ids`. Custom DNS for `domain`,
-TLS/ACM (the listener is HTTP-only), and an applied end-to-end smoke test remain
-deferred and require site-specific values; fill those in for a
-production-complete deployment.
+public/edge subnets via `existing_alb_subnet_ids`. Custom-domain HTTPS is
+**optional**: supply `acm_certificate_arn` (adds a 443 HTTPS/TLS listener) and/or
+`route53_zone_id` (aliases `domain` at the ALB); with both empty the deployment
+stays on the ALB-DNS HTTP path. An applied end-to-end smoke test against a live
+AWS account remains deferred and requires site-specific values; fill that in for
+a production-complete deployment.

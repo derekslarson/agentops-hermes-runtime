@@ -753,3 +753,155 @@ def test_readmes_use_module_local_commands_not_root_relative_paths():
 
         # No root-relative -chdir hacks that break when run from the module dir.
         assert "-chdir=deploy/terraform" not in readme
+
+
+# --- AWS optional custom-domain HTTPS/TLS (M15 slice) -----------------------
+#
+# The default path stays ALB-DNS HTTP. Optionally a customer supplies an ACM
+# certificate ARN (→ HTTPS listener on 443) and/or a Route53 hosted zone (→ alias
+# record pointing the custom domain at the ALB). These are non-secret inputs; raw
+# app/integration secret values still belong to bootstrap, not Terraform.
+
+
+def _output_block(text: str, name: str) -> str:
+    import re
+
+    match = re.search(
+        r'output "' + re.escape(name) + r'".*?(?=\noutput "|\Z)',
+        text,
+        re.DOTALL,
+    )
+    return match.group(0) if match else ""
+
+
+def test_aws_variables_expose_optional_tls_dns_inputs():
+    variables = _read(AWS_DIR / "variables.tf")
+    for var_name in ("acm_certificate_arn", "route53_zone_id"):
+        block = _variable_block(variables, var_name)
+        assert block, f"missing optional TLS/DNS variable {var_name}"
+        # Optional: empty-string default keeps the default ALB-HTTP path intact.
+        assert 'default     = ""' in block or 'default = ""' in block, f"{var_name} is not optional (no empty default)"
+        # Not a secret value.
+        lowered = block.lower()
+        for token in RAW_SECRET_TOKENS:
+            assert token not in lowered, f"{token} leaked into {var_name}"
+
+
+def test_aws_https_listener_created_only_when_certificate_provided():
+    main = _read(AWS_DIR / "main.tf")
+    listener = _resource_block(main, "aws_lb_listener", "api_https")
+    assert listener, "missing aws_lb_listener api_https"
+
+    # Gated on a certificate being supplied (default empty → no HTTPS listener).
+    assert 'var.acm_certificate_arn != ""' in listener, "HTTPS listener is not gated on the certificate ARN"
+    assert "count" in listener, "HTTPS listener is not conditional"
+
+    # HTTPS on 443 using the supplied certificate, reusing the existing ALB.
+    assert "443" in listener
+    assert '"HTTPS"' in listener
+    assert "var.acm_certificate_arn" in listener, "listener does not use the certificate ARN"
+    assert "aws_lb.this.arn" in listener, "HTTPS listener not bound to the existing ALB"
+
+    # Forwards to the SAME existing API target group as the HTTP listener.
+    assert "aws_lb_target_group.api.arn" in listener, "HTTPS listener does not forward to the api target group"
+
+
+def test_aws_alb_security_group_allows_https_when_certificate_provided():
+    main = _read(AWS_DIR / "main.tf")
+    sg = _resource_block(main, "aws_security_group", "alb")
+    assert sg, "missing aws_security_group alb"
+    # HTTPS ingress (443) is opened only when a certificate is supplied.
+    assert "443" in sg, "ALB security group does not allow HTTPS (443)"
+    assert 'var.acm_certificate_arn != ""' in sg, "443 ingress is not gated on the certificate ARN"
+
+
+def test_aws_route53_alias_record_created_only_when_zone_provided():
+    main = _read(AWS_DIR / "main.tf")
+    record = _resource_block(main, "aws_route53_record", "api")
+    assert record, "missing aws_route53_record api"
+
+    # Gated on a hosted zone being supplied (default empty → no DNS record).
+    assert 'var.route53_zone_id != ""' in record, "DNS record is not gated on the hosted zone id"
+    assert "count" in record, "DNS record is not conditional"
+
+    # Alias record pointing the custom domain at the ALB DNS/zone.
+    assert "var.route53_zone_id" in record, "record does not use the hosted zone id"
+    assert "var.domain" in record, "record does not point the custom domain"
+    assert "alias" in record, "record is not an ALB alias record"
+    assert "aws_lb.this.dns_name" in record, "alias does not target the ALB DNS name"
+    assert "aws_lb.this.zone_id" in record, "alias does not target the ALB hosted zone id"
+
+
+def test_aws_http_listener_remains_unconditional_default_path():
+    main = _read(AWS_DIR / "main.tf")
+    http = _resource_block(main, "aws_lb_listener", "api")
+    assert http, "missing default HTTP listener"
+    # The default ALB-DNS HTTP path is preserved: the port-80 listener is not
+    # made conditional on TLS/DNS being configured.
+    assert "80" in http
+    assert '"HTTP"' in http
+    assert "count" not in http, "the default HTTP listener must stay unconditional"
+
+
+def test_aws_outputs_expose_both_alb_http_and_effective_api_url():
+    outputs = _read(AWS_DIR / "outputs.tf")
+
+    # The raw ALB HTTP URL is always exposed.
+    assert 'output "alb_http_url"' in outputs, "missing alb_http_url output"
+    assert "aws_lb.this.dns_name" in outputs
+
+    # The effective API URL is the custom HTTPS URL when a certificate is
+    # configured, otherwise the ALB HTTP URL.
+    assert "var.acm_certificate_arn" in outputs, "effective API URL is not conditioned on the certificate"
+    assert "https://${var.domain}" in outputs, "effective API URL is not the custom HTTPS domain URL when configured"
+
+    # agentops_api_url surfaces the effective URL.
+    api_url = _output_block(outputs, "agentops_api_url")
+    assert "local.api_base_url" in api_url, "agentops_api_url does not surface the effective base URL"
+
+
+def test_aws_bootstrap_and_webhook_urls_derive_from_effective_api_url():
+    outputs = _read(AWS_DIR / "outputs.tf")
+    for out in (
+        "bootstrap_url",
+        "slack_webhook_url",
+        "github_webhook_url",
+        "linear_webhook_url",
+        "jira_webhook_url",
+    ):
+        block = _output_block(outputs, out)
+        assert block, f"missing output {out}"
+        assert "local.api_base_url" in block, f"{out} does not derive from the effective API base URL"
+
+
+def test_aws_smoke_hints_stay_honest_about_optional_dns_tls():
+    outputs = _read(AWS_DIR / "outputs.tf")
+    hints = _output_block(outputs, "smoke_test_hints").lower()
+    assert hints, "missing smoke_test_hints output"
+    # DNS/TLS is optional, and a live apply/smoke is still pending.
+    assert "optional" in hints, "smoke hints do not flag DNS/TLS as optional"
+    assert "https" in hints or "tls" in hints or "acm" in hints
+    assert "dns" in hints
+
+
+def test_aws_readme_documents_optional_tls_dns_path():
+    readme = _read(AWS_DIR / "README.md")
+    lowered = readme.lower()
+    # Both optional knobs are documented by name.
+    assert "acm_certificate_arn" in readme, "README does not document acm_certificate_arn"
+    assert "route53_zone_id" in readme, "README does not document route53_zone_id"
+    # The default path is still ALB-DNS HTTP; HTTPS is opt-in.
+    assert "optional" in lowered
+    assert "https" in lowered
+    # Raw secrets remain a bootstrap concern, not Terraform inputs.
+    assert "bootstrap" in lowered
+    assert "raw" in lowered
+
+
+def test_tfvars_example_documents_optional_tls_dns():
+    tfvars = _read(AWS_DIR / "terraform.tfvars.example")
+    assert "acm_certificate_arn" in tfvars, "tfvars example does not surface acm_certificate_arn"
+    assert "route53_zone_id" in tfvars, "tfvars example does not surface route53_zone_id"
+    # These stay commented/optional so the default apply is ALB-HTTP.
+    lowered = tfvars.lower()
+    assert "optional" in lowered or "https" in lowered, "tfvars does not explain the optional HTTPS path"

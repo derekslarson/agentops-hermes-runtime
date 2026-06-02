@@ -32,6 +32,25 @@ variable "tags" {
   default     = {}
 }
 
+# --- Optional custom-domain HTTPS / TLS --------------------------------------
+#
+# Both are OPTIONAL and non-secret. Leaving them empty (the default) keeps the
+# ALB-DNS HTTP path: the public ALB serves on port 80 and URLs derive from the
+# ALB DNS name. Supplying them opts into a custom-domain HTTPS path without
+# changing the default behavior.
+
+variable "acm_certificate_arn" {
+  description = "Optional ACM certificate ARN for the custom domain. When set, an HTTPS listener on 443 is added to the existing ALB (forwarding to the same API target group). Empty keeps the HTTP-only default. This is a certificate REFERENCE, not a secret value."
+  type        = string
+  default     = ""
+}
+
+variable "route53_zone_id" {
+  description = "Optional Route53 hosted zone id for var.domain. When set, an alias record pointing var.domain at the ALB is created. Empty leaves DNS for you to wire manually. Not a secret value."
+  type        = string
+  default     = ""
+}
+
 # --- Container images --------------------------------------------------------
 #
 # Customer-supplied runtime container images for each service. Defaults are

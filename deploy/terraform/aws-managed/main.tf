@@ -19,10 +19,10 @@
 # this module creates the VPC it also creates PUBLIC ALB subnets with public
 # routing (IGW + default route), so a default apply can stand up an
 # internet-facing ALB. A bring-your-own VPC must instead supply public/edge
-# subnets via var.existing_alb_subnet_ids. Custom DNS (Route53) + TLS/ACM for
-# var.domain and an applied end-to-end smoke test remain deferred and need
-# site-specific values; see the README "Scope" / "Apply" sections for the honest
-# remaining gaps.
+# subnets via var.existing_alb_subnet_ids. Optional custom DNS (Route53) and
+# TLS/ACM for var.domain are wired when their non-secret refs are supplied, but a
+# live applied end-to-end smoke test remains deferred and needs site-specific
+# values; see the README "Scope" / "Apply" sections for the honest remaining gap.
 ###############################################################################
 
 terraform {
@@ -316,14 +316,14 @@ resource "aws_secretsmanager_secret" "containers" {
   tags     = local.common_tags
 }
 
-# --- Public ingress (ALB + target group + HTTP listener) --------------------
+# --- Public ingress (ALB + target group + listeners) ------------------------
 #
 # A public Application Load Balancer fronts the API / control-plane service. It
 # attaches to local.effective_alb_subnet_ids: the module-created public ALB
 # subnets (IGW + public route) by default, or the bring-your-own public/edge
-# subnets in var.existing_alb_subnet_ids. The listener is HTTP only: TLS/ACM and
-# custom DNS (Route53) for var.domain are deferred (site-specific), so URLs
-# derive from the ALB DNS name over HTTP until those are wired.
+# subnets in var.existing_alb_subnet_ids. The default listener is HTTP on port
+# 80; optional custom-domain HTTPS/TLS and Route53 DNS are wired below and stay
+# disabled unless the corresponding non-secret refs are supplied.
 
 resource "aws_security_group" "alb" {
   name        = "${local.prefix}-alb"
@@ -336,6 +336,20 @@ resource "aws_security_group" "alb" {
     to_port     = 80
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  # HTTPS is opened only when a custom-domain certificate is supplied (the HTTPS
+  # listener below is gated the same way), so the default HTTP-only path does not
+  # expose a 443 port with no listener behind it.
+  dynamic "ingress" {
+    for_each = var.acm_certificate_arn != "" ? [1] : []
+    content {
+      description = "HTTPS from the internet"
+      from_port   = 443
+      to_port     = 443
+      protocol    = "tcp"
+      cidr_blocks = ["0.0.0.0/0"]
+    }
   }
 
   egress {
@@ -407,6 +421,43 @@ resource "aws_lb_listener" "api" {
   }
 
   tags = local.common_tags
+}
+
+# --- Optional custom-domain HTTPS / TLS -------------------------------------
+#
+# When var.acm_certificate_arn is supplied, add an HTTPS listener on 443 to the
+# SAME ALB, terminating TLS with the customer's ACM certificate and forwarding to
+# the SAME API target group as the HTTP listener. When var.route53_zone_id is
+# supplied, an alias record points var.domain at the ALB. Both are optional: with
+# them empty the module stays on the ALB-DNS HTTP default path.
+
+resource "aws_lb_listener" "api_https" {
+  count             = var.acm_certificate_arn != "" ? 1 : 0
+  load_balancer_arn = aws_lb.this.arn
+  port              = 443
+  protocol          = "HTTPS"
+  ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+  certificate_arn   = var.acm_certificate_arn
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.api.arn
+  }
+
+  tags = local.common_tags
+}
+
+resource "aws_route53_record" "api" {
+  count   = var.route53_zone_id != "" ? 1 : 0
+  zone_id = var.route53_zone_id
+  name    = var.domain
+  type    = "A"
+
+  alias {
+    name                   = aws_lb.this.dns_name
+    zone_id                = aws_lb.this.zone_id
+    evaluate_target_health = true
+  }
 }
 
 # --- ECS cluster + services --------------------------------------------------
