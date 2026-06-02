@@ -158,6 +158,11 @@ files outside this module.
 DRY_RUN=0 WRITE_TFVARS=1 AWS_REGION=us-east-1 ./publish-images.sh   # also writes image.auto.tfvars
 ```
 
+`DRY_RUN` and `WRITE_TFVARS` accept only 0 or 1; any other value is rejected with
+a clear non-secret error naming the variable and the helper fails closed
+**before any side effect** (before the `aws`/`docker` prerequisite checks, ECR
+login, build, or push).
+
 ## Live-smoke helper (`smoke.sh`)
 
 `smoke.sh` is a module-local helper that an operator runs from inside this
@@ -255,6 +260,12 @@ transcript). It involves no raw app/integration secret values.
 ```bash
 CLEAN_TERRAFORM_ARTIFACTS=1 ./smoke.sh   # plan-only, then remove local Terraform/OpenTofu scratch
 ```
+
+Each of these boolean flags — `PLAN_ONLY`, `DESTROY_ON_FAILURE`, and
+`CLEAN_TERRAFORM_ARTIFACTS` — accepts only 0 or 1. Any other value (a typo like
+`PLAN_ONLY=2` or `DESTROY_ON_FAILURE=yes`) is rejected with a clear non-secret
+error naming the variable, and the helper fails closed **before any side effect**
+(before the CLI/credential checks, `init`, or creating `.terraform/`).
 
 ## Bring your own network / managed resources
 

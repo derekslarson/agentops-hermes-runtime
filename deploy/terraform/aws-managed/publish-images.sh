@@ -40,15 +40,32 @@ set -euo pipefail
 # root-relative -chdir).
 cd "$(dirname "$0")"
 
-DRY_RUN="${DRY_RUN:-1}"
+DRY_RUN="${DRY_RUN-1}"
 
 # Opt-in, non-secret image tfvars writer. With WRITE_TFVARS=1 on the live path
 # (DRY_RUN=0) the three image assignments are also written to a module-local
 # tfvars override (default image.auto.tfvars) so operators need not hand-copy
 # them before a PLAN_ONLY=0 ./smoke.sh apply. Off by default; never writes in
 # dry-run.
-WRITE_TFVARS="${WRITE_TFVARS:-0}"
+WRITE_TFVARS="${WRITE_TFVARS-0}"
 IMAGE_TFVARS_PATH="${IMAGE_TFVARS_PATH:-image.auto.tfvars}"
+
+# --- validate boolean-ish safety flags (fail closed before any side effect) --
+# DRY_RUN and WRITE_TFVARS must each be exactly 0 or 1. A typo (DRY_RUN=true) must
+# not be silently coerced into an unsafe path, so reject anything else with a
+# clear non-secret error naming the variable BEFORE any aws/docker side effect or
+# live prerequisite command runs.
+require_boolean_flag() {
+  case "$2" in
+    0|1) ;;
+    *)
+      echo "error: $1 must be 0 or 1" >&2
+      exit 1
+      ;;
+  esac
+}
+require_boolean_flag DRY_RUN "$DRY_RUN"
+require_boolean_flag WRITE_TFVARS "$WRITE_TFVARS"
 
 IMAGE_TAG="${IMAGE_TAG:-$(date -u +%Y%m%d%H%M%S)}"
 AWS_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"

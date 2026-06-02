@@ -2691,7 +2691,7 @@ def test_publish_image_helpers_dry_run_by_default():
     for script in (AWS_PUBLISH_SCRIPT, GCP_PUBLISH_SCRIPT):
         text = _read(script)
         # DRY_RUN defaults to 1 — side-effect-safe unless explicitly opted out.
-        assert 'DRY_RUN="${DRY_RUN:-1}"' in text, (
+        assert 'DRY_RUN="${DRY_RUN-1}"' in text, (
             f"{script.parent.name}/publish-images.sh does not default DRY_RUN to 1"
         )
 
@@ -3341,7 +3341,7 @@ def test_publish_helpers_default_write_tfvars_off_and_image_path():
         text = _read(script)
         name = script.parent.name
         # Opt-in: WRITE_TFVARS defaults to 0 (off).
-        assert 'WRITE_TFVARS="${WRITE_TFVARS:-0}"' in text, (
+        assert 'WRITE_TFVARS="${WRITE_TFVARS-0}"' in text, (
             f"{name}: publish-images.sh does not default WRITE_TFVARS to 0"
         )
         # Default output path is the module-local image.auto.tfvars, overridable.
@@ -4268,7 +4268,7 @@ def _assert_smoke_artifact_cleanup_static(script_path: Path) -> None:
 
     # Opt-in via CLEAN_TERRAFORM_ARTIFACTS, defaulting OFF.
     assert (
-        'CLEAN_TERRAFORM_ARTIFACTS="${CLEAN_TERRAFORM_ARTIFACTS:-0}"' in text
+        'CLEAN_TERRAFORM_ARTIFACTS="${CLEAN_TERRAFORM_ARTIFACTS-0}"' in text
     ), f"{name}: smoke.sh does not default CLEAN_TERRAFORM_ARTIFACTS off"
 
     region = _cleanup_region(text)
@@ -4510,4 +4510,248 @@ def test_readmes_document_artifact_cleanup_option_default_off():
         )
         assert "plan-only" in lowered or "plan only" in lowered, (
             f"{module_dir.name}: live-smoke section does not tie the cleanup to the plan-only path"
+        )
+
+
+# --- boolean-ish safety flag validation (M15 hardening slice) ---------------
+#
+# The managed-cloud helper scripts gate real cloud/docker/terraform side effects
+# behind boolean-ish env flags (smoke.sh: PLAN_ONLY / DESTROY_ON_FAILURE /
+# CLEAN_TERRAFORM_ARTIFACTS; publish-images.sh: DRY_RUN / WRITE_TFVARS, plus
+# CREATE_REPO for gcp). A typo like PLAN_ONLY=2 or DRY_RUN=true must not be
+# silently coerced into an unsafe path: each flag must be exactly 0 or 1, and an
+# invalid value must fail closed with a clear non-secret error naming the variable
+# BEFORE any terraform/tofu/aws/gcloud/docker/curl side effect (and before
+# .terraform/ is created). Valid values keep their existing semantics, which the
+# plan-only / apply / cleanup / dry-run behavior tests above already exercise.
+
+SMOKE_BOOLEAN_FLAGS = ("PLAN_ONLY", "DESTROY_ON_FAILURE", "CLEAN_TERRAFORM_ARTIFACTS")
+AWS_PUBLISH_BOOLEAN_FLAGS = ("DRY_RUN", "WRITE_TFVARS")
+GCP_PUBLISH_BOOLEAN_FLAGS = ("DRY_RUN", "WRITE_TFVARS", "CREATE_REPO")
+
+
+def _smoke_first_side_effect_index(text: str) -> int:
+    # The earliest point smoke.sh actually invokes an external tool: the
+    # AWS/gcloud credential/auth probe, or the first Terraform/OpenTofu
+    # `-input=false` command. Whichever comes first bounds "before any side effect".
+    candidates = [
+        text.find("get-caller-identity"),
+        text.find("gcloud auth"),
+        text.find("-input=false"),
+    ]
+    present = [i for i in candidates if i != -1]
+    return min(present) if present else -1
+
+
+def test_smoke_scripts_validate_boolean_flags_before_side_effects():
+    for script in (SMOKE_SCRIPT, GCP_SMOKE_SCRIPT):
+        text = _read(script)
+        name = script.parent.name
+        first_side_effect = _smoke_first_side_effect_index(text)
+        assert first_side_effect != -1, f"{name}: smoke.sh never invokes an external tool"
+
+        # A clear, non-secret 0/1 validation error exists before any side effect.
+        err_idx = text.find("must be 0 or 1")
+        assert err_idx != -1, f"{name}: smoke.sh has no boolean-flag 0/1 validation"
+        assert err_idx < first_side_effect, (
+            f"{name}: boolean-flag validation runs after the first side effect"
+        )
+
+        # Fails closed (non-zero) on an invalid value before any side effect.
+        fail_idx = text.find("exit 1", err_idx)
+        assert fail_idx != -1 and fail_idx < first_side_effect, (
+            f"{name}: boolean-flag validation does not fail closed (exit 1) before a side effect"
+        )
+
+
+def test_smoke_boolean_flag_validation_does_not_reference_raw_secrets():
+    for script in (SMOKE_SCRIPT, GCP_SMOKE_SCRIPT):
+        lowered = _read(script).lower()
+        for token in RAW_SECRET_TOKENS:
+            assert token not in lowered, f"{token} referenced in {script.parent.name}/smoke.sh"
+
+
+def _run_smoke_with_invalid_boolean_flag(
+    base: Path, module_dir: Path, flag_env: dict[str, str]
+) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+    module_copy = base / module_dir.name
+    shutil.copytree(
+        module_dir,
+        module_copy,
+        ignore=shutil.ignore_patterns(".terraform", ".terraform.lock.hcl"),
+    )
+
+    bin_dir = base / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    marker = base / "tool-invoked"
+    for tool in ("terraform", "tofu", "aws", "gcloud", "curl"):
+        body = f"#!/usr/bin/env bash\ntouch {marker}\n"
+        if tool == "gcloud":
+            body += 'if [ "${1:-}" = "auth" ]; then echo user@example.com; fi\n'
+        elif tool == "aws":
+            body += 'if [ "$1" = "sts" ]; then echo 123456789012; fi\n'
+        body += "exit 0\n"
+        (bin_dir / tool).write_text(body, encoding="utf-8")
+        (bin_dir / tool).chmod(0o755)
+
+    env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+    for key in list(env):
+        if key.startswith("TF_VAR_") or key in SMOKE_BOOLEAN_FLAGS:
+            env.pop(key, None)
+    # Valid required inputs so the ONLY reason to fail is the invalid flag.
+    env.update(CLEANUP_REQUIRED_INPUT_ENV[module_dir.name])
+    env.update(flag_env)
+    result = subprocess.run(
+        ["bash", "./smoke.sh"],
+        cwd=module_copy,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    return result, marker, module_copy
+
+
+def _assert_smoke_rejects_invalid_flag(tmp_path: Path, module_dir: Path) -> None:
+    invalid_values = ("2", "", "sk-test-secret")
+    for flag in SMOKE_BOOLEAN_FLAGS:
+        for invalid_value in invalid_values:
+            value_label = invalid_value or "<empty>"
+            base = tmp_path / f"{module_dir.name}-{flag.lower()}-{value_label.replace('/', '_')}"
+            result, marker, module_copy = _run_smoke_with_invalid_boolean_flag(
+                base, module_dir, {flag: invalid_value}
+            )
+            assert result.returncode == 1, (
+                f"{module_dir.name}: {flag}={value_label} did not fail closed "
+                f"(rc={result.returncode} stdout={result.stdout!r} stderr={result.stderr!r})"
+            )
+            assert flag in result.stderr, (
+                f"{module_dir.name}: {flag}={value_label} error does not name the variable "
+                f"(stderr={result.stderr!r})"
+            )
+            assert invalid_value == "" or invalid_value not in result.stderr, (
+                f"{module_dir.name}: {flag}={value_label} leaked the invalid value in stderr "
+                f"(stderr={result.stderr!r})"
+            )
+            assert not marker.exists(), (
+                f"{module_dir.name}: {flag}={value_label} invoked an external tool before failing closed"
+            )
+            assert not (module_copy / ".terraform").exists(), (
+                f"{module_dir.name}: {flag}={value_label} created .terraform/ before failing closed"
+            )
+
+
+def test_aws_smoke_script_rejects_invalid_boolean_flag_before_side_effects(tmp_path):
+    _assert_smoke_rejects_invalid_flag(tmp_path, AWS_DIR)
+
+
+def test_gcp_smoke_script_rejects_invalid_boolean_flag_before_side_effects(tmp_path):
+    _assert_smoke_rejects_invalid_flag(tmp_path, GCP_DIR)
+
+
+def test_publish_helpers_validate_boolean_flags_before_side_effects():
+    for script in (AWS_PUBLISH_SCRIPT, GCP_PUBLISH_SCRIPT):
+        text = _read(script)
+        name = script.parent.name
+        candidates = [
+            text.find("get-caller-identity"),
+            text.find("gcloud auth"),
+            text.find("run docker build"),
+            text.find("command -v aws"),
+            text.find("command -v gcloud"),
+        ]
+        present = [i for i in candidates if i != -1]
+        assert present, f"{name}: publish-images.sh never invokes a live prerequisite/side effect"
+        first_side_effect = min(present)
+
+        err_idx = text.find("must be 0 or 1")
+        assert err_idx != -1, f"{name}: publish-images.sh has no boolean-flag 0/1 validation"
+        assert err_idx < first_side_effect, (
+            f"{name}: boolean-flag validation runs after a live prerequisite/side effect"
+        )
+        fail_idx = text.find("exit 1", err_idx)
+        assert fail_idx != -1 and fail_idx < first_side_effect, (
+            f"{name}: boolean-flag validation does not fail closed (exit 1) before a side effect"
+        )
+
+
+def test_publish_boolean_flag_validation_does_not_reference_raw_secrets():
+    for script in (AWS_PUBLISH_SCRIPT, GCP_PUBLISH_SCRIPT):
+        lowered = _read(script).lower()
+        for token in RAW_SECRET_TOKENS:
+            assert token not in lowered, f"{token} referenced in {script.parent.name}/publish-images.sh"
+
+
+def _assert_publish_rejects_invalid_flag(
+    tmp_path: Path, module_dir: Path, cloud_tool: str, flags: tuple[str, ...]
+) -> None:
+    invalid_values = ("2", "", "sk-test-secret")
+    for flag in flags:
+        for invalid_value in invalid_values:
+            value_label = invalid_value or "<empty>"
+            base = tmp_path / f"{module_dir.name}-{flag.lower()}-{value_label.replace('/', '_')}"
+            module_copy, env, side_effect = _make_publish_env(base, module_dir, cloud_tool)
+            # For a non-DRY_RUN flag, run the live path (DRY_RUN=0) so real side
+            # effects WOULD occur unless validation fails closed first.
+            env["DRY_RUN"] = invalid_value if flag == "DRY_RUN" else "0"
+            if flag != "DRY_RUN":
+                env[flag] = invalid_value
+            result = _run_publish(module_copy, env)
+            assert result.returncode == 1, (
+                f"{module_dir.name}: {flag}={value_label} did not fail closed "
+                f"(rc={result.returncode} stdout={result.stdout!r} stderr={result.stderr!r})"
+            )
+            assert flag in result.stderr, (
+                f"{module_dir.name}: {flag}={value_label} error does not name the variable "
+                f"(stderr={result.stderr!r})"
+            )
+            assert invalid_value == "" or invalid_value not in result.stderr, (
+                f"{module_dir.name}: {flag}={value_label} leaked the invalid value in stderr "
+                f"(stderr={result.stderr!r})"
+            )
+            assert not side_effect.exists(), (
+                f"{module_dir.name}: {flag}={value_label} reached an aws/gcloud/docker "
+                "side effect before failing closed"
+            )
+
+
+def test_aws_publish_rejects_invalid_boolean_flag_before_side_effects(tmp_path):
+    _assert_publish_rejects_invalid_flag(tmp_path, AWS_DIR, "aws", AWS_PUBLISH_BOOLEAN_FLAGS)
+
+
+def test_gcp_publish_rejects_invalid_boolean_flag_before_side_effects(tmp_path):
+    _assert_publish_rejects_invalid_flag(tmp_path, GCP_DIR, "gcloud", GCP_PUBLISH_BOOLEAN_FLAGS)
+
+
+def test_smoke_readmes_document_boolean_flag_validation():
+    for module_dir in (AWS_DIR, GCP_DIR):
+        section = _smoke_section(_read(module_dir / "README.md"))
+        assert section, f"{module_dir.name}: README has no live-smoke helper section"
+        lowered = section.lower()
+        assert "0 or 1" in section, (
+            f"{module_dir.name}: smoke section does not say the flags accept only 0 or 1"
+        )
+        for flag in SMOKE_BOOLEAN_FLAGS:
+            assert flag in section, (
+                f"{module_dir.name}: smoke section does not name {flag} in the flag-validation note"
+            )
+        assert "before any side effect" in lowered, (
+            f"{module_dir.name}: smoke section does not state invalid values fail before side effects"
+        )
+
+
+def test_publish_readmes_document_boolean_flag_validation():
+    for module_dir, flags in ((AWS_DIR, AWS_PUBLISH_BOOLEAN_FLAGS), (GCP_DIR, GCP_PUBLISH_BOOLEAN_FLAGS)):
+        section = _publish_section(_read(module_dir / "README.md"))
+        lowered = section.lower()
+        assert "0 or 1" in section, (
+            f"{module_dir.name}: publish section does not say the flags accept only 0 or 1"
+        )
+        for flag in flags:
+            assert flag in section, (
+                f"{module_dir.name}: publish section does not name {flag} in the flag-validation note"
+            )
+        assert "before any side effect" in lowered, (
+            f"{module_dir.name}: publish section does not state invalid values fail before side effects"
         )

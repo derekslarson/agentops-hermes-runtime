@@ -38,9 +38,27 @@
 
 set -euo pipefail
 
-PLAN_ONLY="${PLAN_ONLY:-1}"
-DESTROY_ON_FAILURE="${DESTROY_ON_FAILURE:-0}"
-CLEAN_TERRAFORM_ARTIFACTS="${CLEAN_TERRAFORM_ARTIFACTS:-0}"
+PLAN_ONLY="${PLAN_ONLY-1}"
+DESTROY_ON_FAILURE="${DESTROY_ON_FAILURE-0}"
+CLEAN_TERRAFORM_ARTIFACTS="${CLEAN_TERRAFORM_ARTIFACTS-0}"
+
+# --- validate boolean-ish safety flags (fail closed before any side effect) --
+# Each safety flag must be exactly 0 or 1. A typo (PLAN_ONLY=2, DESTROY_ON_FAILURE=
+# yes) must not be silently coerced into an unsafe path, so reject anything else
+# with a clear non-secret error naming the variable BEFORE any terraform/tofu/
+# gcloud/curl command runs or .terraform/ is created.
+require_boolean_flag() {
+  case "$2" in
+    0|1) ;;
+    *)
+      echo "error: $1 must be 0 or 1" >&2
+      exit 1
+      ;;
+  esac
+}
+require_boolean_flag PLAN_ONLY "$PLAN_ONLY"
+require_boolean_flag DESTROY_ON_FAILURE "$DESTROY_ON_FAILURE"
+require_boolean_flag CLEAN_TERRAFORM_ARTIFACTS "$CLEAN_TERRAFORM_ARTIFACTS"
 
 # Operate on the module directory this script lives in (module-local commands;
 # no root-relative -chdir hacks).
