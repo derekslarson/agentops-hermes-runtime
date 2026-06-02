@@ -101,7 +101,7 @@ scripts/out/
 # deploy/terraform/*/smoke.sh on the apply path. Operator artifacts, never source.
 smoke-transcript-*.log
 
-# Generated non-secret image tfvars override — written by
+# Generated non-secret image tfvars overrides — written by
 # deploy/terraform/*-managed/publish-images.sh on the WRITE_TFVARS=1 live path.
 # Per-operator generated input, never source.
-deploy/terraform/*-managed/image*.auto.tfvars
+deploy/terraform/*-managed/*.auto.tfvars

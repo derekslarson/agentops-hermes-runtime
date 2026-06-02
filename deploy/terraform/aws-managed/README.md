@@ -134,7 +134,10 @@ overridable via `IMAGE_TFVARS_PATH`) using a temp file + `mv`. Terraform auto-lo
 any `*.auto.tfvars` file, so the next `PLAN_ONLY=0 ./smoke.sh` picks the images up
 with no manual edit. The writer is opt-in and **never runs in the default
 `DRY_RUN=1` mode** (dry-run stays side-effect-free), writes no secret values, and
-the generated file is git-ignored.
+the generated file is git-ignored. A custom `IMAGE_TFVARS_PATH` must stay a
+module-local plain filename (no leading `/`, no `/` path segments, no `..`); the
+helper fails closed before publishing otherwise, so the writer can never clobber
+files outside this module.
 
 ```bash
 DRY_RUN=0 WRITE_TFVARS=1 AWS_REGION=us-east-1 ./publish-images.sh   # also writes image.auto.tfvars

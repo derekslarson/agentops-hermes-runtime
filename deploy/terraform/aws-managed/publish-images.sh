@@ -94,6 +94,21 @@ preflight_build_contexts() {
   done
 }
 
+# --- opt-in writer: custom output path must stay module-local ----------------
+# When WRITE_TFVARS=1 the generated non-secret image tfvars is written to
+# IMAGE_TFVARS_PATH. Reject anything that is not a module-local plain filename
+# (absolute path, a '/' path segment, or a '..' traversal) so the writer can
+# never clobber files outside this module directory and its output stays covered
+# by the deploy/terraform/*-managed/ .gitignore entry. Non-secret check only.
+preflight_image_tfvars_path() {
+  case "$IMAGE_TFVARS_PATH" in
+    /*|*/*|*..*)
+      echo "error: IMAGE_TFVARS_PATH='${IMAGE_TFVARS_PATH}' must be a module-local filename (no leading '/', no '/' path segments, no '..') so the generated non-secret image tfvars cannot escape the module directory" >&2
+      exit 1
+      ;;
+  esac
+}
+
 # --- live-path prerequisites / config (fail closed before side effects) ------
 if [ "$DRY_RUN" = "0" ]; then
   if ! command -v aws >/dev/null 2>&1; then
@@ -115,6 +130,10 @@ if [ "$DRY_RUN" = "0" ]; then
   AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID:-$(aws sts get-caller-identity --query Account --output text)}"
   # Build contexts must be valid before any ECR login / repo create / build.
   preflight_build_contexts
+  # A custom image-tfvars output path must stay module-local before we publish.
+  if [ "$WRITE_TFVARS" = "1" ]; then
+    preflight_image_tfvars_path
+  fi
 else
   # Dry-run placeholders so the printed commands are concrete and readable.
   AWS_REGION="${AWS_REGION:-<AWS_REGION>}"

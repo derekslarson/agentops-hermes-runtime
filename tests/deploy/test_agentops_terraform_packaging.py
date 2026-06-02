@@ -2626,9 +2626,12 @@ def test_root_gitignore_ignores_generated_image_tfvars():
     gitignore = _read(REPO_ROOT / ".gitignore")
     lines = {line.strip() for line in gitignore.splitlines()}
     # The generated module-local image tfvars override must be ignored so an
-    # operator's WRITE_TFVARS=1 output is never accidentally committed.
-    assert "deploy/terraform/*-managed/image*.auto.tfvars" in lines, (
-        "root .gitignore does not ignore generated image*.auto.tfvars operator files"
+    # operator's WRITE_TFVARS=1 output is never accidentally committed. The
+    # helpers permit custom module-local filenames such as
+    # custom-images.auto.tfvars, so the ignore coverage must match any allowed
+    # module-local *.auto.tfvars override in a managed Terraform module.
+    assert "deploy/terraform/*-managed/*.auto.tfvars" in lines, (
+        "root .gitignore does not ignore all module-local *.auto.tfvars operator files"
     )
 
 
@@ -2645,4 +2648,88 @@ def test_publish_helper_readmes_document_write_tfvars_option():
         )
         assert "image_tfvars_path" in lowered, (
             f"{name}: publish section does not document the IMAGE_TFVARS_PATH override"
+        )
+
+
+# --- custom IMAGE_TFVARS_PATH must stay module-local (M15 hardening slice) ----
+#
+# The opt-in writer (WRITE_TFVARS=1) writes the generated non-secret image tfvars
+# to IMAGE_TFVARS_PATH via a temp file + mv. A custom path must stay a
+# module-local plain filename so the writer can never clobber files outside the
+# module directory and so its output stays covered by the
+# `deploy/terraform/*-managed/...` .gitignore entry. On the live write path the
+# helpers must fail closed BEFORE any cloud/docker side effect when
+# IMAGE_TFVARS_PATH is absolute, contains a '/' path segment, or contains '..'.
+# The error must name IMAGE_TFVARS_PATH and never reference a raw secret.
+
+NON_MODULE_LOCAL_IMAGE_PATHS = (
+    "/tmp/escape.auto.tfvars",
+    "../escape.auto.tfvars",
+    "sub/dir.auto.tfvars",
+)
+
+
+def test_publish_write_tfvars_rejects_non_module_local_image_path(tmp_path):
+    for module_dir, cloud_tool in ((AWS_DIR, "aws"), (GCP_DIR, "gcloud")):
+        for i, bad_path in enumerate(NON_MODULE_LOCAL_IMAGE_PATHS):
+            sub = tmp_path / f"{cloud_tool}-{i}"
+            sub.mkdir()
+            module_copy, env, side_effect = _make_publish_env(sub, module_dir, cloud_tool)
+            ctx = _make_publish_context_with_dockerfile(sub)
+            env.update(
+                {
+                    "DRY_RUN": "0",
+                    "WRITE_TFVARS": "1",
+                    "IMAGE_TFVARS_PATH": bad_path,
+                    "CONTROL_PLANE_CONTEXT": str(ctx),
+                    "WORKER_CONTEXT": str(ctx),
+                    "SCHEDULER_CONTEXT": str(ctx),
+                }
+            )
+            result = _run_publish(module_copy, env)
+            name = module_dir.name
+
+            assert result.returncode == 1, (
+                f"{name}: live publish did not fail closed on non-module-local "
+                f"IMAGE_TFVARS_PATH={bad_path}\n{result.stdout}\n{result.stderr}"
+            )
+            assert "image_tfvars_path" in result.stderr.lower(), (
+                f"{name}: error does not name IMAGE_TFVARS_PATH for {bad_path}\n{result.stderr}"
+            )
+            # Fail closed BEFORE any cloud/docker side effect.
+            assert not side_effect.exists(), (
+                f"{name}: a side effect ran before the IMAGE_TFVARS_PATH validation for {bad_path}"
+            )
+            # Nothing written at the default module-local path either.
+            assert not (module_copy / IMAGE_AUTO_TFVARS).exists(), (
+                f"{name}: wrote {IMAGE_AUTO_TFVARS} despite rejecting {bad_path}"
+            )
+
+
+def test_publish_image_tfvars_path_validation_does_not_reference_raw_secrets():
+    for script in (AWS_PUBLISH_SCRIPT, GCP_PUBLISH_SCRIPT):
+        lowered = _read(script).lower()
+        for token in RAW_SECRET_TOKENS:
+            assert token not in lowered, f"{token} referenced in {script.parent.name}/publish-images.sh"
+
+
+def test_publish_validates_image_tfvars_path_is_module_local_before_side_effects():
+    for script in (AWS_PUBLISH_SCRIPT, GCP_PUBLISH_SCRIPT):
+        text = _read(script)
+        name = script.parent.name
+
+        # A module-local validation of the custom output path exists, naming the
+        # IMAGE_TFVARS_PATH variable and failing closed.
+        assert "module-local filename" in text, (
+            f"{name}: no IMAGE_TFVARS_PATH module-local validation"
+        )
+        assert "IMAGE_TFVARS_PATH" in text
+
+        # It runs before the first cloud/docker side effect so a misconfigured
+        # output path never reaches a build/push.
+        guard_idx = text.find("module-local filename")
+        side_effects = _publish_side_effect_indices(text)
+        assert side_effects, f"{name}: no side effects found"
+        assert guard_idx < min(side_effects), (
+            f"{name}: IMAGE_TFVARS_PATH validation runs after a side effect"
         )
