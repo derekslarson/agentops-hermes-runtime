@@ -212,7 +212,10 @@ helper prints the transcript path so you can attach it to the still-pending M15
 live-smoke evidence before marking the milestone Done. The transcript is produced
 **only** after a `PLAN_ONLY=0` apply with a healthy `/healthz` probe — never in
 the plan-only default. Although the script writes only non-secret outputs,
-**review the transcript for secrets before sharing it**.
+**review the transcript for secrets before sharing it**. The transcript is
+written **atomically** — built in a temporary file and renamed into place only
+once fully written, with the temporary file removed on failure — so a partial
+transcript is never committed as evidence if `terraform output` errors mid-write.
 
 The helper never accepts or echoes raw app/integration secret values; bootstrap
 (M16) owns those. **No live AWS apply/smoke has been captured for this module

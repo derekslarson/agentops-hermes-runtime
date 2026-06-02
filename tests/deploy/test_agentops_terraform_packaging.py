@@ -2141,6 +2141,62 @@ def test_readmes_document_smoke_transcript_artifact():
         assert "shar" in lowered, f"{module_dir.name}: README does not say to review before sharing"
 
 
+# --- smoke transcript is written atomically (M15 slice) ---------------------
+#
+# The transcript is operator evidence. A direct redirect into
+# smoke-transcript-*.log leaves a half-written file if `terraform output` fails
+# mid-write. Both helpers must instead build the transcript in a temporary file
+# and atomically rename it into place (mv) only once fully written, and must
+# remove the temporary file if the build fails — so an operator never attaches a
+# partially-written transcript as evidence. Both READMEs say so.
+
+
+def _assert_smoke_transcript_atomic(script_path: Path) -> None:
+    region = _transcript_region(_read(script_path))
+    name = script_path.parent.name
+    assert region, f"{name}: smoke.sh has no transcript region"
+
+    # The final transcript is produced by an atomic rename, not a direct redirect.
+    assert (
+        'mv "$TRANSCRIPT_TMP" "$TRANSCRIPT"' in region
+    ), f"{name}: transcript is not atomically renamed into place (mv temp -> final)"
+
+    # The block builds into the temporary file, never redirecting straight to the
+    # final operator-facing transcript path.
+    assert (
+        '>"$TRANSCRIPT_TMP"' in region or '> "$TRANSCRIPT_TMP"' in region
+    ), f"{name}: transcript block does not write to a temporary file first"
+    assert '>"$TRANSCRIPT"' not in region and '> "$TRANSCRIPT"' not in region, (
+        f"{name}: transcript block still redirects directly to the final transcript file"
+    )
+
+    # A failed build cleans up the temporary file rather than leaving a partial.
+    assert (
+        'rm -f "$TRANSCRIPT_TMP"' in region
+    ), f"{name}: transcript build does not remove the temporary file on failure"
+
+
+def test_aws_smoke_script_writes_transcript_atomically():
+    _assert_smoke_transcript_atomic(SMOKE_SCRIPT)
+
+
+def test_gcp_smoke_script_writes_transcript_atomically():
+    _assert_smoke_transcript_atomic(GCP_SMOKE_SCRIPT)
+
+
+def test_readmes_document_smoke_transcript_atomic_write():
+    for module_dir in (AWS_DIR, GCP_DIR):
+        section = _smoke_section(_read(module_dir / "README.md"))
+        assert section, f"{module_dir.name}: README has no live-smoke helper section"
+        lowered = section.lower()
+        assert "atomic" in lowered, (
+            f"{module_dir.name}: smoke-helper section does not say the transcript is written atomically"
+        )
+        assert "partial" in lowered, (
+            f"{module_dir.name}: smoke-helper section does not say a partial transcript is not committed"
+        )
+
+
 # --- GCP opt-in External HTTPS Load Balancer + DNS (M15 slice) --------------
 #
 # Closes the load-balancer/DNS parity gap with a small, OPT-IN External HTTPS

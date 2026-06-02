@@ -197,13 +197,23 @@ echo "Apply complete — smoke hints/outputs:"
 # already surfaced above. It never writes a raw app/integration secret value, but
 # review it for secrets before sharing regardless.
 TRANSCRIPT="smoke-transcript-$(date -u +%Y%m%dT%H%M%SZ).log"
-{
+# Write atomically: build the transcript into a temporary file and only rename it
+# into place once fully written, removing the temporary file if any line fails.
+# This keeps operator evidence from being partially committed if `terraform
+# output` errors mid-write.
+TRANSCRIPT_TMP="${TRANSCRIPT}.tmp"
+if ! {
   echo "provider/profile: gcp-managed"
   echo "timestamp (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "agentops_api_url: ${API_URL}"
   echo "healthz probe: OK — ${API_URL}/healthz responded healthy"
   echo "smoke_test_hints:"
   "$TF" output smoke_test_hints
-} >"$TRANSCRIPT"
+} >"$TRANSCRIPT_TMP"; then
+  rm -f "$TRANSCRIPT_TMP"
+  echo "error: failed to build smoke transcript — removed partial ${TRANSCRIPT_TMP}" >&2
+  exit 1
+fi
+mv "$TRANSCRIPT_TMP" "$TRANSCRIPT"
 echo "Wrote non-secret smoke transcript: ${TRANSCRIPT}"
 echo "Attach it to M15 evidence after reviewing it for secrets before sharing."
