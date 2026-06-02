@@ -67,6 +67,25 @@ run() {
   fi
 }
 
+# --- live-path build-context / Dockerfile preflight --------------------------
+# On the live path only, verify each docker build context exists and contains a
+# Dockerfile BEFORE any cloud/docker side effect (login, repository creation,
+# build, push). Dry-run stays permissive and never requires the contexts/
+# Dockerfiles to exist. Errors are non-secret and name the offending variable.
+preflight_build_contexts() {
+  for ctx_var in CONTROL_PLANE_CONTEXT WORKER_CONTEXT SCHEDULER_CONTEXT; do
+    ctx_dir="${!ctx_var}"
+    if [ ! -d "$ctx_dir" ]; then
+      echo "error: ${ctx_var}='${ctx_dir}' is not a directory — point ${ctx_var} at a build-context directory containing a Dockerfile" >&2
+      exit 1
+    fi
+    if [ ! -f "${ctx_dir}/Dockerfile" ]; then
+      echo "error: ${ctx_var}='${ctx_dir}' has no Dockerfile — point ${ctx_var} at a build-context directory containing a Dockerfile" >&2
+      exit 1
+    fi
+  done
+}
+
 # --- live-path prerequisites / config (fail closed before side effects) ------
 if [ "$DRY_RUN" = "0" ]; then
   if ! command -v aws >/dev/null 2>&1; then
@@ -86,6 +105,8 @@ if [ "$DRY_RUN" = "0" ]; then
     exit 1
   fi
   AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID:-$(aws sts get-caller-identity --query Account --output text)}"
+  # Build contexts must be valid before any ECR login / repo create / build.
+  preflight_build_contexts
 else
   # Dry-run placeholders so the printed commands are concrete and readable.
   AWS_REGION="${AWS_REGION:-<AWS_REGION>}"

@@ -2235,3 +2235,223 @@ def test_readmes_document_required_input_preflight():
         assert "tf_var_" in lowered, (
             f"{module_dir.name}: smoke-helper section does not mention the TF_VAR_* env-var path"
         )
+
+
+# --- live-publish build-context / Dockerfile preflight (M15 hardening slice) --
+#
+# On the live publish path (DRY_RUN=0) only, each configured docker build context
+# (CONTROL_PLANE_CONTEXT / WORKER_CONTEXT / SCHEDULER_CONTEXT) must be verified to
+# be an existing directory containing a Dockerfile BEFORE any cloud/docker side
+# effect (ECR/Artifact-Registry login, repository creation/config, docker
+# build/push). The default dry-run must stay side-effect-free and permissive: it
+# may print commands with placeholder contexts and must not require the
+# contexts/Dockerfiles to exist. Error messages must be non-secret and name the
+# offending *_CONTEXT variable.
+
+PUBLISH_SIDE_EFFECT_MARKERS = (
+    "get-login-password",
+    "auth configure-docker",
+    "create-repository",
+    "artifacts repositories create",
+    "run docker build",
+    "run docker push",
+)
+
+
+def _publish_side_effect_indices(text: str) -> list[int]:
+    return [text.find(m) for m in PUBLISH_SIDE_EFFECT_MARKERS if text.find(m) != -1]
+
+
+def _make_publish_env(tmp_path: Path, module_dir: Path, cloud_tool: str):
+    module_copy = tmp_path / module_dir.name
+    shutil.copytree(
+        module_dir,
+        module_copy,
+        ignore=shutil.ignore_patterns(".terraform", ".terraform.lock.hcl"),
+    )
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    side_effect = tmp_path / "side-effect"
+
+    docker = bin_dir / "docker"
+    docker.write_text(
+        f"#!/usr/bin/env bash\ntouch {side_effect}\nexit 0\n", encoding="utf-8"
+    )
+    docker.chmod(0o755)
+
+    if cloud_tool == "aws":
+        aws = bin_dir / "aws"
+        aws.write_text(
+            "#!/usr/bin/env bash\n"
+            'if [ "$1" = "sts" ]; then echo 123456789012; exit 0; fi\n'
+            f"touch {side_effect}\nexit 0\n",
+            encoding="utf-8",
+        )
+        aws.chmod(0o755)
+    elif cloud_tool == "gcloud":
+        gcloud = bin_dir / "gcloud"
+        gcloud.write_text(
+            "#!/usr/bin/env bash\n"
+            'case "$1 $2" in\n'
+            '  "auth list") echo user@example.com; exit 0;;\n'
+            '  "config get-value") echo my-project; exit 0;;\n'
+            "esac\n"
+            f"touch {side_effect}\nexit 0\n",
+            encoding="utf-8",
+        )
+        gcloud.chmod(0o755)
+    else:  # pragma: no cover - helper guard
+        raise AssertionError(f"unsupported cloud tool {cloud_tool}")
+
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "AWS_REGION": "us-east-1",
+    }
+    return module_copy, env, side_effect
+
+
+def _run_publish(module_copy: Path, env: dict) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", "./publish-images.sh"],
+        cwd=module_copy,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
+def _assert_live_context_preflight_missing_dockerfile(
+    tmp_path: Path, module_dir: Path, cloud_tool: str
+) -> None:
+    module_copy, env, side_effect = _make_publish_env(tmp_path, module_dir, cloud_tool)
+    ctx = tmp_path / "ctx-without-dockerfile"
+    ctx.mkdir()
+    env.update(
+        {
+            "DRY_RUN": "0",
+            "CONTROL_PLANE_CONTEXT": str(ctx),
+            "WORKER_CONTEXT": str(ctx),
+            "SCHEDULER_CONTEXT": str(ctx),
+        }
+    )
+    result = _run_publish(module_copy, env)
+    name = module_dir.name
+    assert result.returncode == 1, (
+        f"{name}: live publish did not fail closed on a Dockerfile-less context\n"
+        f"{result.stdout}\n{result.stderr}"
+    )
+    err = result.stderr.lower()
+    assert "dockerfile" in err, f"{name}: error does not mention the missing Dockerfile"
+    assert "control_plane_context" in err, (
+        f"{name}: error does not name the offending *_CONTEXT variable"
+    )
+    assert not side_effect.exists(), (
+        f"{name}: a cloud/docker side effect ran before the context preflight"
+    )
+
+
+def test_aws_publish_preflights_build_context_dockerfile_on_live_path(tmp_path):
+    _assert_live_context_preflight_missing_dockerfile(tmp_path, AWS_DIR, "aws")
+
+
+def test_gcp_publish_preflights_build_context_dockerfile_on_live_path(tmp_path):
+    _assert_live_context_preflight_missing_dockerfile(tmp_path, GCP_DIR, "gcloud")
+
+
+def test_aws_publish_preflight_rejects_missing_context_directory(tmp_path):
+    module_copy, env, side_effect = _make_publish_env(tmp_path, AWS_DIR, "aws")
+    missing = tmp_path / "does-not-exist"
+    env.update(
+        {
+            "DRY_RUN": "0",
+            "CONTROL_PLANE_CONTEXT": str(missing),
+            "WORKER_CONTEXT": str(missing),
+            "SCHEDULER_CONTEXT": str(missing),
+        }
+    )
+    result = _run_publish(module_copy, env)
+    assert result.returncode == 1, f"{result.stdout}\n{result.stderr}"
+    assert "control_plane_context" in result.stderr.lower()
+    assert not side_effect.exists(), "a side effect ran before the missing-context preflight"
+
+
+def test_publish_dry_run_is_permissive_about_missing_contexts(tmp_path):
+    for module_dir, cloud_tool in ((AWS_DIR, "aws"), (GCP_DIR, "gcloud")):
+        module_copy, env, side_effect = _make_publish_env(tmp_path / cloud_tool, module_dir, cloud_tool)
+        bogus = tmp_path / cloud_tool / "nope"
+        env.update(
+            {
+                "DRY_RUN": "1",
+                "CONTROL_PLANE_CONTEXT": str(bogus),
+                "WORKER_CONTEXT": str(bogus),
+                "SCHEDULER_CONTEXT": str(bogus),
+            }
+        )
+        result = _run_publish(module_copy, env)
+        assert result.returncode == 0, (
+            f"{module_dir.name}: dry-run is not permissive about missing contexts\n"
+            f"{result.stdout}\n{result.stderr}"
+        )
+        assert not side_effect.exists(), f"{module_dir.name}: dry-run performed a side effect"
+
+
+def test_publish_helpers_preflight_contexts_before_side_effects():
+    for script in (AWS_PUBLISH_SCRIPT, GCP_PUBLISH_SCRIPT):
+        text = _read(script)
+        name = script.parent.name
+
+        # A Dockerfile-in-context check exists, testing both the directory and the
+        # Dockerfile file.
+        assert "/Dockerfile" in text, f"{name}: publish-images.sh has no Dockerfile preflight"
+        assert "-d " in text, f"{name}: publish-images.sh does not check the context is a directory"
+
+        # Each *_CONTEXT variable is considered by the preflight.
+        for var_name in PUBLISH_CONTEXT_VARS:
+            assert var_name in text, f"{name}: preflight does not consider {var_name}"
+
+        # The Dockerfile preflight runs before the first cloud/docker side effect.
+        dockerfile_idx = text.find("/Dockerfile")
+        side_effects = _publish_side_effect_indices(text)
+        assert side_effects, f"{name}: no side effects found"
+        assert dockerfile_idx < min(side_effects), (
+            f"{name}: context/Dockerfile preflight does not run before the first side effect"
+        )
+
+        # Fails closed.
+        assert "exit 1" in text, f"{name}: context preflight does not fail closed"
+
+
+def test_publish_context_preflight_does_not_reference_raw_secrets():
+    for script in (AWS_PUBLISH_SCRIPT, GCP_PUBLISH_SCRIPT):
+        lowered = _read(script).lower()
+        for token in RAW_SECRET_TOKENS:
+            assert token not in lowered, f"{token} referenced in {script.parent.name}/publish-images.sh"
+
+
+def _publish_section(readme: str) -> str:
+    start = readme.find("## Image-publishing helper")
+    assert start != -1, "README has no Image-publishing helper section"
+    end = readme.find("\n## ", start + 1)
+    return readme[start:] if end == -1 else readme[start:end]
+
+
+def test_publish_helper_readmes_document_context_dockerfile_preflight():
+    for module_dir in (AWS_DIR, GCP_DIR):
+        section = _publish_section(_read(module_dir / "README.md"))
+        lowered = section.lower()
+        name = module_dir.name
+        # The live-publish context/Dockerfile preflight is documented.
+        assert "preflight" in lowered, (
+            f"{name}: publish section does not document the context/Dockerfile preflight"
+        )
+        assert "dockerfile" in lowered, (
+            f"{name}: publish section does not mention the Dockerfile requirement"
+        )
+        # *_CONTEXT overrides must point at a directory containing a Dockerfile.
+        assert "_context" in lowered, (
+            f"{name}: publish section does not mention the *_CONTEXT overrides"
+        )

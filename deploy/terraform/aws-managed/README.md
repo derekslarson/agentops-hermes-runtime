@@ -107,6 +107,14 @@ UTC timestamp), and the `*_REPO` repository names (defaulting to the
 the helper `cd`s into the module dir, so they must not default to `.`) and are
 overridable via env.
 
+On a live publish (`DRY_RUN=0`) the helper **preflights each build context
+before any ECR login, repository creation, or `docker build`/`push`**: every
+`*_CONTEXT` must be an existing directory containing a `Dockerfile`, or the run
+fails closed with a non-secret error naming the offending variable. Any
+`*_CONTEXT` override must therefore point at a build-context directory that
+contains a `Dockerfile`. The default dry-run skips this check and stays
+permissive.
+
 ```bash
 cd deploy/terraform/aws-managed
 ./publish-images.sh                       # DRY_RUN=1 (default): print commands only
