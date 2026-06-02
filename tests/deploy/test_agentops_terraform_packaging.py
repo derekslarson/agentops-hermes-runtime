@@ -260,6 +260,32 @@ def test_gcp_network_docs_match_parity_gap_no_new_network():
         assert "default egress" in lowered or "parity" in lowered
 
 
+def test_gcp_byo_vpc_requires_subnets_and_validation_is_documented():
+    variables = _read(GCP_DIR / "variables.tf")
+    readme = _read(GCP_DIR / "README.md")
+    subnet_block = _variable_block(variables, "existing_subnet_ids")
+
+    # Direct VPC egress cannot be configured with only a network name; the Cloud
+    # Run template also needs at least one subnet self-link. Fail during variable
+    # validation instead of allowing an apply to fail later or silently using
+    # default egress.
+    assert "validation" in subnet_block
+    assert "existing_vpc_id" in subnet_block
+    assert "length(var.existing_subnet_ids) > 0" in subnet_block
+    assert "existing_subnet_ids must be provided when existing_vpc_id is set" in subnet_block
+
+    lowered = readme.lower()
+    assert "existing_subnet_ids must be provided when existing_vpc_id is set" in lowered
+
+
+def test_gcp_cross_variable_validation_requires_terraform_1_9_or_newer():
+    main = _read(GCP_DIR / "main.tf")
+    variables = _read(GCP_DIR / "variables.tf")
+
+    assert "var.existing_vpc_id" in _variable_block(variables, "existing_subnet_ids")
+    assert 'required_version = ">= 1.9"' in main
+
+
 # --- honesty: apply path is not overstated while TODOs remain ---------------
 
 

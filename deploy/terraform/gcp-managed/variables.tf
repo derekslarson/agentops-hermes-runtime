@@ -113,6 +113,11 @@ variable "existing_subnet_ids" {
   description = "Reuse existing subnet self-links for Direct VPC egress (set together with existing_vpc_id). When empty, services use Cloud Run default egress; creating new subnets is a documented parity gap (see README), not done here."
   type        = list(string)
   default     = []
+
+  validation {
+    condition     = var.existing_vpc_id == "" || length(var.existing_subnet_ids) > 0
+    error_message = "existing_subnet_ids must be provided when existing_vpc_id is set (Direct VPC egress requires at least one subnet self-link)."
+  }
 }
 
 # --- Bring-your-own-managed-resource ----------------------------------------

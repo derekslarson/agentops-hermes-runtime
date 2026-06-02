@@ -207,8 +207,13 @@ leaving the value empty creates a new resource. For the network,
 `existing_vpc_id` + `existing_subnet_ids` attach the services via Direct VPC
 egress when set; when empty the services use Cloud Run default egress — creating
 a *new* private network/subnets is a parity gap (see below), not done here.
-Whether the database is created or reused, it is surfaced through the
-`database_refs` output.
+A bring-your-own VPC requires bring-your-own subnets:
+`existing_subnet_ids must be provided when existing_vpc_id is set`, because
+Direct VPC egress needs at least one subnet self-link. This is enforced by
+variable validation, so an
+`existing_vpc_id` with no `existing_subnet_ids` fails at plan time rather than
+silently falling back to default egress. Whether the database is created or
+reused, it is surfaced through the `database_refs` output.
 
 ## Secret handling — raw values stay out of state
 
