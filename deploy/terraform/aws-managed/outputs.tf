@@ -7,7 +7,13 @@
 ###############################################################################
 
 locals {
-  api_base_url = "https://${var.domain}"
+  # URLs derive from the public ALB DNS name over HTTP. When the module creates
+  # the VPC it also creates public ALB subnets with public routing (IGW + default
+  # route), so the default endpoint is internet-reachable; a bring-your-own VPC
+  # must supply public ALB subnets (see existing_alb_subnet_ids). Custom DNS
+  # (Route53 for var.domain) and TLS/ACM are deferred, so URLs derive from the ALB
+  # DNS name rather than the (not-yet-wired) domain.
+  api_base_url = "http://${aws_lb.this.dns_name}"
 }
 
 output "agentops_api_url" {
@@ -79,10 +85,11 @@ output "database_refs" {
 }
 
 output "network_refs" {
-  description = "Effective VPC/subnet refs the services attach to (reuses BYO values when provided)."
+  description = "Effective VPC/subnet refs the services attach to (reuses BYO values when provided). alb_subnet_ids are the public/edge subnets fronting the ALB (module-created public subnets by default, or BYO public subnets)."
   value = {
-    vpc_id     = local.effective_vpc_id
-    subnet_ids = local.effective_subnet_ids
+    vpc_id         = local.effective_vpc_id
+    subnet_ids     = local.effective_subnet_ids
+    alb_subnet_ids = local.effective_alb_subnet_ids
   }
 }
 
@@ -96,6 +103,7 @@ output "smoke_test_hints" {
   value = {
     api_health = "curl ${local.api_base_url}/healthz"
     api_ready  = "curl ${local.api_base_url}/readyz"
+    dns_note   = "URLs resolve to the ALB DNS name over HTTP. When this module creates the VPC it also creates public ALB subnets with public routing (IGW + default route), so the endpoint is internet-reachable; a bring-your-own VPC must supply public ALB subnets via existing_alb_subnet_ids. Custom DNS (point ${var.domain} at the ALB) and TLS/ACM are deferred and must be wired before serving ${var.domain} over HTTPS."
     note       = "After bootstrap, send a test Slack/GitHub/Linear/Jira event and confirm a worker run is claimed from the runs queue."
   }
 }

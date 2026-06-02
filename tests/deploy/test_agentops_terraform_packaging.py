@@ -460,6 +460,286 @@ def test_aws_task_role_grants_scoped_backend_access():
     assert "aws_secretsmanager_secret.containers" in block
 
 
+# --- AWS public ingress (ALB + target group + listener) — M15 slice ---------
+
+
+def test_aws_main_defines_public_alb_target_group_and_listener():
+    main = _read(AWS_DIR / "main.tf")
+    assert 'resource "aws_lb"' in main, "missing public ALB"
+    assert 'resource "aws_lb_target_group"' in main, "missing target group"
+    assert 'resource "aws_lb_listener"' in main, "missing listener"
+
+
+def test_aws_target_group_uses_ip_target_type_in_effective_vpc():
+    main = _read(AWS_DIR / "main.tf")
+    tg = _resource_block(main, "aws_lb_target_group", "api")
+    assert tg, "missing aws_lb_target_group api"
+    # Fargate awsvpc tasks register by IP, not by instance.
+    assert 'target_type = "ip"' in tg
+    # Target group lives in the effective (created/BYO) VPC.
+    assert "local.effective_vpc_id" in tg
+
+
+def test_aws_listener_forwards_to_api_target_group():
+    main = _read(AWS_DIR / "main.tf")
+    listener = _resource_block(main, "aws_lb_listener", "api")
+    assert listener, "missing aws_lb_listener api"
+    assert "aws_lb.this.arn" in listener, "listener not bound to the ALB"
+    assert "aws_lb_target_group.api.arn" in listener, "listener does not forward to the api target group"
+
+
+def test_aws_control_plane_service_wires_load_balancer_to_target_group():
+    main = _read(AWS_DIR / "main.tf")
+    block = _resource_block(main, "aws_ecs_service", "control_plane")
+    assert block, "missing control_plane service"
+    assert "load_balancer {" in block, "control_plane service has no load_balancer block"
+    assert "aws_lb_target_group.api.arn" in block, "load_balancer block does not reference the target group"
+    assert "container_name" in block, "load_balancer block does not name the container"
+    assert "var.api_container_port" in block, "load_balancer block does not reference the container port"
+
+
+def test_aws_control_plane_task_def_exposes_api_container_port():
+    main = _read(AWS_DIR / "main.tf")
+    block = _resource_block(main, "aws_ecs_task_definition", "control_plane")
+    assert block, "missing control_plane task definition"
+    assert "portMappings" in block, "control_plane container exposes no port for the target group"
+    assert "var.api_container_port" in block
+
+
+def test_aws_api_container_port_is_non_secret_variable_with_default():
+    variables = _read(AWS_DIR / "variables.tf")
+    block = _variable_block(variables, "api_container_port")
+    assert block, "missing api_container_port variable"
+    assert "default" in block, "api_container_port has no default"
+    lowered = block.lower()
+    for token in RAW_SECRET_TOKENS:
+        assert token not in lowered, f"{token} leaked into api_container_port"
+
+
+def test_aws_api_url_outputs_derive_from_alb_dns_not_placeholder():
+    outputs = _read(AWS_DIR / "outputs.tf")
+    # The reachable API base URL derives from the ALB DNS name (DNS/ACM not yet
+    # wired), so api/bootstrap/webhook URLs are real endpoints, not placeholders.
+    assert "aws_lb.this.dns_name" in outputs, "api url not derived from the ALB DNS name"
+    assert "TODO" not in outputs, "outputs still contain a TODO placeholder"
+
+
+def test_aws_main_has_no_ingress_todo_placeholder():
+    main = _read(AWS_DIR / "main.tf")
+    # Targeted: the old ingress placeholder must be gone. A blanket "no TODO
+    # anywhere" assertion is brittle (it would flag an unrelated honest TODO),
+    # so we only forbid the specific ingress placeholder this slice replaced.
+    assert "TODO(ingress)" not in main, "old TODO(ingress) placeholder still present in main.tf"
+
+
+# --- AWS ALB subnet contract (independent-review blocker fix) ---------------
+#
+# An ALB needs public/edge subnets distinct from the private service subnets.
+# existing_alb_subnet_ids carries those; the ALB wires to a dedicated local that
+# falls back to the service subnets only for scaffold/default compatibility.
+
+
+def test_aws_alb_subnet_ids_variable_validates_at_least_two():
+    variables = _read(AWS_DIR / "variables.tf")
+    block = _variable_block(variables, "existing_alb_subnet_ids")
+    assert block, "missing existing_alb_subnet_ids variable"
+
+    # Public/edge intent is documented (distinct from the private service subnets).
+    lowered = block.lower()
+    assert "public" in lowered or "edge" in lowered, "alb subnet var does not document public/edge intent"
+
+    # An Application Load Balancer needs at least two subnets; enforce it when
+    # the customer provides the list (empty stays allowed for the fallback).
+    assert "validation" in block, "existing_alb_subnet_ids has no validation"
+    assert "length(var.existing_alb_subnet_ids)" in block
+    assert ">= 2" in block, "validation does not require at least two ALB subnets"
+
+    # Not a secret input.
+    for token in RAW_SECRET_TOKENS:
+        assert token not in lowered, f"{token} leaked into existing_alb_subnet_ids"
+
+
+def test_aws_lb_uses_dedicated_alb_subnet_local():
+    main = _read(AWS_DIR / "main.tf")
+
+    # A dedicated local picks the ALB (edge) subnets, falling back to the
+    # service subnets only for scaffold/default compatibility.
+    assert "effective_alb_subnet_ids" in main, "missing effective_alb_subnet_ids local"
+    assert "var.existing_alb_subnet_ids" in main, "ALB subnet local does not consume the new variable"
+
+    lb = _resource_block(main, "aws_lb", "this")
+    assert lb, "missing aws_lb this"
+    assert "local.effective_alb_subnet_ids" in lb, "ALB does not wire to the dedicated edge-subnet local"
+    assert "local.effective_subnet_ids" not in lb, "ALB still wires directly to the private service subnets"
+
+
+def test_aws_ecs_services_use_private_service_subnets_not_alb_subnets():
+    main = _read(AWS_DIR / "main.tf")
+    for name in ("control_plane", "worker", "scheduler"):
+        block = _resource_block(main, "aws_ecs_service", name)
+        assert block, f"missing aws_ecs_service {name}"
+        assert (
+            "local.effective_subnet_ids" in block
+        ), f"{name} service must stay on the private service subnets"
+        assert (
+            "local.effective_alb_subnet_ids" not in block
+        ), f"{name} service must not run in the public ALB subnets"
+
+
+def test_aws_outputs_do_not_overstate_reachability():
+    outputs = _read(AWS_DIR / "outputs.tf").lower()
+    # URLs derive from the ALB DNS name, but reachability is conditional: it
+    # requires the ALB subnets to have public routing.
+    assert "reachable now" not in outputs, 'outputs still claim the endpoint is "reachable now"'
+    assert "public" in outputs and "rout" in outputs, "outputs do not condition reachability on public routing"
+
+
+def test_aws_readme_conditions_reachability_on_public_alb_subnets():
+    readme = _read(AWS_DIR / "README.md")
+    lowered = readme.lower()
+    # The new public/edge ALB subnet knob is documented.
+    assert "existing_alb_subnet_ids" in readme, "README does not document existing_alb_subnet_ids"
+    # No unconditional reachability claim; reachability requires public routing.
+    assert "reachable now" not in lowered, 'README still claims the endpoint is "reachable now"'
+    assert "yields an endpoint reachable" not in lowered, "README still claims apply yields a reachable endpoint unconditionally"
+    assert "public" in lowered and "rout" in lowered, "README does not condition reachability on public ALB subnet routing"
+
+
+def test_aws_main_comment_does_not_claim_unconditional_reachability():
+    main = _read(AWS_DIR / "main.tf").lower()
+    assert "reachable now" not in main, 'main.tf comment still claims "reachable now"'
+    assert "yields a reachable" not in main, "main.tf comment still claims apply yields a reachable endpoint unconditionally"
+
+
+# --- AWS public ALB subnets get real public routing (review blocker fix) -----
+#
+# The default path (module-created VPC, no BYO ALB subnets) must create public
+# ALB subnets with IGW + public-route wiring rather than reusing the private
+# service subnets, so a default apply can actually create an internet-facing ALB.
+
+
+def test_aws_main_creates_public_alb_subnets_with_igw_and_routing():
+    main = _read(AWS_DIR / "main.tf")
+
+    # Internet gateway for the module-created VPC.
+    igw = _resource_block(main, "aws_internet_gateway", "this")
+    assert igw, "missing aws_internet_gateway for the created VPC"
+    assert "aws_vpc.this" in igw, "IGW not attached to the created VPC"
+
+    # Public route table with a default route to the IGW.
+    rt = _resource_block(main, "aws_route_table", "alb")
+    assert rt, "missing aws_route_table alb for public ALB routing"
+    assert "0.0.0.0/0" in rt, "ALB route table has no default route"
+    assert "aws_internet_gateway.this" in rt, "ALB default route does not target the IGW"
+
+    # Public ALB subnets, clearly public.
+    alb_subnet = _resource_block(main, "aws_subnet", "alb")
+    assert alb_subnet, "missing aws_subnet alb (public ALB subnets)"
+    assert "map_public_ip_on_launch = true" in alb_subnet, "ALB subnets are not clearly public"
+
+    # Route table association binding ALB subnets to the public route table.
+    assoc = _resource_block(main, "aws_route_table_association", "alb")
+    assert assoc, "missing aws_route_table_association alb"
+    assert "aws_subnet.alb" in assoc, "association does not bind the ALB subnets"
+    assert "aws_route_table.alb" in assoc, "association does not bind the public route table"
+
+
+def test_aws_create_alb_subnets_local_gates_on_created_vpc_and_empty_byo():
+    main = _read(AWS_DIR / "main.tf")
+    assert "create_alb_subnets" in main, "missing create_alb_subnets local"
+
+    start = main.find("create_alb_subnets = ")
+    assert start != -1, "create_alb_subnets is not assigned"
+    line = main[start : main.find("\n", start)]
+    # Module creates public ALB subnets only when it creates the VPC and no BYO
+    # ALB subnets were supplied.
+    assert "local.create_vpc" in line, "create_alb_subnets does not gate on creating the VPC"
+    assert "length(var.existing_alb_subnet_ids) == 0" in line, "create_alb_subnets does not gate on empty BYO ALB subnets"
+
+
+def test_aws_effective_alb_subnets_use_created_public_subnets_not_private_service_subnets():
+    main = _read(AWS_DIR / "main.tf")
+    start = main.find("effective_alb_subnet_ids = ")
+    assert start != -1, "missing effective_alb_subnet_ids local assignment"
+    line = main[start : main.find("\n", start)]
+
+    # Module-created path uses the public ALB subnets; BYO path uses the public
+    # ALB subnet IDs. It must never fall back to the private service subnets.
+    assert "aws_subnet.alb[*].id" in line, "ALB subnet local does not use the module-created public subnets"
+    assert "var.existing_alb_subnet_ids" in line, "ALB subnet local does not use the BYO public ALB subnets"
+    assert "effective_subnet_ids" not in line, "ALB subnet local still falls back to the private service subnets"
+
+
+def test_aws_lb_consumes_effective_alb_subnet_local():
+    main = _read(AWS_DIR / "main.tf")
+    lb = _resource_block(main, "aws_lb", "this")
+    assert lb, "missing aws_lb this"
+    assert "local.effective_alb_subnet_ids" in lb, "ALB does not wire to the effective ALB subnet local"
+
+
+def test_aws_alb_subnet_ids_validation_requires_two_when_byo_vpc():
+    variables = _read(AWS_DIR / "variables.tf")
+    block = _variable_block(variables, "existing_alb_subnet_ids")
+    assert block, "missing existing_alb_subnet_ids variable"
+    assert "validation" in block, "existing_alb_subnet_ids has no validation"
+
+    # BYO VPC requires at least two public ALB subnets — empty is only allowed
+    # when the module creates the VPC (and thus its public ALB subnets).
+    assert "var.existing_vpc_id" in block, "ALB subnet validation does not gate empty-allowed on creating the VPC"
+    assert ">= 2" in block, "ALB subnet validation does not require at least two subnets"
+
+
+def test_aws_alb_subnet_ids_validation_rejects_mixed_created_vpc_with_byo_alb_subnets():
+    variables = _read(AWS_DIR / "variables.tf")
+    block = _variable_block(variables, "existing_alb_subnet_ids")
+    assert block, "missing existing_alb_subnet_ids variable"
+
+    # Mixed mode would create the ALB security group/target group in the new VPC
+    # while attaching the ALB to caller-supplied subnets from another VPC. The
+    # valid modes are: fully module-created network, or BYO VPC plus BYO public
+    # ALB subnets.
+    normalized = " ".join(block.split())
+    assert 'var.existing_vpc_id != "" && length(var.existing_alb_subnet_ids) >= 2' in normalized
+
+
+def test_tfvars_example_documents_existing_alb_subnet_ids():
+    tfvars = _read(AWS_DIR / "terraform.tfvars.example")
+    assert "existing_alb_subnet_ids" in tfvars, "tfvars example does not surface existing_alb_subnet_ids"
+
+    # The example explains these are public/edge ALB subnets for the BYO path.
+    lowered = tfvars.lower()
+    assert "public" in lowered or "edge" in lowered, "tfvars does not explain ALB subnets are public/edge"
+
+
+def test_aws_readme_states_byo_vpc_requires_public_alb_subnets_and_default_is_public():
+    readme = _read(AWS_DIR / "README.md")
+    lowered = readme.lower()
+
+    assert "existing_alb_subnet_ids" in readme, "README does not document existing_alb_subnet_ids"
+    # Default module-created ALB subnets now get public routing.
+    assert "public rout" in lowered, "README does not say module-created ALB subnets get public routing"
+    # BYO VPC requires public ALB subnets.
+    assert "requir" in lowered, "README does not state BYO VPC requires public ALB subnets"
+    # No claim that the fallback reuses the private service subnets for the ALB.
+    assert (
+        "reuse the private service subnets" not in lowered
+        and "reuse `existing_subnet_ids`" not in readme
+    ), "README still claims the ALB falls back to the private service subnets"
+
+
+def test_aws_readme_drops_blocking_ingress_caveat_but_keeps_dns_acm_honesty():
+    readme = _read(AWS_DIR / "README.md")
+    # Ingress is now wired, so the blocking "apply yields nothing reachable"
+    # caveat is gone.
+    assert "does not yield a working deployment" not in readme
+    lowered = readme.lower()
+    # Remaining honest gaps are still stated: custom DNS, TLS/ACM (HTTP-only
+    # listener), and an applied smoke test.
+    assert "dns" in lowered
+    assert "acm" in lowered or "tls" in lowered or "https" in lowered
+    assert "smoke" in lowered
+
+
 def test_readmes_use_module_local_commands_not_root_relative_paths():
     for module_dir, name in ((AWS_DIR, "aws-managed"), (GCP_DIR, "gcp-managed")):
         readme = _read(module_dir / "README.md")

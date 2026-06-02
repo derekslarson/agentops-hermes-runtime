@@ -3,12 +3,16 @@
 This module packages the `aws-managed` backend profile so a customer can edit
 account/region/domain/capacity settings and apply Terraform or OpenTofu. It
 packages the resource topology and the variables/outputs contract; see the
-completeness caveat under **Apply** before treating an apply as a finished
-install.
+remaining-gaps caveat under **Apply** before treating an apply as a fully
+production-finished install.
 
 ## What it provisions
 
 - API / control-plane ECS/Fargate service + task definition
+- Public Application Load Balancer (target group + HTTP listener) fronting the
+  control-plane, with ALB and service security groups. When the module creates
+  the VPC it also creates **public ALB subnets** with an Internet Gateway and a
+  public default route, so a default apply can stand up an internet-facing ALB
 - Worker fleet ECS/Fargate service + task definition (Application Auto Scaling)
 - Scheduler ECS/Fargate service + task definition
 - RDS Postgres database
@@ -20,13 +24,25 @@ install.
 
 ## Apply
 
-> **Completeness caveat:** ECS task definitions and the customer-supplied
-> container images are now wired to the services with the non-secret backend env
-> contract. However, running `apply` still **does not yield a working deployment**:
-> public ingress (ALB + listener) and DNS for the API/control-plane are still a
-> `TODO` in `main.tf`, so the API is not reachable at `domain`. Wire that ingress
-> (and the private-networking notes under **Scope**) before expecting a reachable
-> install.
+> **Remaining-gaps caveat:** ECS task definitions, container images, and a public
+> ALB (target group + HTTP listener) fronting the control-plane are wired, so an
+> apply **provisions** an ALB DNS endpoint (see the `agentops_api_url` output).
+> When this module creates the VPC it also creates **public ALB subnets** (IGW +
+> public route), so a default apply stands up an internet-facing ALB. What is
+> still **deferred** and needs site-specific work before this is
+> production-complete:
+>
+> - **Public ALB routing for a BYO VPC** — when the module creates the VPC it
+>   creates public ALB subnets with an Internet Gateway and a default route, so
+>   the default apply is reachable. With a **bring-your-own VPC** you must supply
+>   at least two **public** subnets via `existing_alb_subnet_ids`; the module does
+>   not add public routing to a VPC it did not create.
+> - **Custom DNS** — pointing `domain` at the ALB (e.g. a Route53 alias record)
+>   is not created here; URLs derive from the ALB DNS name, not `domain`.
+> - **TLS/ACM** — the listener is HTTP-only (port 80). HTTPS needs an ACM
+>   certificate and a 443 listener.
+> - **Applied smoke test** — no end-to-end `apply` against a live AWS account has
+>   been run/verified in this slice; treat the first real apply as the smoke test.
 
 All commands run from inside this module directory. With Terraform:
 
@@ -57,7 +73,17 @@ resources:
   bring-your-own VPC **requires** bring-your-own subnets: if `existing_vpc_id`
   is set you must also set `existing_subnet_ids` (enforced by a variable
   validation). Subnets are only created by this module when it also creates the
-  VPC (both left empty).
+  VPC (both left empty). These are the **private service subnets** the ECS tasks
+  run in.
+- `existing_alb_subnet_ids` — the **public/edge subnets** the internet-facing ALB
+  attaches to, distinct from the private service subnets above. When this module
+  creates the VPC (both `existing_vpc_id` and this list left empty) it creates
+  public ALB subnets for you, with an Internet Gateway and a public default route.
+  With a **bring-your-own VPC** (`existing_vpc_id` set) you **must** supply at
+  least two **public** subnets here — the module does not add public routing to a
+  VPC it did not create, so a BYO VPC needs its own public ALB subnets (enforced
+  by a variable validation that also requires at least two entries, since an
+  Application Load Balancer needs two subnets in different AZs).
 - `existing_database_arn` — reuse an existing RDS/Postgres database. Whether
   created or reused, the database is surfaced through the `database_refs` output.
 - `existing_artifact_bucket` — reuse an existing S3 bucket.
@@ -91,11 +117,16 @@ After apply, `terraform output` (or `tofu output`) surfaces:
 
 ## Scope
 
-This slice packages the profile topology with the variables/outputs contract and
+This slice packages the profile topology with the variables/outputs contract,
 wires ECS task definitions to the customer-supplied container images
 (`control_plane_image`, `worker_image`, `scheduler_image`) with the non-secret
 backend env (`AGENTOPS_RUNTIME_PROFILE`, queue/artifact/secret-prefix/database
-refs, and the worker's `AGENTOPS_WORKER_MAX_CONCURRENT_RUNS`). Public ingress
-(ALB + listener), DNS, and full private networking are still marked `TODO` in
-`main.tf` where they require site-specific values; fill those in for a
+refs, and the worker's `AGENTOPS_WORKER_MAX_CONCURRENT_RUNS`), and fronts the
+control-plane with a public ALB (target group + HTTP listener on
+`api_container_port`). When the module creates the VPC it also creates public ALB
+subnets with an Internet Gateway and a public default route, so a default apply
+stands up an internet-facing ALB; a bring-your-own VPC instead supplies its own
+public/edge subnets via `existing_alb_subnet_ids`. Custom DNS for `domain`,
+TLS/ACM (the listener is HTTP-only), and an applied end-to-end smoke test remain
+deferred and require site-specific values; fill those in for a
 production-complete deployment.

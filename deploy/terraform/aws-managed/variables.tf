@@ -56,6 +56,12 @@ variable "scheduler_image" {
   default     = "agentops/hermes-scheduler:replace-me"
 }
 
+variable "api_container_port" {
+  description = "TCP port the API / control-plane container listens on (target group + listener forward here). Not a secret."
+  type        = number
+  default     = 8080
+}
+
 # --- Capacity ----------------------------------------------------------------
 
 variable "desired_task_count" {
@@ -98,6 +104,19 @@ variable "existing_subnet_ids" {
   validation {
     condition     = var.existing_vpc_id == "" || length(var.existing_subnet_ids) > 0
     error_message = "existing_subnet_ids must be provided when existing_vpc_id is set (bring-your-own VPC requires bring-your-own subnets)."
+  }
+}
+
+variable "existing_alb_subnet_ids" {
+  description = "Public/edge subnet IDs the internet-facing ALB attaches to. These are the public-routing subnets, distinct from the private service subnets in existing_subnet_ids. Leave empty ONLY when this module creates the VPC — it then creates public ALB subnets with IGW + default route for you. A bring-your-own VPC (existing_vpc_id set) MUST supply at least two public/edge subnets here, because the module does not add public routing to a VPC it did not create. An Application Load Balancer requires at least two subnets in different AZs, so when provided this must list at least two."
+  type        = list(string)
+  default     = []
+
+  validation {
+    # Valid modes are either fully module-created networking (empty VPC + empty
+    # ALB subnets) or BYO VPC plus at least two BYO public/edge ALB subnets.
+    condition     = (var.existing_vpc_id == "" && length(var.existing_alb_subnet_ids) == 0) || (var.existing_vpc_id != "" && length(var.existing_alb_subnet_ids) >= 2)
+    error_message = "existing_alb_subnet_ids must be empty when this module creates the VPC; when existing_vpc_id is set, it must list at least two public/edge subnets in different AZs."
   }
 }
 

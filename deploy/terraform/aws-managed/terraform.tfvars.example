@@ -28,6 +28,14 @@ db_instance_class = "db.t4g.medium"
 # --- Bring-your-own-network (leave empty to create new) ---------------------
 # existing_vpc_id     = "vpc-0123456789abcdef0"
 # existing_subnet_ids = ["subnet-aaa", "subnet-bbb"]
+#
+# Public/edge subnets for the internet-facing ALB, distinct from the private
+# service subnets above. When this module creates the VPC it creates these public
+# ALB subnets (with IGW + public route) automatically, so leave this empty. With
+# a bring-your-own VPC you MUST supply at least two PUBLIC subnets here — the
+# module does not add public routing to a VPC it did not create.
+existing_alb_subnet_ids = []
+# existing_alb_subnet_ids = ["subnet-public-aaa", "subnet-public-bbb"]
 
 # --- Bring-your-own-managed-resource (leave empty to create new) ------------
 # existing_database_arn    = "arn:aws:rds:us-east-1:123456789012:db:my-postgres"

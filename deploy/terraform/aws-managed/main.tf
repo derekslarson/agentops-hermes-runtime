@@ -13,11 +13,16 @@
 #   * IAM task/execution roles
 #   * Application Auto Scaling for the worker service
 #
-# Scope/honesty: task definitions and customer-supplied container images are now
-# wired to the services with the non-secret backend env contract. Public ingress
-# (ALB + listener) and DNS for the API/control-plane are still left as a TODO
-# below where a real deployment needs site-specific values, so an apply does not
-# yet yield a reachable, production-complete stack unattended.
+# Scope/honesty: task definitions, customer-supplied container images, and a
+# public Application Load Balancer (target group + HTTP listener) fronting the
+# API/control-plane are wired, so an apply provisions an ALB DNS endpoint. When
+# this module creates the VPC it also creates PUBLIC ALB subnets with public
+# routing (IGW + default route), so a default apply can stand up an
+# internet-facing ALB. A bring-your-own VPC must instead supply public/edge
+# subnets via var.existing_alb_subnet_ids. Custom DNS (Route53) + TLS/ACM for
+# var.domain and an applied end-to-end smoke test remain deferred and need
+# site-specific values; see the README "Scope" / "Apply" sections for the honest
+# remaining gaps.
 ###############################################################################
 
 terraform {
@@ -47,10 +52,21 @@ locals {
   create_database       = var.existing_database_arn == ""
   create_artifact_store = var.existing_artifact_bucket == ""
 
+  # Public ALB subnets are created (with IGW + public-route wiring) only when the
+  # module creates the VPC and no bring-your-own ALB subnets were supplied. A BYO
+  # VPC must bring its own public/edge ALB subnets via var.existing_alb_subnet_ids.
+  create_alb_subnets = local.create_vpc && length(var.existing_alb_subnet_ids) == 0
+
   # Effective network the runtime services attach to. Bring-your-own values win
   # when provided; otherwise the module's created VPC/subnets are used.
   effective_vpc_id     = local.create_vpc ? aws_vpc.this[0].id : var.existing_vpc_id
   effective_subnet_ids = local.create_subnets ? aws_subnet.this[*].id : var.existing_subnet_ids
+
+  # Public/edge subnets the internet-facing ALB attaches to. When the module
+  # creates them they get real public routing (IGW + 0.0.0.0/0 route); otherwise
+  # the bring-your-own public ALB subnets are used. Never the private service
+  # subnets — those have no public route.
+  effective_alb_subnet_ids = local.create_alb_subnets ? aws_subnet.alb[*].id : var.existing_alb_subnet_ids
 
   # Secret CONTAINERS created by Terraform. Raw values are written by bootstrap
   # (M16) into these refs — never passed as Terraform inputs or stored in state.
@@ -105,13 +121,55 @@ data "aws_availability_zones" "available" {
 
 # Subnets are created only when this module also creates the VPC. A
 # bring-your-own VPC is expected to come with bring-your-own subnets via
-# var.existing_subnet_ids.
+# var.existing_subnet_ids. These are the PRIVATE service subnets the ECS tasks
+# run in (no public route); the public ALB attaches to aws_subnet.alb below.
 resource "aws_subnet" "this" {
   count             = local.create_subnets ? 2 : 0
   vpc_id            = aws_vpc.this[0].id
   cidr_block        = cidrsubnet(aws_vpc.this[0].cidr_block, 8, count.index)
   availability_zone = data.aws_availability_zones.available.names[count.index]
   tags              = merge(local.common_tags, { "Name" = "${local.prefix}-subnet-${count.index}" })
+}
+
+# --- Public edge networking for the internet-facing ALB ---------------------
+#
+# When the module creates the VPC (and no BYO ALB subnets were supplied) it also
+# creates PUBLIC ALB subnets with real public routing: an Internet Gateway and a
+# route table with a default route to it, associated to the ALB subnets. This is
+# what makes a default apply able to create a working internet-facing ALB. A BYO
+# VPC instead supplies its own public/edge subnets via var.existing_alb_subnet_ids.
+
+resource "aws_internet_gateway" "this" {
+  count  = local.create_alb_subnets ? 1 : 0
+  vpc_id = aws_vpc.this[0].id
+  tags   = merge(local.common_tags, { "Name" = "${local.prefix}-igw" })
+}
+
+resource "aws_subnet" "alb" {
+  count                   = local.create_alb_subnets ? 2 : 0
+  vpc_id                  = aws_vpc.this[0].id
+  cidr_block              = cidrsubnet(aws_vpc.this[0].cidr_block, 8, count.index + 128)
+  availability_zone       = data.aws_availability_zones.available.names[count.index]
+  map_public_ip_on_launch = true
+  tags                    = merge(local.common_tags, { "Name" = "${local.prefix}-alb-subnet-${count.index}" })
+}
+
+resource "aws_route_table" "alb" {
+  count  = local.create_alb_subnets ? 1 : 0
+  vpc_id = aws_vpc.this[0].id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.this[0].id
+  }
+
+  tags = merge(local.common_tags, { "Name" = "${local.prefix}-alb-rt" })
+}
+
+resource "aws_route_table_association" "alb" {
+  count          = local.create_alb_subnets ? 2 : 0
+  subnet_id      = aws_subnet.alb[count.index].id
+  route_table_id = aws_route_table.alb[0].id
 }
 
 # --- Logs --------------------------------------------------------------------
@@ -258,6 +316,99 @@ resource "aws_secretsmanager_secret" "containers" {
   tags     = local.common_tags
 }
 
+# --- Public ingress (ALB + target group + HTTP listener) --------------------
+#
+# A public Application Load Balancer fronts the API / control-plane service. It
+# attaches to local.effective_alb_subnet_ids: the module-created public ALB
+# subnets (IGW + public route) by default, or the bring-your-own public/edge
+# subnets in var.existing_alb_subnet_ids. The listener is HTTP only: TLS/ACM and
+# custom DNS (Route53) for var.domain are deferred (site-specific), so URLs
+# derive from the ALB DNS name over HTTP until those are wired.
+
+resource "aws_security_group" "alb" {
+  name        = "${local.prefix}-alb"
+  description = "Public ingress to the AgentOps API/control-plane ALB."
+  vpc_id      = local.effective_vpc_id
+
+  ingress {
+    description = "HTTP from the internet"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = local.common_tags
+}
+
+# Service security group: control-plane accepts ALB traffic on the container
+# port; all services get unrestricted egress.
+resource "aws_security_group" "service" {
+  name        = "${local.prefix}-service"
+  description = "AgentOps runtime ECS tasks."
+  vpc_id      = local.effective_vpc_id
+
+  ingress {
+    description     = "API container port from the ALB"
+    from_port       = var.api_container_port
+    to_port         = var.api_container_port
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = local.common_tags
+}
+
+resource "aws_lb" "this" {
+  name               = "${local.prefix}-alb"
+  load_balancer_type = "application"
+  internal           = false
+  security_groups    = [aws_security_group.alb.id]
+  subnets            = local.effective_alb_subnet_ids
+  tags               = local.common_tags
+}
+
+resource "aws_lb_target_group" "api" {
+  name        = "${local.prefix}-api"
+  port        = var.api_container_port
+  protocol    = "HTTP"
+  vpc_id      = local.effective_vpc_id
+  target_type = "ip" # Fargate awsvpc tasks register by IP, not by instance.
+
+  health_check {
+    path = "/healthz"
+  }
+
+  tags = local.common_tags
+}
+
+resource "aws_lb_listener" "api" {
+  load_balancer_arn = aws_lb.this.arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.api.arn
+  }
+
+  tags = local.common_tags
+}
+
 # --- ECS cluster + services --------------------------------------------------
 
 resource "aws_ecs_cluster" "this" {
@@ -278,9 +429,13 @@ resource "aws_ecs_task_definition" "control_plane" {
   tags                     = local.common_tags
 
   container_definitions = jsonencode([{
-    name             = "control-plane"
-    image            = var.control_plane_image
-    essential        = true
+    name      = "control-plane"
+    image     = var.control_plane_image
+    essential = true
+    portMappings = [{
+      containerPort = var.api_container_port
+      protocol      = "tcp"
+    }]
     environment      = local.runtime_common_env
     logConfiguration = local.log_config
   }])
@@ -326,11 +481,7 @@ resource "aws_ecs_task_definition" "scheduler" {
   }])
 }
 
-# TODO(ingress): public ALB + listener and DNS for the control-plane are not yet
-# wired. Until they are, the API/control-plane is not reachable at var.domain and
-# an apply does not yield a working, internet-facing deployment.
-
-# API / control-plane service.
+# API / control-plane service, fronted by the public ALB target group.
 resource "aws_ecs_service" "control_plane" {
   name            = "${local.prefix}-control-plane"
   cluster         = aws_ecs_cluster.this.id
@@ -341,8 +492,18 @@ resource "aws_ecs_service" "control_plane" {
 
   network_configuration {
     subnets          = local.effective_subnet_ids
+    security_groups  = [aws_security_group.service.id]
     assign_public_ip = false
   }
+
+  load_balancer {
+    target_group_arn = aws_lb_target_group.api.arn
+    container_name   = "control-plane"
+    container_port   = var.api_container_port
+  }
+
+  # The listener must exist before the service registers targets.
+  depends_on = [aws_lb_listener.api]
 }
 
 # Worker fleet service.
@@ -356,6 +517,7 @@ resource "aws_ecs_service" "worker" {
 
   network_configuration {
     subnets          = local.effective_subnet_ids
+    security_groups  = [aws_security_group.service.id]
     assign_public_ip = false
   }
 }
@@ -371,6 +533,7 @@ resource "aws_ecs_service" "scheduler" {
 
   network_configuration {
     subnets          = local.effective_subnet_ids
+    security_groups  = [aws_security_group.service.id]
     assign_public_ip = false
   }
 }
