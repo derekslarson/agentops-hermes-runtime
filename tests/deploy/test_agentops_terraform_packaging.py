@@ -3443,3 +3443,301 @@ def test_live_smoke_docs_note_terraform_artifacts_are_operator_local_not_committ
         assert "commit" in lowered, (
             f"{module_dir.name}: live-smoke section does not say the local Terraform artifacts must not be committed"
         )
+
+
+# --- optional DESTROY_ON_FAILURE cleanup guard on the apply path (M15 slice) -
+#
+# Both managed-cloud live-smoke helpers must support an OPTIONAL, side-effect-safe
+# DESTROY_ON_FAILURE cleanup guard. The default preserves existing behavior (no
+# destroy). When PLAN_ONLY=0 and DESTROY_ON_FAILURE=1, if `apply` SUCCEEDS but the
+# subsequent /healthz probe FAILS, the helper attempts `terraform/tofu destroy
+# -auto-approve -input=false` and then exits non-zero. It must never destroy on
+# plan-only runs, never destroy before a successful apply, never destroy on
+# placeholder-image/public-invoker preflight failures, and never echo/require raw
+# app/integration secret values. Module-local, provider-agnostic (CLI only).
+
+AWS_DESTROY_ENV = {"TF_VAR_region": "us-east-1", "TF_VAR_domain": "agentops.example"}
+GCP_DESTROY_ENV = {
+    "TF_VAR_project": "example-project",
+    "TF_VAR_region": "us-central1",
+    "TF_VAR_enable_public_invoker": "true",
+}
+
+
+def _make_destroy_smoke_stub_bin(tmp: Path) -> Path:
+    """Stub terraform/aws/gcloud/curl for driving the DESTROY_ON_FAILURE path.
+
+    terraform: no-ops init/validate/plan; `console` returns a non-placeholder
+    image and the TF_VAR-driven enable_public_invoker (so the image/public-invoker
+    preflights pass); `output -raw` returns a URL; `apply` touches $APPLY_MARKER
+    and exits ${APPLY_EXIT:-0}; `destroy` touches $DESTROY_MARKER and exits 0.
+    curl exits ${CURL_EXIT:-1} so the post-apply /healthz probe fails by default —
+    the exact scenario an opted-in DESTROY_ON_FAILURE run must clean up after.
+    """
+    bin_dir = tmp / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+
+    terraform = bin_dir / "terraform"
+    terraform.write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        "  console)\n"
+        '    q="$(cat)"\n'
+        '    case "$q" in\n'
+        "      *enable_public_invoker*) printf '%s\\n' \"${TF_VAR_enable_public_invoker:-false}\" ;;\n"
+        "      *image*) printf 'gcr.io/example/app:v1\\n' ;;\n"
+        "      *) printf '\\n' ;;\n"
+        "    esac\n"
+        "    ;;\n"
+        "  output)\n"
+        '    if [ "${2:-}" = "-raw" ]; then printf \'http://api.example.test\\n\'; else printf \'hint\\n\'; fi\n'
+        "    ;;\n"
+        "  apply)\n"
+        '    : >"$APPLY_MARKER"\n'
+        '    exit "${APPLY_EXIT:-0}"\n'
+        "    ;;\n"
+        "  destroy)\n"
+        '    : >"$DESTROY_MARKER"\n'
+        "    exit 0\n"
+        "    ;;\n"
+        "  *) : ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    terraform.chmod(0o755)
+
+    aws = bin_dir / "aws"
+    aws.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    aws.chmod(0o755)
+
+    gcloud = bin_dir / "gcloud"
+    gcloud.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [ "${1:-}" = "auth" ] && [ "${2:-}" = "list" ]; then printf \'tester@example.com\\n\'; fi\n',
+        encoding="utf-8",
+    )
+    gcloud.chmod(0o755)
+
+    curl = bin_dir / "curl"
+    curl.write_text("#!/usr/bin/env bash\nexit ${CURL_EXIT:-1}\n", encoding="utf-8")
+    curl.chmod(0o755)
+
+    return bin_dir
+
+
+def _run_destroy_smoke(
+    script: Path,
+    bin_dir: Path,
+    *,
+    plan_only: str,
+    destroy_on_failure: str | None,
+    apply_marker: Path,
+    destroy_marker: Path,
+    extra_env: dict[str, str],
+    apply_exit: str = "0",
+    curl_exit: str = "1",
+) -> subprocess.CompletedProcess[str]:
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+        "PLAN_ONLY": plan_only,
+        "APPLY_MARKER": str(apply_marker),
+        "DESTROY_MARKER": str(destroy_marker),
+        "APPLY_EXIT": apply_exit,
+        "CURL_EXIT": curl_exit,
+    }
+    env.pop("DESTROY_ON_FAILURE", None)
+    if destroy_on_failure is not None:
+        env["DESTROY_ON_FAILURE"] = destroy_on_failure
+    env.update(extra_env)
+    return subprocess.run(
+        ["bash", str(script)],
+        env=env,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+
+
+def _assert_destroys_on_opt_in(script: Path, extra_env: dict[str, str], tmp_path: Path) -> None:
+    apply_marker = tmp_path / "applied"
+    destroy_marker = tmp_path / "destroyed"
+    bin_dir = _make_destroy_smoke_stub_bin(tmp_path)
+    result = _run_destroy_smoke(
+        script,
+        bin_dir,
+        plan_only="0",
+        destroy_on_failure="1",
+        apply_marker=apply_marker,
+        destroy_marker=destroy_marker,
+        extra_env=extra_env,
+    )
+    assert apply_marker.exists(), (
+        f"{script.parent.name}: apply not reached "
+        f"(stdout={result.stdout!r} stderr={result.stderr!r})"
+    )
+    assert destroy_marker.exists(), (
+        f"{script.parent.name}: DESTROY_ON_FAILURE=1 did not destroy after a failed "
+        f"/healthz probe (stdout={result.stdout!r} stderr={result.stderr!r})"
+    )
+    assert result.returncode != 0, (
+        f"{script.parent.name}: smoke.sh must still exit non-zero after destroying on failure"
+    )
+
+
+def _assert_no_destroy_by_default(script: Path, extra_env: dict[str, str], tmp_path: Path) -> None:
+    apply_marker = tmp_path / "applied"
+    destroy_marker = tmp_path / "destroyed"
+    bin_dir = _make_destroy_smoke_stub_bin(tmp_path)
+    result = _run_destroy_smoke(
+        script,
+        bin_dir,
+        plan_only="0",
+        destroy_on_failure=None,
+        apply_marker=apply_marker,
+        destroy_marker=destroy_marker,
+        extra_env=extra_env,
+    )
+    assert apply_marker.exists(), f"{script.parent.name}: apply not reached"
+    assert not destroy_marker.exists(), (
+        f"{script.parent.name}: default run destroyed on probe failure "
+        f"(DESTROY_ON_FAILURE must default off; stdout={result.stdout!r} stderr={result.stderr!r})"
+    )
+    assert result.returncode != 0, (
+        f"{script.parent.name}: probe failure must still exit non-zero by default"
+    )
+
+
+def test_aws_smoke_script_destroys_on_failure_when_opted_in(tmp_path):
+    _assert_destroys_on_opt_in(SMOKE_SCRIPT, AWS_DESTROY_ENV, tmp_path)
+
+
+def test_gcp_smoke_script_destroys_on_failure_when_opted_in(tmp_path):
+    _assert_destroys_on_opt_in(GCP_SMOKE_SCRIPT, GCP_DESTROY_ENV, tmp_path)
+
+
+def test_aws_smoke_script_does_not_destroy_by_default_on_probe_failure(tmp_path):
+    _assert_no_destroy_by_default(SMOKE_SCRIPT, AWS_DESTROY_ENV, tmp_path)
+
+
+def test_gcp_smoke_script_does_not_destroy_by_default_on_probe_failure(tmp_path):
+    _assert_no_destroy_by_default(GCP_SMOKE_SCRIPT, GCP_DESTROY_ENV, tmp_path)
+
+
+def test_aws_smoke_script_plan_only_never_destroys_even_when_opted_in(tmp_path):
+    apply_marker = tmp_path / "applied"
+    destroy_marker = tmp_path / "destroyed"
+    bin_dir = _make_destroy_smoke_stub_bin(tmp_path)
+    result = _run_destroy_smoke(
+        SMOKE_SCRIPT,
+        bin_dir,
+        plan_only="1",
+        destroy_on_failure="1",
+        apply_marker=apply_marker,
+        destroy_marker=destroy_marker,
+        extra_env=AWS_DESTROY_ENV,
+    )
+    assert result.returncode == 0, (
+        f"plan-only run failed (stdout={result.stdout!r} stderr={result.stderr!r})"
+    )
+    assert not apply_marker.exists(), "plan-only run must never apply"
+    assert not destroy_marker.exists(), "plan-only run must never destroy"
+
+
+def test_gcp_smoke_script_plan_only_never_destroys_even_when_opted_in(tmp_path):
+    apply_marker = tmp_path / "applied"
+    destroy_marker = tmp_path / "destroyed"
+    bin_dir = _make_destroy_smoke_stub_bin(tmp_path)
+    result = _run_destroy_smoke(
+        GCP_SMOKE_SCRIPT,
+        bin_dir,
+        plan_only="1",
+        destroy_on_failure="1",
+        apply_marker=apply_marker,
+        destroy_marker=destroy_marker,
+        extra_env=GCP_DESTROY_ENV,
+    )
+    assert result.returncode == 0, (
+        f"plan-only run failed (stdout={result.stdout!r} stderr={result.stderr!r})"
+    )
+    assert not apply_marker.exists(), "plan-only run must never apply"
+    assert not destroy_marker.exists(), "plan-only run must never destroy"
+
+
+def test_aws_smoke_script_does_not_destroy_before_successful_apply(tmp_path):
+    # When apply itself FAILS, the helper must exit (set -e) before the probe and
+    # must never run destroy — it only destroys to clean up an apply that
+    # succeeded but failed its /healthz probe.
+    apply_marker = tmp_path / "applied"
+    destroy_marker = tmp_path / "destroyed"
+    bin_dir = _make_destroy_smoke_stub_bin(tmp_path)
+    result = _run_destroy_smoke(
+        SMOKE_SCRIPT,
+        bin_dir,
+        plan_only="0",
+        destroy_on_failure="1",
+        apply_marker=apply_marker,
+        destroy_marker=destroy_marker,
+        extra_env=AWS_DESTROY_ENV,
+        apply_exit="1",
+    )
+    assert result.returncode != 0, "a failed apply must exit non-zero"
+    assert not destroy_marker.exists(), (
+        f"destroy ran even though apply itself failed "
+        f"(stdout={result.stdout!r} stderr={result.stderr!r})"
+    )
+
+
+def test_gcp_smoke_script_does_not_destroy_before_successful_apply(tmp_path):
+    apply_marker = tmp_path / "applied"
+    destroy_marker = tmp_path / "destroyed"
+    bin_dir = _make_destroy_smoke_stub_bin(tmp_path)
+    result = _run_destroy_smoke(
+        GCP_SMOKE_SCRIPT,
+        bin_dir,
+        plan_only="0",
+        destroy_on_failure="1",
+        apply_marker=apply_marker,
+        destroy_marker=destroy_marker,
+        extra_env=GCP_DESTROY_ENV,
+        apply_exit="1",
+    )
+    assert result.returncode != 0, "a failed apply must exit non-zero"
+    assert not destroy_marker.exists(), (
+        f"destroy ran even though apply itself failed "
+        f"(stdout={result.stdout!r} stderr={result.stderr!r})"
+    )
+
+
+def test_smoke_scripts_destroy_guard_uses_provider_agnostic_cli_and_no_raw_secrets():
+    for script in (SMOKE_SCRIPT, GCP_SMOKE_SCRIPT):
+        text = _read(script)
+        name = script.parent.name
+        assert "DESTROY_ON_FAILURE" in text, f"{name}/smoke.sh missing DESTROY_ON_FAILURE guard"
+        assert "destroy -auto-approve -input=false" in text, (
+            f"{name}/smoke.sh does not run a CLI `destroy -auto-approve -input=false`"
+        )
+        # Provider-agnostic: destroy goes through the detected terraform/tofu CLI
+        # ("$TF"), not a cloud SDK.
+        assert '"$TF" destroy' in text, (
+            f"{name}/smoke.sh destroy is not invoked via the detected $TF CLI"
+        )
+        lowered = text.lower()
+        for token in RAW_SECRET_TOKENS:
+            assert token not in lowered, f"{token} referenced in {name}/smoke.sh"
+
+
+def test_smoke_scripts_document_destroy_on_failure_default_off():
+    for module_dir in (AWS_DIR, GCP_DIR):
+        section = _smoke_section(_read(module_dir / "README.md"))
+        assert section, f"{module_dir.name}: README has no live-smoke helper section"
+        assert "DESTROY_ON_FAILURE" in section, (
+            f"{module_dir.name}: live-smoke section does not document DESTROY_ON_FAILURE"
+        )
+        lowered = section.lower()
+        assert "destroy" in lowered, (
+            f"{module_dir.name}: live-smoke section does not describe the destroy cleanup"
+        )
+        assert "default" in lowered, (
+            f"{module_dir.name}: live-smoke section does not state the safe default (no destroy)"
+        )

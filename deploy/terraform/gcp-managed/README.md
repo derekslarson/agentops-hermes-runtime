@@ -146,10 +146,21 @@ unhealthy or unreachable. `curl` is required on the apply path (the helper fails
 clearly before applying if it is missing); the plan-only default never probes and
 so never needs `curl`.
 
+Optionally set `DESTROY_ON_FAILURE=1` to add a cleanup guard on the apply path:
+if `apply` **succeeds** but the `/healthz` probe then **fails**, the helper runs
+`terraform/tofu destroy -auto-approve -input=false` (through the detected CLI — no
+cloud SDK) before exiting non-zero, so a failed live smoke does not leave a
+half-provisioned stack behind. It defaults to `0` (**no destroy**, preserving the
+existing behavior) and never destroys on a plan-only run, before a successful
+apply, or on a preflight failure (missing inputs, `enable_public_invoker` not
+true, placeholder `:replace-me` images). Leave it unset unless you explicitly
+want failed-smoke cleanup.
+
 ```bash
 cd deploy/terraform/gcp-managed
 ./smoke.sh              # plan-only (default)
 PLAN_ONLY=0 ./smoke.sh  # opt-in apply, probe ${agentops_api_url}/healthz, surface outputs
+PLAN_ONLY=0 DESTROY_ON_FAILURE=1 ./smoke.sh  # apply, then destroy if /healthz fails
 ```
 
 Before a `PLAN_ONLY=0` apply/smoke you must replace the placeholder

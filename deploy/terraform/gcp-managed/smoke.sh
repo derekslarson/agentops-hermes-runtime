@@ -21,12 +21,25 @@
 # fetches the bare agentops_api_url output and curls ${agentops_api_url}/healthz,
 # failing closed (non-zero) on an unhealthy/unreachable response.
 #
+# Optional cleanup guard:
+#   DESTROY_ON_FAILURE=1   On the apply path only, if apply SUCCEEDS but the
+#                          subsequent /healthz probe FAILS, attempt a
+#                          non-interactive auto-approved Terraform/OpenTofu destroy
+#                          before exiting non-zero, so a failed live smoke does
+#                          not leave a half-provisioned stack behind. Defaults to
+#                          0 (no destroy), preserving existing behavior. It never
+#                          destroys on plan-only runs, never destroys before a
+#                          successful apply, and never destroys on a preflight
+#                          failure. Provider-agnostic — destroy goes through the
+#                          detected Terraform/OpenTofu CLI, never a cloud SDK.
+#
 # This helper never accepts or echoes raw app/integration secret values; bootstrap
 # (M16) owns those and writes them into the secret backend after apply.
 
 set -euo pipefail
 
 PLAN_ONLY="${PLAN_ONLY:-1}"
+DESTROY_ON_FAILURE="${DESTROY_ON_FAILURE:-0}"
 
 # Operate on the module directory this script lives in (module-local commands;
 # no root-relative -chdir hacks).
@@ -160,6 +173,13 @@ API_URL="$("$TF" output -raw agentops_api_url)"
 echo "Probing ${API_URL}/healthz ..."
 if ! curl -fsS --max-time 30 "${API_URL}/healthz" >/dev/null; then
   echo "error: API health probe failed — ${API_URL}/healthz did not respond healthy" >&2
+  # Optional cleanup: apply succeeded but the endpoint is unhealthy. Only when
+  # explicitly opted in (DESTROY_ON_FAILURE=1) do we tear the stack back down via
+  # the detected Terraform/OpenTofu CLI (no cloud SDK) before failing closed.
+  if [ "$DESTROY_ON_FAILURE" = "1" ]; then
+    echo "DESTROY_ON_FAILURE=1 — apply succeeded but /healthz failed; destroying provisioned resources ..." >&2
+    "$TF" destroy -auto-approve -input=false
+  fi
   exit 1
 fi
 echo "API health probe OK — ${API_URL}/healthz responded healthy"
