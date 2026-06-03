@@ -27,6 +27,21 @@ This is not a wrapper that injects memory around Hermes. The native Hermes surfa
 13. **Infrastructure provisioning is separate from application activation.** Terraform/OpenTofu should create inert cloud resources and output URLs/refs; a bootstrap UI/CLI should store integration secrets, configure policies, run migrations, and prove the system works.
 14. **Secrets stay out of Terraform state.** Terraform may create secret containers/placeholders and IAM access, but Slack/GitHub/Linear/Jira/model-provider secret values should be written by bootstrap directly into the configured secret backend.
 15. **Small fork deltas.** Prefer modular seams that could be upstreamed or maintained as a small patch stack.
+16. **Cloud feature parity is the first-version bar.** Do not mark the roadmap/MVP complete because cloud can provision infrastructure while native Hermes surfaces are missing, local-only, health-only, fake-backed, or import-only. A managed deployment must support the same user-visible Hermes capabilities as local mode — curated memory, deep-memory record recall, skills, sessions, cron/autonomous jobs, credentials/secrets, tools, artifacts, audit, delivery, conversation continuity, approvals/follow-up, and worker lifecycle — through scoped durable backends.
+
+## Feature-parity audit gates (2026-06-03 correction)
+
+This section is the durable correction for the scope drift that treated some local Hermes behavior as optional in cloud. The autonomous builder must treat these as MVP gates, not stretch goals.
+
+Audit findings against code:
+
+1. **Deep memory was pulled back to local/scoped seams.** `agent/runtime_backends.py` currently marks `BackendCapability.DEEP_MEMORY` optional and excludes it from `REQUIRED_CAPABILITIES`; `agentops_runtime.compose_backends.configure_compose_runtime_backends(...)` does not register a deep-memory adapter; `agentops_runtime.aws_managed.configure_aws_managed_runtime_backends(...)` registers local/fake backends for the `aws-managed` spike. That is not feature parity.
+2. **Compose still has health-only services and hermetic in-process smoke for several surfaces.** `agentops_runtime.compose_services` exposes `/healthz`/`/readyz` and backend-wiring checks, while `agentops_runtime.compose_smoke.create_compose_smoke_registry(...)` proves distributed semantics with shared local contract backends rather than real API/database/queue/object-store endpoints. That is useful scaffolding, but not a self-hosted multi-tenant Hermes deployment.
+3. **Managed cloud adapter mode is still a contract spike for runtime state.** `agentops_runtime.aws_managed` intentionally avoids boto3/network/cloud dependencies and registers local/fake backends. M15 provisions cloud resources and helper scripts, but the runtime must still bind those resources to real non-local adapters before a cloud deployment has parity.
+4. **HTTP adapter coverage is partial.** Compose currently wires HTTP adapters for curated memory, cron, artifacts, and audit only. Sessions, skills, credentials/secrets, queue, run leases, conversation routing, worker registry, delivery, and deep memory need explicit remote/durable adapters or control-plane endpoints before the first version is complete.
+5. **A green `/healthz` is insufficient.** Health proves process reachability; it does not prove native Hermes parity. Final smoke evidence must exercise an actual conversation/event loop using scoped native surfaces and durable remote state.
+
+Builder rule: when the earliest pending milestone below mentions a parity gap, implement that gap rather than narrowing the acceptance criteria. If a capability exists locally, the first cloud-deployable version needs either the same native behavior behind a scoped remote/durable backend or an explicit roadmap decision from Derek changing scope.
 
 ## Required deployment profiles
 
@@ -599,6 +614,25 @@ Caveats:
 3. `scripts/local_memory_import.py --profile` now resolves `<hermes_root>/profiles/<name>` (and default → root) via `get_default_hermes_root()`, not `~/.hermes-<name>`. Tests: `test_named_profile_resolves_to_profiles_subdir`, `test_default_profile_resolves_to_hermes_root`.
 4. Import redaction now fails closed — `_redact_or_skip()` skips any record/turn whose enabled redaction raises, so raw text is never persisted. Tests: `test_import_redaction_failure_fails_closed`, `test_import_redaction_disabled_still_imports`.
 
+### M5B. Remote durable deep-memory adapter + parity correction
+
+**Status:** Pending
+
+**Goal:** Make deep-memory record recall feature-parity for compose/cloud profiles, not just local/local-multi. The cloud runtime must ingest completed turns, prefetch scoped hints, and serve `memory_record_search` / `memory_record_get` / `memory_record_get_many` through a durable remote backend with the same user-visible semantics as Derek's local Hermes.
+
+**Audit correction:** M5A is correctly Done for the local provider plus scoped fail-closed seams, but that is not enough for the first cloud-deployable version. The roadmap previously allowed compose/cloud to fail closed with no `DEEP_MEMORY` adapter. That was too small: fail-closed remains correct for misconfiguration, but a completed MVP profile must ship and register a real scoped deep-memory backend.
+
+**Acceptance criteria:**
+
+- `DEEP_MEMORY` is treated as MVP-required for `local-multi`, `compose-self-hosted`, and the first managed-cloud profile. Local single-user compatibility may continue using the MemoryManager provider path, but no cloud/compose profile can be considered complete while native deep-memory tools are absent.
+- Add a provider-neutral `HttpMemoryRecordBackend` (or equivalent adapter behind `MemoryRecordBackend`) and register it explicitly for compose and managed-cloud profiles. Missing/unsafe config fails closed; there is no fallback to `$HERMES_HOME/deep-memory`, Chroma, process-local dicts, or another tenant's store in AgentOps mode.
+- Implement the control-plane storage API for deep-memory records: upsert completed-turn records, search, get-one, get-many, automatic-prefetch query, and idempotent scoped import. The API accepts only a sanitized RuntimeContext-derived scope, bearer/control-plane auth, record metadata/provenance, and redacted text.
+- Back the first durable implementation with Postgres + `pgvector` + Postgres full-text search (or an equivalent committed adapter with the same vector + keyword + deterministic-boost behavior). Compose uses its Postgres service; AWS uses RDS Postgres; GCP uses Cloud SQL Postgres if/when the GCP profile is used for parity.
+- Completed user-facing turns are ingested through the selected backend in local-multi/compose/cloud, not only via offline import. Interrupted/failed turns are skipped; cron/subagent/review/internal traces remain excluded unless policy opts them in.
+- Preserve local useful semantics: stable `mem_...` IDs, source/provenance metadata, vector/BM25 union search, extracted-signal boosts, metadata filters, bounded excerpts from search, fenced full-record fetch, async/best-effort summaries with verbatim fallback, and secret-redaction fail-closed behavior.
+- Tests prove cross-org/user/project/conversation/thread isolation for ingest, search, prefetch, import, `get`, and guessed-ID fetch failures across at least two runtime scopes.
+- `docs/agentops-runtime/memory-surfaces.md` documents both local and remote deep-memory flows, including the exact cloud backend and no-local-fallback rule.
+
 ### M6. Session/conversation backend abstraction
 
 **Status:** Done
@@ -775,6 +809,23 @@ Caveats:
 - Remote cron/leases prevent duplicate job execution with multiple schedulers/workers.
 - Worker restart between turns resumes from durable state.
 
+### M12B. Compose control-plane durable backend parity
+
+**Status:** Pending
+
+**Goal:** Turn Compose from topology/health scaffolding plus in-process contract smoke into a real self-hosted multi-tenant Hermes deployment backed by the Compose database/queue/object-store/secret services.
+
+**Audit correction:** M12's existing smoke is useful and should be preserved, but the code shows `agentops_runtime.compose_services` is health-only and `create_compose_smoke_registry()` uses shared in-process local backends. That does not prove that multiple real containers coordinate through durable remote state.
+
+**Acceptance criteria:**
+
+- The Compose API/control-plane exposes real backend endpoints for every MVP-required native surface: curated memory, deep memory, sessions/search/turn locks, skills, cron/jobs/leases/history, credential/secret refs, queue, run leases, conversation routing, worker registry, artifacts, audit, and delivery routing where applicable.
+- `configure_compose_runtime_backends(...)` registers every `REQUIRED_CAPABILITIES` entry plus `DEEP_MEMORY` for `compose-self-hosted`; partial registration is a readiness failure, not a silent fallback.
+- Durable Compose backends use the services declared in `deploy/compose/docker-compose.yml` — Postgres for scoped state/deep-memory vectors/FTS, Redis/NATS/equivalent for queue/leases where selected, MinIO/filesystem object store for artifacts, and the local secret service for secret values/refs. Process-local dicts are allowed only in tests.
+- API/worker/scheduler `/readyz` verifies migrations and backend reachability for all required capabilities, not only that services answer HTTP.
+- A live `docker compose --scale worker=3 --scale scheduler=2` smoke runs an actual user/event-to-response path through the containers and proves: two users/threads have isolated curated memory, sessions, and deep-memory hints/fetches; shared org/project skills load in both; a cron firing is claimed once; an unrelated watchdog firing is not starved by a long-running builder; artifacts/audit entries persist; and a worker restart resumes conversation state from durable storage.
+- Tests keep the hermetic in-process smoke as a fast contract guard, but M12B completion requires at least one live Compose transcript proving real durable endpoints.
+
 ### M13. Slack multi-user/thread MVP
 
 **Status:** Done
@@ -828,6 +879,24 @@ Caveats:
 
 **Autonomous run note (2026-06-02) — closes the spike:** The prior slice's named gap was AWS-mode execution evidence for criterion 3 ("same worker lifecycle runs locally, in Compose, and in AWS adapter mode"). This slice closes it at the spike/contract layer by adding an AWS-shaped queued-item ingress that flows through the *unchanged* shared lifecycle: `AwsManagedWorkItem` models an SQS/EventBridge envelope (`message_id`, optional `receipt_handle`, `run_type`/`run_id`/`job_id`, tenant/user/project/conversation/agent-profile scope, `payload`, optional `delivery_ref`, `backend_profile` defaulting to `aws-managed`); `to_context()` maps it to an `agentops` `RuntimeContext` with `backend_profile='aws-managed'` and surfaces only the non-secret `work_item_id` (the SQS `receipt_handle` delete/visibility credential is deliberately kept out of scope metadata and audit); and `run_aws_managed_work_item(work_item, handler, …)` runs it via the same `RuntimeBackendRegistry` + `LocalRunSupervisor.run_to_completion` path used by local/Compose — claiming the same per-run lease, recording the same `started`/`succeeded` lifecycle audit, binding the AWS-managed context on the native surface, and passing the payload to the handler. The per-task `max_concurrent_runs` bound stays independent of fleet `desired_task_count` (a plan with `desired_task_count=8, max_concurrent_runs=2` yields `capacity=16` but a per-task supervisor bound of `2`, unchanged after running an item). **Scope/honesty:** this remains AWS-mode *contract/spike* execution — **no boto3, AWS credentials, network, real SQS/ECS/Fargate/RDS/S3/Secrets Manager/CloudWatch, or Terraform** are involved or imported; "AWS adapter mode" here means an AWS-shaped work item exercising the provider-neutral lifecycle under the `aws-managed` profile, not execution on provisioned AWS infrastructure. Real managed-AWS provisioning is **M15** (Terraform/OpenTofu), and boto3-backed durable adapters (SQS/RDS/S3/Secrets Manager) land with/after that; GCP adapters remain later. All four acceptance criteria are now met at the spike altitude (1: AWS naming isolated to `agentops_runtime/aws_managed.py`, guarded by the core-leakage test; 2: local/fake/Compose remain the default test path; 3: identical lifecycle now also runs an AWS-shaped queued item under `aws-managed`; 4: independent task-count vs per-task concurrency), so M14 is marked Done. Test evidence: focused RED (`ImportError: cannot import name 'AwsManagedWorkItem'`) → GREEN, plus reviewer-driven RED tests for receipt-handle repr redaction and backend-profile downgrade rejection → GREEN; `python -m pytest tests/agentops_runtime/test_aws_managed_runtime.py -q -o 'addopts='` → 21 passed; `tests/agentops_runtime/test_aws_managed_runtime.py tests/agentops_runtime/test_compose_distributed_smoke.py tests/agent/test_runtime_supervisor.py` → 87 passed; `ruff check agentops_runtime/aws_managed.py tests/agentops_runtime/test_aws_managed_runtime.py` → passed; `git diff --check` → clean. The core-contract leakage guard (`agent/runtime_backends.py`, `agent/runtime_supervisor.py`, `agent/runtime_context.py` carry no ECS/Fargate/SQS/RDS/S3/Secrets Manager/CloudWatch strings) still passes.
 
+### M14B. Managed runtime adapter parity — AWS first
+
+**Status:** Pending
+
+**Goal:** Replace the `aws-managed` local/fake spike with real managed-service adapter registration so the first managed cloud profile runs Hermes against durable cloud backends, not local compatibility stores.
+
+**Audit correction:** M14 proved the shape of an AWS-managed RuntimeContext and lifecycle, but `configure_aws_managed_runtime_backends(...)` currently registers local/fake backends and explicitly says real managed AWS backends come later. That is acceptable for a spike; it is not acceptable for the first cloud-deployable version.
+
+**Acceptance criteria:**
+
+- `aws-managed` runtime startup registers explicit non-local adapters for every MVP-required capability: curated memory, deep memory, sessions, skills, cron/jobs, credentials/secrets, queue, run leases, conversation routing, worker registry, artifacts, audit, and delivery routing.
+- The first AWS durable backing set is RDS Postgres (+ `pgvector`/FTS for deep memory), SQS/EventBridge or equivalent for work/cron triggers, S3 for artifacts, Secrets Manager for secret values/refs, and CloudWatch or control-plane audit storage for logs/audit. Alternatives are allowed only behind the same contracts and with tests proving parity.
+- Test/fake backends remain available only under test helpers or explicit local/contract-spike modes. Production `aws-managed` cannot silently resolve to `LocalMemoryBackend`, `LocalDeepMemoryBackend`, `LocalSessionBackend`, `LocalCronBackend`, local/fake queues, process-local leases, local skills, or filesystem artifacts.
+- `AwsManagedWorkItem` execution is wired to real cloud queue/lease/worker-registry semantics so duplicate delivery, retry/visibility timeout, cancellation, drain, and worker restart behavior match the local/compose contracts.
+- Terraform/OpenTofu outputs and bootstrap write the non-secret refs/config needed by these adapters; raw integration/model-provider secret values still enter only through bootstrap and the configured secret backend.
+- A focused no-local-fallback test fails if any non-test `aws-managed` runtime path registers local/fake backends for required capabilities.
+- GCP may remain scaffolded after the AWS-first proof, but it must be labeled not-first-version-complete until the same adapter-parity criteria are met for `gcp-managed`.
+
 ### M15. Managed cloud Terraform/OpenTofu packaging
 
 **Status:** Started
@@ -837,7 +906,8 @@ Caveats:
 **Acceptance criteria:**
 
 - `deploy/terraform/aws-managed/` provisions the AWS managed profile: API/control-plane, worker service, scheduler, RDS/Postgres or selected DB adapter, queue, artifact store, secret placeholders/refs, logs, IAM, and autoscaling.
-- `deploy/terraform/gcp-managed/` is scaffolded or implemented with equivalent GCP resources and clear parity gaps.
+- The provisioned AWS services are not just placeholders: the runtime image/env/bootstrap path can bind them to the real `aws-managed` adapters from M14B for every MVP-required native surface, including deep memory.
+- `deploy/terraform/gcp-managed/` is scaffolded or implemented with equivalent GCP resources and clear parity gaps; if GCP is not used for the first managed proof, docs must say AWS is the first-version parity target and GCP is not complete yet.
 - `terraform.tfvars.example` avoids raw app/integration secret values where possible; secret containers/refs are created instead.
 - Outputs include AgentOps API URL, bootstrap URL/token ref, Slack/GitHub/Linear/Jira webhook URLs, secret refs, queue refs, artifact refs, worker service names, and smoke-test hints.
 - Bring-your-own-network and bring-your-own-managed-resource paths are represented through variables such as existing VPC/subnet/database/bucket/secret refs.
@@ -942,17 +1012,21 @@ Caveats:
 3. M2 backend registry/contracts.
 4. M3 local multi-run concurrency baseline.
 5. M4 native memory backend abstraction.
-6. M5 fake/HTTP remote memory adapter.
+6. M5 fake/HTTP remote curated-memory adapter.
 7. M5A local flat deep-memory provider + scoped record recall.
-8. M8 cron backend abstraction early, because remote cron is not optional.
-9. M6 sessions and M7 skills.
-10. M9 credentials.
-11. M11 worker fleet/run lifecycle.
-12. M12 Compose self-hosted distributed MVP.
-13. M13 Slack smoke.
-14. M14 AWS adapter spike.
-15. M15 managed cloud Terraform/OpenTofu packaging.
-16. M16 bootstrap UI/CLI and activation smoke test.
+8. **M5B remote durable deep-memory adapter + parity correction.** This is the first pending item after the 2026-06-03 audit and must be completed before later packaging work can claim feature parity.
+9. M8 cron backend abstraction early, because remote cron is not optional.
+10. M6 sessions and M7 skills.
+11. M9 credentials.
+12. M10 artifacts/audit.
+13. M11 worker fleet/run lifecycle.
+14. M12 Compose topology/distributed smoke.
+15. **M12B Compose control-plane durable backend parity.** Convert health-only/in-process smoke into real Compose durable endpoints for all required native surfaces.
+16. M13 Slack smoke.
+17. M14 AWS adapter spike.
+18. **M14B managed runtime adapter parity — AWS first.** Replace local/fake `aws-managed` runtime backends with real managed-service adapters before calling any cloud deployment complete.
+19. M15 managed cloud Terraform/OpenTofu packaging and live `/healthz` evidence.
+20. M16 bootstrap UI/CLI and activation smoke test.
 
 ## Reference MVP proof
 
@@ -1011,7 +1085,7 @@ Restart a worker between turns:
   conversation resumes from remote/local-durable state.
 ```
 
-This proof must work first in local-multi and compose-self-hosted profiles before AWS-specific adapters are considered complete.
+This proof must work in local-multi, compose-self-hosted with real durable endpoints, and at least one managed cloud profile (AWS first unless Derek changes the target) before the roadmap/MVP is complete. A health-only deployment or local/fake cloud adapter cannot satisfy this proof.
 
 ## Explicit non-goals for MVP
 
@@ -1028,13 +1102,12 @@ This proof must work first in local-multi and compose-self-hosted profiles befor
 ## Open questions
 
 - Should AgentOps mode communicate with the control plane primarily over HTTP/gRPC, direct SQL, or both through adapters?
-- Should remote cron scheduling live in AgentOps control plane, Hermes scheduler, cloud scheduler, or an adapter that can wrap all three?
+- Which remote cron implementation should be the default first: AgentOps control-plane scheduler, Hermes scheduler behind `CronBackend`, cloud scheduler, or an adapter that can wrap all three while preserving per-firing leases?
 - How much of RuntimeContext should be visible to the model versus internal only?
 - Should shared skill mutations be impossible from an agent by default, or allowed with approval gates?
 - What is the smallest safe credential grant model that still supports useful tools?
 - Should the first durable distributed backend be Postgres everywhere, or should AWS-native DynamoDB be developed early as a separate adapter?
-- Should deep-memory records live behind a separate `DeepMemoryBackend` contract, or be folded into a broader `MemoryBackend` with distinct curated-vs-record methods?
-- What is the recommended durable remote retrieval stack for deep memory: Postgres + pgvector/FTS, dedicated vector DB, Chroma per tenant, or adapter-specific choices?
+- For remote deep memory, Postgres + `pgvector` + FTS is the first durable implementation target. Which optional adapters, if any, should be prioritized later (dedicated vector DB, DynamoDB/OpenSearch hybrid, provider-specific search service)?
 - Should warm conversation runs be subprocesses for isolation from the start, or can some local profiles safely run multiple agents in-process?
 - Should the recommended AWS path use Terraform, OpenTofu, or a wrapper CLI that can drive both?
 - Should bootstrap be primarily a CLI, a hosted web UI, or both from the beginning?
