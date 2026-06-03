@@ -227,3 +227,84 @@ def test_memory_records_log_message_redacts_query_values():
     assert "sentinel-secret-query" not in rendered
     assert "/memory/records/search" in rendered
     assert "<redacted>" in rendered
+
+
+# ---------------------------------------------------------------------------
+# _make_memory_backend seam tests (M5B durable store selection)
+# ---------------------------------------------------------------------------
+
+
+def test_make_memory_backend_returns_local_by_default():
+    from agent.runtime_backends import LocalDeepMemoryBackend
+
+    backend = compose_services._make_memory_backend({})
+    assert isinstance(backend, LocalDeepMemoryBackend)
+
+
+def test_make_memory_backend_selects_sqlite_via_db_url(tmp_path):
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    db_path = str(tmp_path / "seam_test.db")
+    backend = compose_services._make_memory_backend({
+        "AGENTOPS_DEEP_MEMORY_DB_URL": f"sqlite:///{db_path}",
+    })
+    assert isinstance(backend, RelationalMemoryRecordBackend)
+
+
+def test_make_memory_backend_selects_sqlite_via_store_env(tmp_path):
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    db_path = str(tmp_path / "seam_store.db")
+    backend = compose_services._make_memory_backend({
+        "AGENTOPS_DEEP_MEMORY_STORE": "sqlite",
+        "AGENTOPS_DEEP_MEMORY_DB_URL": f"sqlite:///{db_path}",
+    })
+    assert isinstance(backend, RelationalMemoryRecordBackend)
+
+
+def test_make_memory_backend_fails_closed_on_postgres_url():
+    with pytest.raises(Exception):
+        compose_services._make_memory_backend({
+            "AGENTOPS_DEEP_MEMORY_DB_URL": "postgresql://user:pw@localhost/db",
+        })
+
+
+def test_make_memory_backend_fails_closed_on_postgres_store_without_url():
+    with pytest.raises(Exception):
+        compose_services._make_memory_backend({"AGENTOPS_DEEP_MEMORY_STORE": "postgres"})
+
+
+def test_make_memory_backend_fails_closed_on_postgres_store_even_with_sqlite_url(tmp_path):
+    with pytest.raises(Exception):
+        compose_services._make_memory_backend({
+            "AGENTOPS_DEEP_MEMORY_STORE": "postgres",
+            "AGENTOPS_DEEP_MEMORY_DB_URL": f"sqlite:///{tmp_path / 'records.db'}",
+        })
+
+
+def test_make_memory_backend_fails_closed_on_unknown_store_type():
+    with pytest.raises(Exception):
+        compose_services._make_memory_backend({"AGENTOPS_DEEP_MEMORY_STORE": "postgress"})
+
+
+def test_make_memory_backend_fails_closed_on_unsupported_db_url():
+    with pytest.raises(Exception):
+        compose_services._make_memory_backend({"AGENTOPS_DEEP_MEMORY_DB_URL": "mysql://localhost/deepmemory"})
+
+
+def test_make_memory_backend_postgres_error_does_not_leak_password():
+    sentinel_password = "LEAKSENTINEL123"
+    with pytest.raises(Exception) as exc_info:
+        compose_services._make_memory_backend({
+            "AGENTOPS_DEEP_MEMORY_DB_URL": f"postgresql://user:{sentinel_password}@localhost/db",
+        })
+    assert sentinel_password not in str(exc_info.value)
+
+
+def test_get_or_create_memory_backend_falls_back_to_local(monkeypatch):
+    monkeypatch.setattr(compose_services, "_memory_backend_instance", None)
+    monkeypatch.setattr(compose_services.os, "environ", {})
+    from agent.runtime_backends import LocalDeepMemoryBackend
+
+    backend = compose_services._get_or_create_memory_backend()
+    assert isinstance(backend, LocalDeepMemoryBackend)

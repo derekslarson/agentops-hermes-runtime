@@ -141,13 +141,48 @@ def _sanitize_log_message(message: str) -> str:
     return re.sub(r"(/memory/records[^\s?\"]*)\?[^\s\"]+", r"\1?<redacted>", message)
 
 
+def _make_memory_backend(environ: dict[str, str]) -> Any:
+    """Create a MemoryRecordBackend from the given environment mapping.
+
+    Selection order:
+    1. AGENTOPS_DEEP_MEMORY_DB_URL=sqlite:///... → RelationalMemoryRecordBackend
+    2. AGENTOPS_DEEP_MEMORY_STORE=sqlite + AGENTOPS_DEEP_MEMORY_DB_URL → same
+    3. AGENTOPS_DEEP_MEMORY_DB_URL=postgresql://... → scaffold fails closed
+    4. Unconfigured → LocalDeepMemoryBackend(partition=True)
+
+    When a durable store is explicitly configured but cannot initialize,
+    raises instead of silently falling back to local partitioned storage.
+    """
+    db_url = environ.get("AGENTOPS_DEEP_MEMORY_DB_URL", "").strip()
+    store_type = environ.get("AGENTOPS_DEEP_MEMORY_STORE", "").lower().strip()
+
+    if store_type and store_type not in ("sqlite", "postgres", "postgresql"):
+        raise ValueError("unsupported deep-memory store type")
+
+    if db_url or store_type in ("sqlite", "postgres", "postgresql"):
+        if store_type in ("postgres", "postgresql"):
+            raise ValueError("deep-memory postgres store is not yet implemented")
+        if not db_url and store_type == "sqlite":
+            import os as _os
+
+            hermes_home = environ.get("HERMES_HOME") or _os.path.expanduser("~/.hermes/hermes-agent")
+            db_dir = _os.path.join(hermes_home, "deep-memory")
+            _os.makedirs(db_dir, exist_ok=True)
+            db_url = f"sqlite:///{db_dir}/records.db"
+        from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+        return RelationalMemoryRecordBackend(db_url)
+
+    from agent.runtime_backends import LocalDeepMemoryBackend
+
+    return LocalDeepMemoryBackend(partition=True)
+
+
 def _get_or_create_memory_backend() -> Any:
     global _memory_backend_instance
     with _memory_backend_lock:
         if _memory_backend_instance is None:
-            from agent.runtime_backends import LocalDeepMemoryBackend
-
-            _memory_backend_instance = LocalDeepMemoryBackend(partition=True)
+            _memory_backend_instance = _make_memory_backend(dict(os.environ))
         return _memory_backend_instance
 
 
