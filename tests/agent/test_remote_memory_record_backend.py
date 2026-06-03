@@ -153,6 +153,16 @@ class _RecordControlPlaneHandler(BaseHTTPRequestHandler):
             records = [self._record_payload(scope[i]) for i in ids if i in scope]
             self._send_json(200, {"records": records})
             return
+        if parsed.path == "/memory/records/import":
+            import_records = body.get("records", [])
+            results = []
+            for rec in import_records:
+                rid = rec.get("record_id") or rec.get("id") or f"mem_{len(scope)}"
+                rec["id"] = rid
+                scope[rid] = rec
+                results.append({"record": self._record_payload(rec), "status": "ok"})
+            self._send_json(200, {"results": results})
+            return
         self._send_json(404, {"error": "not found"})
 
 
@@ -442,3 +452,73 @@ def test_rejects_unsafe_base_urls(base_url):
 def test_rejects_invalid_timeouts(timeout):
     with pytest.raises(ValueError, match="timeout"):
         HttpMemoryRecordBackend(base_url="https://example.test", timeout=timeout)
+
+
+# ---------------------------------------------------------------------------
+# Import records
+# ---------------------------------------------------------------------------
+
+
+def test_import_records_sends_context_and_records_in_body(record_server):
+    _, base_url, handler = record_server
+    backend = HttpMemoryRecordBackend(base_url=base_url, token="test-token")
+    ctx = _ctx("derek", "thread-1")
+
+    backend.import_records(ctx, [{"text": "imported record", "record_id": "mem_imp1"}])
+
+    post_reqs = [r for r in handler.requests if r["method"] == "POST" and "/import" in r["path"]]
+    assert len(post_reqs) == 1
+    req = post_reqs[0]
+    body = json.loads(req["raw_body"])
+    assert "context" in body
+    assert "records" in body
+    assert body["records"][0]["record_id"] == "mem_imp1"
+
+
+def test_import_records_token_is_header_only(record_server):
+    _, base_url, handler = record_server
+    backend = HttpMemoryRecordBackend(base_url=base_url, token="test-token")
+    ctx = _ctx("derek", "thread-1")
+
+    backend.import_records(ctx, [{"text": "content", "record_id": "mem_tok"}])
+
+    import_req = next(r for r in handler.requests if r["method"] == "POST" and "/import" in r["path"])
+    assert "test-token" not in import_req["path"]
+    assert "test-token" not in import_req.get("raw_body", "")
+    assert import_req["authorization"] == "Bearer test-token"
+
+
+def test_import_records_returns_results_list(record_server):
+    _, base_url, _ = record_server
+    backend = HttpMemoryRecordBackend(base_url=base_url, token="test-token")
+    ctx = _ctx("derek", "thread-1")
+
+    results = backend.import_records(ctx, [{"text": "rec a", "record_id": "mem_ra"}, {"text": "rec b", "record_id": "mem_rb"}])
+
+    assert isinstance(results, list)
+    assert len(results) == 2
+
+
+def test_import_records_idempotent_via_stable_ids(record_server):
+    _, base_url, handler = record_server
+    backend = HttpMemoryRecordBackend(base_url=base_url, token="test-token")
+    ctx = _ctx("derek", "thread-1")
+
+    backend.import_records(ctx, [{"text": "stable record", "record_id": "mem_stable"}])
+    backend.import_records(ctx, [{"text": "stable record", "record_id": "mem_stable"}])
+
+    all_scopes = handler.store
+    total_records = sum(len(s) for s in all_scopes.values())
+    assert total_records == 1
+
+
+def test_import_records_scope_isolated(record_server):
+    _, base_url, _ = record_server
+    backend = HttpMemoryRecordBackend(base_url=base_url, token="test-token")
+    derek = _ctx("derek", "thread-1")
+    alex = _ctx("alex", "thread-2")
+
+    backend.import_records(derek, [{"text": "derek import", "record_id": "mem_di"}])
+
+    results = backend.search(alex, "derek import")
+    assert results == []

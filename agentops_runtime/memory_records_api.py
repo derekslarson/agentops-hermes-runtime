@@ -11,6 +11,7 @@ Routes:
     GET   /memory/records/search    → search
     GET   /memory/records/get       → get_record
     POST  /memory/records/get_many  → get_many
+    POST  /memory/records/import    → import (idempotent bulk upsert)
 
 Auth: when token is non-None, Authorization: Bearer <token> is required.
 Context: sanitised scope-only dict reconstructed into RuntimeContext.
@@ -72,6 +73,8 @@ def handle_memory_records_request(
         return _get(query_string, backend)
     if method == "POST" and path == "/memory/records/get_many":
         return _get_many(body_bytes, backend)
+    if method == "POST" and path == "/memory/records/import":
+        return _import(body_bytes, backend)
 
     return 404, {"error": "not found"}
 
@@ -221,6 +224,65 @@ def _get_many(body_bytes: bytes, backend: Any) -> tuple[int, dict[str, Any]]:
     return 200, {"records": [_record_to_dict(r) for r in records if r is not None]}
 
 
+def _import(body_bytes: bytes, backend: Any) -> tuple[int, dict[str, Any]]:
+    if not body_bytes:
+        return 400, {"error": "context is required"}
+    try:
+        body = json.loads(body_bytes)
+    except json.JSONDecodeError:
+        return 400, {"error": "invalid JSON body"}
+    if not isinstance(body, dict):
+        return 400, {"error": "request body must be a JSON object"}
+
+    if "context" not in body:
+        return 400, {"error": "context is required"}
+    ctx, err = _parse_context(body["context"])
+    if err:
+        return 400, {"error": err}
+
+    if "records" not in body:
+        return 400, {"error": "records is required"}
+    records_input = body["records"]
+    if not isinstance(records_input, list):
+        return 400, {"error": "records must be a list"}
+
+    results = []
+    for rec in records_input:
+        item = _import_one(ctx, rec, backend)
+        results.append(item)
+
+    return 200, {"results": results}
+
+
+def _import_one(ctx: Any, rec: Any, backend: Any) -> dict[str, Any]:
+    if not isinstance(rec, dict):
+        return {"status": "error", "error": "record must be an object"}
+
+    text = rec.get("text", "")
+    if not isinstance(text, str):
+        return {"status": "error", "error": "record.text must be a string"}
+    if not text:
+        return {"status": "error", "error": "record.text must be non-empty"}
+
+    try:
+        record = backend.upsert_record(
+            ctx,
+            text=text,
+            metadata=rec.get("metadata") or {},
+            source=str(rec.get("source") or "unknown"),
+            source_uri=str(rec.get("source_uri") or ""),
+            timestamp=rec.get("timestamp"),
+            record_kind=str(rec.get("record_kind") or "verbatim"),
+            parent_id=rec.get("parent_id"),
+            provenance=rec.get("provenance") or {},
+            record_id=rec.get("record_id") or rec.get("id"),
+        )
+    except Exception:
+        return {"status": "error", "error": "internal error"}
+
+    return {"record": _record_to_dict(record), "status": "ok"}
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -240,7 +302,10 @@ def _parse_context(raw: Any) -> tuple[RuntimeContext | None, str | None]:
     missing = [field for field in _SCOPE_FIELDS if field not in raw or raw[field] is None]
     if missing:
         return None, f"context missing required scope field: {missing[0]}"
-    blank = [field for field in _SCOPE_FIELDS if isinstance(raw[field], str) and not raw[field].strip()]
+    non_string = [field for field in _SCOPE_FIELDS if not isinstance(raw[field], str)]
+    if non_string:
+        return None, f"context scope field must be a string: {non_string[0]}"
+    blank = [field for field in _SCOPE_FIELDS if not raw[field].strip()]
     if blank:
         return None, f"context scope field must be non-empty: {blank[0]}"
     scope = {k: raw[k] for k in _SCOPE_FIELDS if k in raw}

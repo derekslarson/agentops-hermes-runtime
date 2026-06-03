@@ -559,3 +559,229 @@ def test_unknown_method_on_memory_records_returns_404():
     backend = _FakeMemoryRecordBackend()
     status, _ = handle_memory_records_request("DELETE", "/memory/records", "", b"", None, None, backend)
     assert status == 404
+
+
+# ---------------------------------------------------------------------------
+# Import endpoint
+# ---------------------------------------------------------------------------
+
+
+def _post_import(backend: _FakeMemoryRecordBackend, scope: dict, records: list) -> tuple[int, dict]:
+    body = json.dumps({"context": scope, "records": records}).encode()
+    return handle_memory_records_request("POST", "/memory/records/import", "", body, None, None, backend)
+
+
+_RECORD_A = {"text": "import record alpha", "record_id": "mem_ia"}
+_RECORD_B = {"text": "import record beta", "record_id": "mem_ib"}
+
+
+def test_import_route_returns_200_with_valid_records():
+    backend = _FakeMemoryRecordBackend()
+    status, resp = _post_import(backend, _SCOPE_A, [_RECORD_A, _RECORD_B])
+    assert status == 200
+
+
+def test_import_route_returns_results_list():
+    backend = _FakeMemoryRecordBackend()
+    status, resp = _post_import(backend, _SCOPE_A, [_RECORD_A, _RECORD_B])
+    assert status == 200
+    assert isinstance(resp.get("results"), list)
+    assert len(resp["results"]) == 2
+
+
+def test_import_is_idempotent_same_content_same_scope():
+    backend = _FakeMemoryRecordBackend()
+    _post_import(backend, _SCOPE_A, [_RECORD_A, _RECORD_B])
+    _post_import(backend, _SCOPE_A, [_RECORD_A, _RECORD_B])
+
+    expected_scope_key = (
+        _SCOPE_A["mode"],
+        _SCOPE_A["org_id"],
+        _SCOPE_A["workspace_id"],
+        _SCOPE_A["user_id"],
+        _SCOPE_A["conversation_id"],
+        _SCOPE_A["agent_profile_id"],
+        _SCOPE_A["project_id"],
+    )
+    assert set(backend._store) == {expected_scope_key}
+    assert len(backend._store[expected_scope_key]) == 2
+
+
+def test_import_cross_scope_isolation():
+    backend = _FakeMemoryRecordBackend()
+    _post_import(backend, _SCOPE_A, [{"text": "alice import", "record_id": "mem_ali"}])
+    status, resp = _get_search(backend, _SCOPE_B, "alice import")
+    assert status == 200
+    assert resp["results"] == []
+
+
+def test_import_requires_bearer_auth_when_token_configured():
+    backend = _FakeMemoryRecordBackend()
+    body = json.dumps({"context": _SCOPE_A, "records": [_RECORD_A]}).encode()
+    status, _ = handle_memory_records_request("POST", "/memory/records/import", "", body, None, _TOKEN, backend)
+    assert status == 401
+
+
+def test_import_auth_applied_correctly():
+    backend = _FakeMemoryRecordBackend()
+    body = json.dumps({"context": _SCOPE_A, "records": [_RECORD_A]}).encode()
+    status, resp = handle_memory_records_request(
+        "POST", "/memory/records/import", "", body, f"Bearer {_TOKEN}", _TOKEN, backend
+    )
+    assert status == 200
+
+
+def test_import_missing_context_fails_closed():
+    backend = _FakeMemoryRecordBackend()
+    body = json.dumps({"records": [_RECORD_A]}).encode()
+    status, resp = handle_memory_records_request("POST", "/memory/records/import", "", body, None, None, backend)
+    assert status == 400
+    assert "context" in resp.get("error", "").lower()
+
+
+def test_import_non_list_records_fails_closed():
+    backend = _FakeMemoryRecordBackend()
+    body = json.dumps({"context": _SCOPE_A, "records": "not a list"}).encode()
+    status, resp = handle_memory_records_request("POST", "/memory/records/import", "", body, None, None, backend)
+    assert status == 400
+    assert "list" in resp.get("error", "").lower()
+
+
+def test_import_missing_records_key_fails_closed():
+    backend = _FakeMemoryRecordBackend()
+    body = json.dumps({"context": _SCOPE_A}).encode()
+    status, resp = handle_memory_records_request("POST", "/memory/records/import", "", body, None, None, backend)
+    assert status == 400
+
+
+def test_import_malformed_record_in_list_partial_success():
+    backend = _FakeMemoryRecordBackend()
+    records = [
+        {"text": "valid record", "record_id": "mem_valid"},
+        "not a dict",
+    ]
+    status, resp = handle_memory_records_request("POST", "/memory/records/import", "", json.dumps({"context": _SCOPE_A, "records": records}).encode(), None, None, backend)
+    assert status == 200
+    results = resp.get("results", [])
+    assert len(results) == 2
+    ok_items = [r for r in results if r.get("status") == "ok"]
+    err_items = [r for r in results if r.get("status") == "error"]
+    assert len(ok_items) == 1
+    assert len(err_items) == 1
+
+
+def test_import_empty_text_record_handled_safely():
+    backend = _FakeMemoryRecordBackend()
+    body = json.dumps({"context": _SCOPE_A, "records": [{"text": "", "record_id": "mem_empty"}]}).encode()
+    status, resp = handle_memory_records_request("POST", "/memory/records/import", "", body, None, None, backend)
+    assert status == 200
+    results = resp.get("results", [])
+    assert len(results) == 1
+    assert results[0].get("status") == "error"
+
+
+def test_import_empty_records_list_returns_200():
+    backend = _FakeMemoryRecordBackend()
+    status, resp = _post_import(backend, _SCOPE_A, [])
+    assert status == 200
+    assert resp.get("results") == []
+
+
+def test_import_token_not_leaked_in_error_payload():
+    backend = _FakeMemoryRecordBackend()
+    secret = "super-secret-import-token-9x7z"
+    body = json.dumps({"context": _SCOPE_A, "records": [_RECORD_A]}).encode()
+    status, resp = handle_memory_records_request("POST", "/memory/records/import", "", body, None, secret, backend)
+    assert status == 401
+    assert secret not in json.dumps(resp)
+
+
+def test_import_context_error_does_not_echo_raw_value():
+    sentinel = "sentinel-import-ctx-error-value"
+    bad_scope = dict(_SCOPE_A, mode=sentinel)
+    backend = _FakeMemoryRecordBackend()
+    body = json.dumps({"context": bad_scope, "records": [_RECORD_A]}).encode()
+    status, resp = handle_memory_records_request("POST", "/memory/records/import", "", body, None, None, backend)
+    assert status == 400
+    assert sentinel not in json.dumps(resp)
+
+
+def test_import_scoped_records_isolated_from_other_scope_get():
+    backend = _FakeMemoryRecordBackend()
+    _post_import(backend, _SCOPE_A, [{"text": "alice scoped import", "record_id": "mem_scoped"}])
+    status, resp = _get_record(backend, _SCOPE_B, "mem_scoped")
+    assert status == 200
+    assert resp["record"] is None
+
+
+# ---------------------------------------------------------------------------
+# Bug: import must preserve canonical MemoryRecord 'id' field (not only 'record_id')
+# ---------------------------------------------------------------------------
+
+
+def test_import_preserves_canonical_id_field_when_no_record_id():
+    """Exported MemoryRecord JSON has 'id', not 'record_id'; import must preserve it."""
+    backend = _FakeMemoryRecordBackend()
+    record_with_id = {"text": "canonical id field import", "id": "mem_canonical_export"}
+    status, resp = _post_import(backend, _SCOPE_A, [record_with_id])
+    assert status == 200
+    results = resp.get("results", [])
+    assert len(results) == 1
+    assert results[0]["status"] == "ok"
+    assert results[0]["record"]["id"] == "mem_canonical_export"
+
+
+def test_import_id_field_idempotent_on_reimport():
+    """Re-importing a record with 'id' produces the same stored record, not a duplicate."""
+    backend = _FakeMemoryRecordBackend()
+    record_with_id = {"text": "reimport stable", "id": "mem_stable_id"}
+    _post_import(backend, _SCOPE_A, [record_with_id])
+    _post_import(backend, _SCOPE_A, [record_with_id])
+    scope = next(iter(backend._store.values()), {})
+    assert len(scope) == 1
+    assert "mem_stable_id" in scope
+
+
+# ---------------------------------------------------------------------------
+# Bug: _parse_context must reject non-string scope field values fail-closed
+# ---------------------------------------------------------------------------
+
+
+def test_numeric_scope_field_value_fails_closed_before_write():
+    """Numeric scope values must be rejected with 400 before any store write."""
+    backend = _FakeMemoryRecordBackend()
+    bad_scope = dict(_SCOPE_A, org_id=123)
+    body = json.dumps({"context": bad_scope, "record": {"text": "must not store"}}).encode()
+    status, resp = handle_memory_records_request("POST", "/memory/records", "", body, None, None, backend)
+    assert status == 400
+    assert backend._store == {}
+
+
+def test_list_scope_field_value_fails_closed_before_write():
+    """List scope values must be rejected with 400 before any store write."""
+    backend = _FakeMemoryRecordBackend()
+    bad_scope = dict(_SCOPE_A, org_id=["org1", "org2"])
+    body = json.dumps({"context": bad_scope, "record": {"text": "must not store"}}).encode()
+    status, resp = handle_memory_records_request("POST", "/memory/records", "", body, None, None, backend)
+    assert status == 400
+    assert backend._store == {}
+
+
+def test_object_scope_field_value_fails_closed_before_write():
+    """Object/dict scope values must be rejected with 400 before any store write."""
+    backend = _FakeMemoryRecordBackend()
+    bad_scope = dict(_SCOPE_A, org_id={"nested": "value"})
+    body = json.dumps({"context": bad_scope, "record": {"text": "must not store"}}).encode()
+    status, resp = handle_memory_records_request("POST", "/memory/records", "", body, None, None, backend)
+    assert status == 400
+    assert backend._store == {}
+
+
+def test_non_string_scope_value_error_does_not_echo_raw_value():
+    """The raw non-string scope value must not appear in the error response."""
+    backend = _FakeMemoryRecordBackend()
+    bad_scope = dict(_SCOPE_A, org_id=99999)
+    body = json.dumps({"context": bad_scope, "record": {"text": "x"}}).encode()
+    status, resp = handle_memory_records_request("POST", "/memory/records", "", body, None, None, backend)
+    assert status == 400
+    assert "99999" not in json.dumps(resp)

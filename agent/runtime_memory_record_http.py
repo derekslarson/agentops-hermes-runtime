@@ -14,6 +14,7 @@ The control-plane contract is intentionally provider-neutral:
 * ``GET  /memory/records/get?context=<json>&id=<id>`` -> ``{"record": <record>|null}``
 * ``POST /memory/records/get_many`` body ``{"context": <dict>, "ids": [<id>...]}`` -> ``{"records": [<record>...]}``
 * ``POST /memory/records`` body ``{"context": <dict>, "record": {<upsert fields>}}`` -> ``{"record": <record>}``
+* ``POST /memory/records/import`` body ``{"context": <dict>, "records": [<upsert fields>...]}`` -> ``{"results": [<result>...]}``
 
 JSON ``<result>`` / ``<record>`` objects are converted back into the local
 :class:`~agent.local_memory.store.SearchResult` / :class:`MemoryRecord` shapes so
@@ -147,6 +148,14 @@ class HttpMemoryRecordBackend:
             # explicit ``{"record": null}`` still means a clean not-found.
             raise RuntimeError("HttpMemoryRecordBackend get response missing 'record'")
         return _to_record(payload["record"])
+
+    def import_records(self, context: "RuntimeContext | None", records: list[Any]) -> list[Any]:
+        body = {"context": self._scope_payload(context), "records": list(records)}
+        payload = self._post("/memory/records/import", body)
+        results = payload.get("results")
+        if not isinstance(results, list):
+            raise RuntimeError("HttpMemoryRecordBackend expected a list of results from import")
+        return results
 
     def get_many(self, context: "RuntimeContext | None", ids: Iterable[str]) -> list[Any]:
         body = {"context": self._scope_payload(context), "ids": [str(i) for i in ids]}
