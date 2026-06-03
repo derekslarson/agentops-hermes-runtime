@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import threading
 import urllib.error
 import urllib.request
@@ -11,6 +12,11 @@ import pytest
 
 from agent.runtime_backends import RuntimeBackendRegistry
 from agentops_runtime import compose_services
+
+
+class _FailingPsycopg2:
+    def connect(self, _db_url):
+        raise RuntimeError("synthetic postgres connection denied")
 
 
 def _ready_env() -> dict[str, str]:
@@ -262,11 +268,54 @@ def test_make_memory_backend_selects_sqlite_via_store_env(tmp_path):
     assert isinstance(backend, RelationalMemoryRecordBackend)
 
 
-def test_make_memory_backend_fails_closed_on_postgres_url():
+def test_make_memory_backend_fails_closed_on_postgres_url(monkeypatch):
+    monkeypatch.setitem(sys.modules, "psycopg2", _FailingPsycopg2())
     with pytest.raises(Exception):
         compose_services._make_memory_backend({
-            "AGENTOPS_DEEP_MEMORY_DB_URL": "postgresql://user:pw@localhost/db",
+            "AGENTOPS_DEEP_MEMORY_DB_URL": "postgresql://user:***@localhost/db",
         })
+
+
+def test_make_memory_backend_selects_postgres_via_fake_psycopg(monkeypatch):
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    class FakeCursor:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc_info):
+            return False
+
+        def execute(self, sql, params=None):
+            self.connection.executed.append((sql, params))
+
+    class FakeConnection:
+        def __init__(self):
+            self.executed = []
+
+        def cursor(self):
+            return FakeCursor(self)
+
+        def commit(self):
+            pass
+
+    class FakePsycopg2:
+        def __init__(self):
+            self.connection = FakeConnection()
+
+        def connect(self, _db_url):
+            return self.connection
+
+    monkeypatch.setitem(sys.modules, "psycopg2", FakePsycopg2())
+
+    backend = compose_services._make_memory_backend({
+        "AGENTOPS_DEEP_MEMORY_DB_URL": "postgresql://user:***@postgres:5432/deepmem",
+    })
+
+    assert isinstance(backend, RelationalMemoryRecordBackend)
 
 
 def test_make_memory_backend_fails_closed_on_postgres_store_without_url():
@@ -292,11 +341,12 @@ def test_make_memory_backend_fails_closed_on_unsupported_db_url():
         compose_services._make_memory_backend({"AGENTOPS_DEEP_MEMORY_DB_URL": "mysql://localhost/deepmemory"})
 
 
-def test_make_memory_backend_postgres_error_does_not_leak_password():
+def test_make_memory_backend_postgres_error_does_not_leak_password(monkeypatch):
+    monkeypatch.setitem(sys.modules, "psycopg2", _FailingPsycopg2())
     sentinel_password = "LEAKSENTINEL123"
     with pytest.raises(Exception) as exc_info:
         compose_services._make_memory_backend({
-            "AGENTOPS_DEEP_MEMORY_DB_URL": f"postgresql://user:{sentinel_password}@localhost/db",
+            "AGENTOPS_DEEP_MEMORY_DB_URL": f"postgresql://user:***@localhost/db",
         })
     assert sentinel_password not in str(exc_info.value)
 

@@ -5,6 +5,8 @@ All tests written before implementation — run RED first, then GREEN.
 """
 from __future__ import annotations
 
+import sys
+import traceback
 import re
 
 import pytest
@@ -321,19 +323,21 @@ def test_durability_scope_isolation_across_fresh_instances(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_postgres_scaffold_fails_closed():
+def test_postgres_scaffold_fails_closed(monkeypatch):
     from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
 
     sentinel_password = "LEAKSENTINEL123"
+    monkeypatch.setitem(sys.modules, "psycopg2", _FailingPsycopg2("synthetic postgres unavailable"))
     with pytest.raises(Exception) as exc_info:
-        RelationalMemoryRecordBackend(f"postgresql://user:{sentinel_password}@localhost:5432/db")
+        RelationalMemoryRecordBackend(f"postgresql://user:***@localhost:5432/db")
     error_msg = str(exc_info.value)
     assert sentinel_password not in error_msg
 
 
-def test_postgres_url_error_message_is_informative():
+def test_postgres_url_error_message_is_informative(monkeypatch):
     from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
 
+    monkeypatch.setitem(sys.modules, "psycopg2", _FailingPsycopg2("synthetic postgres unavailable"))
     with pytest.raises(Exception) as exc_info:
         RelationalMemoryRecordBackend("postgresql://host/db")
     error_msg = str(exc_info.value).lower()
@@ -366,6 +370,335 @@ def test_in_memory_sqlite_path_fails_closed():
 
     with pytest.raises(ValueError):
         RelationalMemoryRecordBackend(":memory:")
+
+
+# ---------------------------------------------------------------------------
+# Live Postgres selection with fake psycopg2 (M5B live adapter slice)
+# ---------------------------------------------------------------------------
+
+
+class _FakePostgresCursor:
+    def __init__(self, connection):
+        self.connection = connection
+        self._fetchone = None
+        self._fetchall = []
+        self.description = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc_info):
+        return False
+
+    def execute(self, sql, params=None):
+        self.connection.executed.append((sql, params))
+        lowered = " ".join(sql.lower().split())
+        if "record_id = %s" in lowered and "select *" in lowered:
+            self._fetchone = self.connection.rows_by_id.get(params[-1])
+            self.description = [(col,) for col in _PG_ROW_COLUMNS]
+        elif "record_id = any" in lowered:
+            requested = list(params[-1])
+            self._fetchall = [self.connection.rows_by_id[rid] for rid in requested if rid in self.connection.rows_by_id]
+            self.description = [(col,) for col in _PG_ROW_COLUMNS]
+        elif "from ranked" in lowered:
+            self._fetchall = list(self.connection.search_rows)
+            self.description = [(col,) for col in (*_PG_ROW_COLUMNS, "score")]
+        elif "on conflict" in lowered and "returning" in lowered:
+            self._fetchone = self.connection.upsert_row
+            self.description = [(col,) for col in _PG_ROW_COLUMNS]
+        else:
+            self._fetchone = None
+            self._fetchall = []
+            self.description = None
+
+    def fetchone(self):
+        return self._fetchone
+
+    def fetchall(self):
+        return self._fetchall
+
+
+class _FakePostgresConnection:
+    def __init__(self):
+        self.executed = []
+        self.commits = 0
+        self.rollbacks = 0
+        self.rows_by_id = {}
+        self.search_rows = []
+        self.upsert_row = None  # type: ignore[var-annotated]
+
+    def cursor(self):
+        return _FakePostgresCursor(self)
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
+
+
+class _FakePsycopg2:
+    def __init__(self, connection):
+        self.connection = connection
+        self.connected_urls = []
+
+    def connect(self, db_url):
+        self.connected_urls.append(db_url)
+        return self.connection
+
+
+def _install_fake_psycopg2(monkeypatch, connection):
+    fake = _FakePsycopg2(connection)
+    monkeypatch.setitem(sys.modules, "psycopg2", fake)
+    return fake
+
+
+class _FailingPsycopg2:
+    def __init__(self, message):
+        self.message = message
+
+    def connect(self, _db_url):
+        raise RuntimeError(self.message)
+
+
+class _ReturningPsycopg2:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def connect(self, _db_url):
+        return self.connection
+
+
+class _RollbackLeakingConnection:
+    def cursor(self):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc_info):
+        return False
+
+    def execute(self, _sql, _params=None):
+        raise RuntimeError("schema failure LEAKSENTINEL_EXECUTE")
+
+    def rollback(self):
+        raise RuntimeError("rollback failure LEAKSENTINEL_ROLLBACK")
+
+
+def test_postgres_connection_failure_strips_secret_exception_cause(monkeypatch):
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    sentinel_password = "LEAKSENTINEL_CAUSE_PASSWORD"
+    monkeypatch.setitem(sys.modules, "psycopg2", _FailingPsycopg2(f"could not auth with {sentinel_password}"))
+
+    with pytest.raises(RuntimeError) as exc_info:
+        RelationalMemoryRecordBackend(f"postgresql://alice:***@db.example/deepmem")
+
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None or getattr(exc_info.value, "__suppress_context__", False)
+    assert sentinel_password not in str(exc_info.value)
+    assert sentinel_password not in "".join(traceback.format_exception(exc_info.value))
+
+
+def test_postgres_schema_failure_suppresses_rollback_secret_context(monkeypatch):
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    monkeypatch.setitem(sys.modules, "psycopg2", _ReturningPsycopg2(_RollbackLeakingConnection()))
+
+    with pytest.raises(RuntimeError) as exc_info:
+        RelationalMemoryRecordBackend("postgresql://alice:***@db.example/deepmem")
+
+    formatted = "".join(traceback.format_exception(exc_info.value))
+    assert exc_info.value.__cause__ is None
+    assert "LEAKSENTINEL_EXECUTE" not in formatted
+    assert "LEAKSENTINEL_ROLLBACK" not in formatted
+
+
+def test_postgres_read_paths_commit_successful_select_transactions(monkeypatch):
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    connection = _FakePostgresConnection()
+    _install_fake_psycopg2(monkeypatch, connection)
+    connection.rows_by_id["mem_pg_001"] = _pg_row()
+    connection.search_rows = [_pg_row(record_id="mem_pg_001", text="postgres search hit", score=0.7)]
+    backend = RelationalMemoryRecordBackend("postgresql://user:***@db.example/deepmem")
+    commits_after_schema = connection.commits
+
+    backend.get_record(_CTX_A, "mem_pg_001")
+    backend.get_many(_CTX_A, ["mem_pg_001"])
+    backend.search(_CTX_A, "postgres", limit=1)
+
+    assert connection.commits >= commits_after_schema + 3
+    assert connection.rollbacks == 0
+
+
+def test_postgres_upsert_returns_database_stored_timestamps_on_conflict(monkeypatch):
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    connection = _FakePostgresConnection()
+    _install_fake_psycopg2(monkeypatch, connection)
+    connection.upsert_row = _pg_row(record_id="mem_pg_existing", text="updated", created_at=100.0, updated_at=200.0)
+    backend = RelationalMemoryRecordBackend("postgresql://user:***@db.example/deepmem")
+
+    record = backend.upsert_record(_CTX_A, text="updated", record_id="mem_pg_existing")
+
+    assert record.id == "mem_pg_existing"
+    assert record.created_at == 100.0
+    assert record.updated_at == 200.0
+
+
+_PG_ROW_COLUMNS = (
+    "record_id",
+    "text",
+    "text_hash",
+    "metadata",
+    "provenance",
+    "source",
+    "source_uri",
+    "ts",
+    "created_at",
+    "updated_at",
+    "record_kind",
+    "parent_id",
+)
+
+
+def _pg_row(record_id="mem_pg_001", text="postgres record", score=1.25, created_at=None, updated_at=None):
+    now = 1234.5
+    return {
+        "record_id": record_id,
+        "text": text,
+        "text_hash": "hash-" + record_id,
+        "metadata": {"kind": "pg"},
+        "provenance": {"run": "r1"},
+        "source": "pg-test",
+        "source_uri": "",
+        "ts": now,
+        "created_at": now if created_at is None else created_at,
+        "updated_at": now if updated_at is None else updated_at,
+        "record_kind": "verbatim",
+        "parent_id": None,
+        "score": score,
+    }
+
+
+def _pg_tuple_row(record_id="mem_pg_tuple", text="tuple row", score=0.9):
+    row = _pg_row(record_id=record_id, text=text, score=score)
+    return tuple(row[col] for col in _PG_ROW_COLUMNS)
+
+
+def test_postgres_backend_initializes_schema_with_fake_psycopg(monkeypatch):
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    connection = _FakePostgresConnection()
+    fake = _install_fake_psycopg2(monkeypatch, connection)
+
+    backend = RelationalMemoryRecordBackend("postgresql://user:pass@db.example/deepmem")
+
+    assert backend is not None
+    assert fake.connected_urls == ["postgresql://user:pass@db.example/deepmem"]
+    assert any("CREATE TABLE IF NOT EXISTS memory_records" in sql for sql, _ in connection.executed)
+    assert connection.commits >= 1
+
+
+def test_postgres_backend_upsert_get_many_and_search_use_bound_scope_params(monkeypatch):
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    connection = _FakePostgresConnection()
+    _install_fake_psycopg2(monkeypatch, connection)
+    connection.rows_by_id["mem_pg_001"] = _pg_row()
+    connection.search_rows = [_pg_row(record_id="mem_pg_001", text="postgres search hit", score=0.7)]
+    backend = RelationalMemoryRecordBackend("postgres://user:pass@db.example/deepmem")
+
+    backend.upsert_record(
+        _CTX_A,
+        text="postgres record",
+        record_id="mem_pg_001",
+        metadata={"kind": "pg"},
+        provenance={"run": "r1"},
+        source="pg-test",
+    )
+    fetched = backend.get_record(_CTX_A, "mem_pg_001")
+    many = backend.get_many(_CTX_A, ["missing", "mem_pg_001"])
+    results = backend.search(_CTX_A, "postgres memory", filters={"kind": "pg"}, limit=3)
+
+    assert fetched is not None
+    assert fetched.id == "mem_pg_001"
+    assert [record.id for record in many] == ["mem_pg_001"]
+    assert [result.id for result in results] == ["mem_pg_001"]
+    upsert_sql, upsert_params = next((sql, params) for sql, params in connection.executed if "ON CONFLICT" in sql)
+    assert "ON CONFLICT" in upsert_sql
+    assert upsert_params[:7] == _scope_values_for_test(_CTX_A)
+    assert len(upsert_params) == 20
+    search_sql, search_params = next((sql, params) for sql, params in connection.executed if "FROM ranked" in sql)
+    assert "jsonb_each(%s::jsonb)" in search_sql
+    assert "metadata -> filter.k = filter.v" in search_sql
+    assert "websearch_to_tsquery" in search_sql
+    assert search_params[:7] == _scope_values_for_test(_CTX_A)
+    assert search_params[7] == '{"kind": "pg"}'
+    assert search_params[8] == '{"kind": "pg"}'
+    assert search_params[10] == "postgres OR memory"
+    assert search_params[12] == "postgres OR memory"
+    assert search_params[-1] == 3
+
+
+def test_postgres_backend_maps_default_tuple_cursor_rows(monkeypatch):
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    connection = _FakePostgresConnection()
+    _install_fake_psycopg2(monkeypatch, connection)
+    connection.rows_by_id["mem_pg_tuple"] = _pg_tuple_row()
+    connection.search_rows = [_pg_tuple_row(text="tuple search hit") + (0.9,)]
+    backend = RelationalMemoryRecordBackend("postgresql://user:***@db.example/deepmem")
+
+    fetched = backend.get_record(_CTX_A, "mem_pg_tuple")
+    results = backend.search(_CTX_A, "tuple", limit=1)
+
+    assert fetched is not None
+    assert fetched.id == "mem_pg_tuple"
+    assert fetched.metadata == {"kind": "pg"}
+    assert [result.id for result in results] == ["mem_pg_tuple"]
+
+
+def test_postgres_missing_dependency_error_redacts_query_password(monkeypatch):
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    class _ImportBlocker:
+        def find_spec(self, fullname, path=None, target=None):
+            if fullname == "psycopg2":
+                raise ImportError("blocked fake missing dependency")
+            return None
+
+    monkeypatch.delitem(sys.modules, "psycopg2", raising=False)
+    blocker = _ImportBlocker()
+    sys.meta_path.insert(0, blocker)
+    try:
+        with pytest.raises(RuntimeError) as exc_info:
+            RelationalMemoryRecordBackend(
+                "postgresql://db.example/deepmem?user=alice&password=LEAKSENTINEL_QUERY_PASSWORD"
+            )
+    finally:
+        sys.meta_path.remove(blocker)
+
+    error_msg = str(exc_info.value)
+    assert "LEAKSENTINEL_QUERY_PASSWORD" not in error_msg
+    assert "password=" not in error_msg
+
+
+def _scope_values_for_test(context):
+    return tuple(
+        str(getattr(context, field) or "")
+        for field in (
+            "mode",
+            "org_id",
+            "workspace_id",
+            "project_id",
+            "agent_profile_id",
+            "conversation_id",
+            "user_id",
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -613,15 +946,19 @@ def test_postgres_upsert_sql_uses_placeholders_not_string_interpolation():
 
 def test_postgres_upsert_sql_preserves_created_at_on_conflict():
     sql = _upsert_sql().lower()
-    # created_at must not appear in the DO UPDATE SET clause after "do update set"
+    # created_at must not appear in the DO UPDATE SET clause after "do update set".
+    # The RETURNING clause may include created_at so callers can report the stored
+    # value without lying on idempotent updates.
     do_update_idx = sql.find("do update set")
     assert do_update_idx != -1, "upsert SQL must contain DO UPDATE SET"
-    after_do_update = sql[do_update_idx:]
+    update_clause = sql[do_update_idx:].split("returning", 1)[0]
     # created_at must not be assigned in the update portion
     # (it is in INSERT columns but must be excluded from SET)
-    assert "created_at" not in after_do_update, (
+    assert "created_at" not in update_clause, (
         "created_at must not appear in DO UPDATE SET — preserve original value"
     )
+    assert "returning" in sql
+    assert "created_at" in sql.split("returning", 1)[1]
 
 
 def test_postgres_upsert_sql_no_sentinel_value_in_sql_string():
@@ -647,9 +984,12 @@ def test_postgres_search_sql_has_scope_filter_before_ranking():
     assert "from scope_filtered" in sql[ranked_cte_idx:]
 
 
-def test_postgres_search_sql_has_metadata_jsonb_containment_or_filter_param():
+def test_postgres_search_sql_has_metadata_jsonb_top_level_exact_filter_param():
     sql = _single_spaced(_search_sql())
-    assert "(%s::jsonb is null or metadata @> %s::jsonb)" in sql
+    assert "%s::jsonb is null" in sql
+    assert "jsonb_each(%s::jsonb)" in sql
+    assert "metadata ? filter.k" in sql
+    assert "metadata -> filter.k = filter.v" in sql
 
 
 def test_postgres_search_sql_has_vector_rank_component():
@@ -659,7 +999,7 @@ def test_postgres_search_sql_has_vector_rank_component():
 
 def test_postgres_search_sql_has_text_rank_component():
     sql = _single_spaced(_search_sql())
-    assert "ts_rank(ts_vec, plainto_tsquery('english', %s))" in sql
+    assert "ts_rank(ts_vec, websearch_to_tsquery('english', %s))" in sql
 
 
 def test_postgres_search_sql_uses_fts_predicate_or_positive_score_filter():
@@ -669,7 +1009,7 @@ def test_postgres_search_sql_uses_fts_predicate_or_positive_score_filter():
     assert ranked_idx != -1
     assert select_idx != -1
     ranked_cte = sql[ranked_idx:select_idx]
-    assert "ts_vec @@ plainto_tsquery('english', %s)" in ranked_cte
+    assert "ts_vec @@ websearch_to_tsquery('english', %s)" in ranked_cte
     assert "where score > 0" in sql[select_idx:]
 
 

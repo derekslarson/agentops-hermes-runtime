@@ -1,10 +1,9 @@
-"""Minimal compose-self-hosted service processes for AgentOps Runtime.
+"""Compose-self-hosted service processes for AgentOps Runtime.
 
-These processes intentionally expose only health and configuration surfaces.
-The real distributed behavior continues to live behind Hermes runtime backend
-contracts; M12 composes those processes with database/queue/artifact/secret
-services so follow-up slices can wire durable adapters without changing the
-compose topology.
+These lightweight processes expose health/readiness surfaces plus the MVP
+control-plane endpoints needed by distributed Hermes workers. Durable runtime
+behavior still lives behind Hermes backend contracts; compose wiring selects
+local, SQLite, or PostgreSQL/pgvector backends without changing the topology.
 """
 
 from __future__ import annotations
@@ -147,7 +146,7 @@ def _make_memory_backend(environ: dict[str, str]) -> Any:
     Selection order:
     1. AGENTOPS_DEEP_MEMORY_DB_URL=sqlite:///... → RelationalMemoryRecordBackend
     2. AGENTOPS_DEEP_MEMORY_STORE=sqlite + AGENTOPS_DEEP_MEMORY_DB_URL → same
-    3. AGENTOPS_DEEP_MEMORY_DB_URL=postgresql://... → scaffold fails closed
+    3. AGENTOPS_DEEP_MEMORY_DB_URL=postgresql://... → live PostgreSQL/pgvector adapter
     4. Unconfigured → LocalDeepMemoryBackend(partition=True)
 
     When a durable store is explicitly configured but cannot initialize,
@@ -160,8 +159,6 @@ def _make_memory_backend(environ: dict[str, str]) -> Any:
         raise ValueError("unsupported deep-memory store type")
 
     if db_url or store_type in ("sqlite", "postgres", "postgresql"):
-        if store_type in ("postgres", "postgresql"):
-            raise ValueError("deep-memory postgres store is not yet implemented")
         if not db_url and store_type == "sqlite":
             import os as _os
 
@@ -169,6 +166,15 @@ def _make_memory_backend(environ: dict[str, str]) -> Any:
             db_dir = _os.path.join(hermes_home, "deep-memory")
             _os.makedirs(db_dir, exist_ok=True)
             db_url = f"sqlite:///{db_dir}/records.db"
+        elif not db_url:
+            raise ValueError("postgres deep-memory store requires AGENTOPS_DEEP_MEMORY_DB_URL")
+
+        parsed = urllib.parse.urlparse(db_url)
+        if store_type in ("postgres", "postgresql") and parsed.scheme not in ("postgres", "postgresql"):
+            raise ValueError("postgres deep-memory store requires a postgres:// or postgresql:// URL")
+        if store_type == "sqlite" and parsed.scheme != "sqlite":
+            raise ValueError("sqlite deep-memory store requires a sqlite:/// URL")
+
         from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
 
         return RelationalMemoryRecordBackend(db_url)

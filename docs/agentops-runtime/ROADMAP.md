@@ -620,6 +620,30 @@ Caveats:
 
 **Goal:** Make deep-memory record recall feature-parity for compose/cloud profiles, not just local/local-multi. The cloud runtime must ingest completed turns, prefetch scoped hints, and serve `memory_record_search` / `memory_record_get` / `memory_record_get_many` through a durable remote backend with the same user-visible semantics as Derek's local Hermes.
 
+**In-progress note (2026-06-03, TDD — eighth slice):** Continued M5B by hardening the live Postgres adapter and compose wiring after independent review. This does NOT complete M5B.
+
+Delivered:
+- `agentops_runtime/memory_record_store.py` — Postgres connection/schema/write/read failures now raise sanitized `RuntimeError`s with suppressed exception chaining; rollback is best-effort so rollback failures cannot replace or leak the sanitized outer error. Successful Postgres read helpers commit transactions so SELECT paths do not leave idle-in-transaction sessions open.
+- `agentops_runtime/memory_record_store.py` — Postgres upsert SQL now uses `RETURNING` and maps the returned stored row so conflict updates report database-preserved `created_at`/`updated_at` values instead of a caller-local timestamp. Postgres search now uses exact top-level JSONB metadata filters via `jsonb_each`, websearch OR queries derived from sanitized tokens for partial-token parity, bound placeholders for all values, positive-score filtering, deterministic ordering, and nonzero score metadata on results.
+- `tests/agentops_runtime/test_memory_record_store.py` and `tests/agentops_runtime/test_compose_services.py` — Postgres failure-path tests now monkeypatch fake/missing `psycopg2` modules so unit tests never attempt live localhost/Postgres connections just because the driver is installed. New coverage asserts secret-safe traceback/cause behavior, best-effort rollback, read-transaction commits, stored timestamp returns, exact metadata filtering SQL, OR full-text query params, and compose/Postgres fail-closed routing.
+- `agentops_runtime/compose_services.py`, `deploy/compose/docker-compose.yml`, `Dockerfile`, and `pyproject.toml` — documentation and packaging now describe the live PostgreSQL/pgvector path honestly; compose uses `pgvector/pgvector:pg16`, the API service sets `AGENTOPS_DEEP_MEMORY_DB_URL`, and the Docker build installs the optional `postgres` extra containing `psycopg2-binary`.
+
+Test/review evidence: RED tests were observed failing before implementation for the new security/search/transaction assertions. Focused verification `./scripts/run_tests.sh tests/agentops_runtime/test_memory_record_store.py tests/agentops_runtime/test_compose_services.py tests/deploy/test_agentops_compose_profile.py` → 108 passed. `git diff --check` passed. Hermes delegate_task spec review passed with no blocking findings; Hermes delegate_task quality/security review found stale-doc blockers only; after docstring patch, blocker-only re-review passed with no blocking findings.
+
+**In-progress note (2026-06-03, TDD — seventh slice):** Live Postgres selection and compose API wiring have landed. This does NOT complete M5B.
+
+Delivered:
+- `agentops_runtime/memory_record_store.py` — `RelationalMemoryRecordBackend` now selects a live Postgres path for `postgresql://` / `postgres://` URLs instead of the earlier scaffold-only `NotImplementedError`. The implementation imports `psycopg2` lazily, executes the existing `_postgres_schema_sql()` during construction, uses the existing `_postgres_upsert_sql()` for scoped idempotent writes, and adds scoped Postgres `get_record`, `get_many`, and `_postgres_search_sql()` execution paths. Every live operation binds the same seven RuntimeContext scope columns before record IDs/search filters. Postgres search currently passes `NULL` vector query/embedding parameters, so this is a safe FTS/metadata/full-record wiring slice; real embedding/vector/extracted-signal parity remains unfinished. Explicit Postgres configuration still fails closed if `psycopg2`, connection, schema, read, write, or search execution fails, and failure messages redact DSN userinfo.
+- `agentops_runtime/compose_services.py` — `_make_memory_backend(environ)` now routes explicit Postgres deep-memory DB URLs and `AGENTOPS_DEEP_MEMORY_STORE=postgres|postgresql` through `RelationalMemoryRecordBackend`, while still preserving local default `LocalDeepMemoryBackend(partition=True)`, sqlite explicit selection, and fail-closed store/URL mismatches.
+- `deploy/compose/docker-compose.yml` plus image packaging — the `api` service now sets `AGENTOPS_DEEP_MEMORY_DB_URL` to the same compose Postgres DSN as `AGENTOPS_DATABASE_URL` so the `/memory/records` control-plane API uses the compose Postgres service for deep-memory records. The value is duplicated instead of referencing `${AGENTOPS_DATABASE_URL}` because Compose interpolates environment entries from host/`.env` values, not from earlier entries in the same service. The Postgres service now uses a `pgvector` image so `CREATE EXTENSION vector` can succeed, and the runtime Docker image installs the new pinned `postgres` extra (`psycopg2-binary`) so the API can import the Postgres driver. Worker and scheduler services keep using the HTTP control-plane route and do not receive direct deep-memory DB configuration.
+
+Test evidence (RED→GREEN): new fake-psycopg tests first failed on the scaffold-only Postgres path, tuple-row mapping/redaction tests first failed on the live-read/error-sanitizing gaps found in review, the compose env test first failed on the invalid `${AGENTOPS_DATABASE_URL}` interpolation, the pgvector image test first failed on the vanilla Postgres image found by spec review, and the image-driver packaging test first failed because no `postgres` extra/Docker install path existed. After fixes, focused/regression suites passed; see the run report for the exact latest command output. `python -m ruff check agentops_runtime/memory_record_store.py agentops_runtime/compose_services.py tests/agentops_runtime/test_memory_record_store.py tests/agentops_runtime/test_compose_services.py tests/deploy/test_agentops_compose_profile.py` → passed.
+
+**Remaining before Done (managed-cloud parity, vector/extracted-signal parity, and final docs are still incomplete):**
+1. Real Postgres vector embedding query parameters and vector/BM25/extracted-signal parity for the live adapter rather than the current `NULL` vector placeholder path.
+2. Managed-cloud profile registration (AWS/GCP backends register their own `DEEP_MEMORY` adapter).
+3. `docs/agentops-runtime/memory-surfaces.md` updated to document both local and remote deep-memory flows, the exact first cloud backend, and the no-local-fallback rule.
+
 **In-progress note (2026-06-03, TDD — sixth slice):** Postgres SQL contract scaffold for `RelationalMemoryRecordBackend`. This does NOT complete M5B.
 
 Delivered:
@@ -632,11 +656,10 @@ Test evidence (RED→GREEN: initial SQL-contract tests were confirmed failing be
 
 `python -m pytest tests/agentops_runtime/test_memory_record_store.py -q` → 62 passed. Regressions `tests/agentops_runtime/test_compose_services.py tests/agent/test_remote_memory_record_backend.py tests/tools/test_memory_record_tools.py` → 63 passed. `ruff check` and `git diff --check` clean.
 
-**Remaining before Done (runtime Postgres/pgvector adapter, compose registration, managed-cloud parity, and final docs are all still incomplete):**
-1. Live Postgres + psycopg2 adapter wiring `_postgres_schema_sql`/`_postgres_upsert_sql`/`_postgres_search_sql` into `RelationalMemoryRecordBackend` when a `postgresql://` URL is configured.
-2. Compose service registration of the Postgres-backed `RelationalMemoryRecordBackend`.
-3. Managed-cloud profile registration (AWS/GCP backends register their own `DEEP_MEMORY` adapter).
-4. `docs/agentops-runtime/memory-surfaces.md` updated to document both local and remote deep-memory flows, the exact first cloud backend, and the no-local-fallback rule.
+**Remaining before Done (managed-cloud parity, final docs, and full vector/extracted-signal parity are still incomplete):**
+1. Managed-cloud profile registration (AWS/GCP backends register their own `DEEP_MEMORY` adapter).
+2. `docs/agentops-runtime/memory-surfaces.md` updated to document both local and remote deep-memory flows, the exact first cloud backend, and the no-local-fallback rule.
+3. Postgres runtime vector embedding population and deterministic extracted-signal boosts matched to the local deep-memory provider; this slice wires the live Postgres schema/search path and compose `pgvector` service but still stores `embedding` as `NULL` until an embedding adapter is added.
 
 **In-progress note (2026-06-03, TDD — fifth slice):** BM25 keyword-ranking parity for `RelationalMemoryRecordBackend`. This does NOT complete M5B.
 

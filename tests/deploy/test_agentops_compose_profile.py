@@ -60,6 +60,27 @@ def test_compose_services_use_agentops_runtime_profile_and_backend_refs():
         assert "AGENTOPS_API_URL=http://api:8710" in env
 
 
+def test_compose_api_wires_deep_memory_db_to_postgres_without_worker_direct_db():
+    services = _compose()["services"]
+
+    worker_env = "\n".join(services["worker"]["environment"])
+    scheduler_env = "\n".join(services["scheduler"]["environment"])
+
+    deep_memory_lines = [line for line in services["api"]["environment"] if line.startswith("AGENTOPS_DEEP_MEMORY_DB_URL=")]
+    assert deep_memory_lines == [
+        "AGENTOPS_DEEP_MEMORY_DB_URL=postgresql://agentops:${AGENTOPS_POSTGRES_PASSWORD:-agentops-dev-password}@postgres:5432/${AGENTOPS_POSTGRES_DB:-agentops}"
+    ]
+    assert "${AGENTOPS_DATABASE_URL}" not in deep_memory_lines[0]
+    assert "AGENTOPS_DEEP_MEMORY_DB_URL=" not in worker_env
+    assert "AGENTOPS_DEEP_MEMORY_DB_URL=" not in scheduler_env
+
+
+def test_compose_postgres_image_includes_pgvector_for_deep_memory_schema():
+    postgres = _compose()["services"]["postgres"]
+
+    assert "pgvector" in postgres["image"].lower()
+
+
 def test_compose_profile_documents_scale_and_smoke_commands_without_raw_secrets():
     env_text = ENV_EXAMPLE.read_text(encoding="utf-8")
     readme_text = README.read_text(encoding="utf-8")
@@ -111,3 +132,13 @@ def test_agentops_runtime_compose_service_is_packaged_in_wheels():
 
     assert "agentops_runtime" in packages
     assert "agentops_runtime.*" in packages
+
+
+def test_compose_runtime_image_installs_postgres_driver_extra():
+    pyproject = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    postgres_extra = pyproject["project"]["optional-dependencies"]["postgres"]
+
+    assert any(dep.startswith("psycopg2-binary==") for dep in postgres_extra)
+    assert "--extra postgres" in dockerfile

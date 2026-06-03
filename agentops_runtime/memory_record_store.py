@@ -1,26 +1,28 @@
 """Relational MemoryRecordBackend for durable scope-isolated deep-memory storage.
 
-SQLite backend uses stdlib sqlite3 for focused tests and local durable storage.
-Postgres is scaffolded for compose/cloud deployments: if a postgresql:// URL is
-configured but unavailable, initialization fails closed — no fallback to local.
+SQLite uses stdlib sqlite3 for local durable storage. PostgreSQL uses a lazy
+psycopg2 import for Compose/cloud deployments; explicit remote configuration
+fails closed if the dependency, server, schema, or query path is unavailable.
 
 Scope isolation: every read/write predicate includes all seven scope columns
 (mode, org_id, workspace_id, project_id, agent_profile_id, conversation_id,
 user_id) derived from RuntimeContext. A record ingested under scope A is never
 visible or fetchable under scope B even when B knows the record_id.
 
-Search is BM25 keyword-based for this slice. Vector union search and
-extracted-signal boosts remain TODO for the Postgres/pgvector slice.
+Search uses local BM25 ranking for SQLite and PostgreSQL full-text/vector SQL
+for remote stores while preserving scoped filtering, bounded excerpts, and
+positive-score deterministic result ordering.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import threading
 import time
 from typing import Any, Iterable, Mapping
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 from agent.local_memory.store import MemoryRecord, SearchResult, _bm25_scores
 from agent.runtime_context import RuntimeContext
@@ -71,6 +73,56 @@ def _row_to_record(row: sqlite3.Row) -> MemoryRecord:
     )
 
 
+def _dict_to_record(row: Mapping[str, Any]) -> MemoryRecord:
+    return MemoryRecord(
+        id=str(row["record_id"]),
+        text=str(row["text"]),
+        text_hash=str(row["text_hash"]),
+        metadata=dict(row.get("metadata") or {}),
+        source=str(row.get("source") or "unknown"),
+        source_uri=str(row.get("source_uri") or ""),
+        timestamp=row.get("ts"),
+        created_at=float(row["created_at"]),
+        updated_at=float(row["updated_at"]),
+        record_kind=str(row.get("record_kind") or "verbatim"),
+        parent_id=row.get("parent_id"),
+        provenance=dict(row.get("provenance") or {}),
+    )
+
+
+def _redact_db_url(db_url: str) -> str:
+    parsed = urlparse(db_url)
+    netloc = parsed.netloc
+    if "@" in netloc:
+        _userinfo, hostinfo = netloc.rsplit("@", 1)
+        netloc = f"[REDACTED]@{hostinfo}"
+    return urlunparse((parsed.scheme, netloc, parsed.path, "", "", ""))
+
+
+def _coerce_mapping_row(row: Any, description: Any) -> Mapping[str, Any] | None:
+    if row is None:
+        return None
+    if isinstance(row, Mapping):
+        return row
+    columns = [column[0] for column in (description or [])]
+    return dict(zip(columns, row, strict=False))
+
+
+def _safe_rollback(conn: Any) -> None:
+    rollback = getattr(conn, "rollback", None)
+    if rollback is None:
+        return
+    try:
+        rollback()
+    except Exception:  # noqa: BLE001 - preserve sanitized outer error
+        return
+
+
+def _postgres_search_query(query: str) -> str:
+    tokens = re.findall(r"[A-Za-z0-9_]+", query)
+    return " OR ".join(tokens) if tokens else query
+
+
 _SCOPE_PRED = (
     "scope_mode=? AND scope_org_id=? AND scope_workspace_id=? AND "
     "scope_project_id=? AND scope_agent_profile_id=? AND "
@@ -79,43 +131,76 @@ _SCOPE_PRED = (
 
 
 class RelationalMemoryRecordBackend:
-    """SQLite-backed MemoryRecordBackend with full scope isolation.
+    """Relational MemoryRecordBackend with full RuntimeContext scope isolation.
 
-    db_url: "sqlite:///absolute/path.db" for SQLite.
-             "postgresql://..." scaffolds Postgres and fails closed when
-             psycopg2 is unavailable or the database cannot be reached.
+    db_url: "sqlite:///absolute/path.db" for SQLite local mode.
+             "postgresql://..." or "postgres://..." for the live PostgreSQL
+             adapter used by Compose/cloud profiles. Explicit remote URLs fail
+             closed instead of falling back to local storage.
     """
 
     def __init__(self, db_url: str) -> None:
-        self._db_path = self._resolve_sqlite_path(db_url)
+        self._driver, self._db_url_or_path = self._resolve_database(db_url)
         self._local = threading.local()
-        self._init_db()
+        if self._driver == "postgres":
+            self._init_postgres()
+        else:
+            self._init_db()
 
-    def _resolve_sqlite_path(self, db_url: str) -> str:
+    def _resolve_database(self, db_url: str) -> tuple[str, str]:
         if not db_url:
             raise ValueError("deep-memory relational store requires a database URL")
         parsed = urlparse(db_url)
         if parsed.scheme in {"postgresql", "postgres"}:
-            raise NotImplementedError(
-                "PostgreSQL backing for deep-memory records is not yet implemented "
-                "in this slice. Configure AGENTOPS_DEEP_MEMORY_DB_URL with a "
-                "sqlite:/// URL for local durable storage, or wait for the "
-                "pgvector/Postgres slice."
-            )
+            return "postgres", db_url
         if parsed.scheme == "sqlite":
             if not db_url.startswith("sqlite:///") or not parsed.path or parsed.path == "/":
                 raise ValueError("deep-memory sqlite store requires sqlite:///absolute/path.db")
-            return parsed.path
+            return "sqlite", parsed.path
         if parsed.scheme:
             raise ValueError("unsupported deep-memory relational store URL scheme")
         raise ValueError("deep-memory relational store requires sqlite:///absolute/path.db")
 
     def _conn(self) -> sqlite3.Connection:
         if not getattr(self._local, "conn", None):
-            conn = sqlite3.connect(self._db_path, check_same_thread=False)
+            conn = sqlite3.connect(self._db_url_or_path, check_same_thread=False)
             conn.row_factory = sqlite3.Row
             self._local.conn = conn
         return self._local.conn
+
+    def _postgres_driver(self) -> Any:
+        try:
+            return __import__("psycopg2")
+        except ImportError:
+            raise RuntimeError(
+                "PostgreSQL deep-memory store requires optional dependency psycopg2 "
+                f"for {_redact_db_url(self._db_url_or_path)}"
+            ) from None
+
+    def _pg_conn(self) -> Any:
+        if not getattr(self._local, "pg_conn", None):
+            driver = self._postgres_driver()
+            try:
+                self._local.pg_conn = driver.connect(self._db_url_or_path)
+            except Exception as exc:  # noqa: BLE001 - sanitize configuration failures
+                raise RuntimeError(
+                    "failed to initialize PostgreSQL deep-memory store "
+                    f"for {_redact_db_url(self._db_url_or_path)}: {exc.__class__.__name__}"
+                ) from None
+        return self._local.pg_conn
+
+    def _init_postgres(self) -> None:
+        conn = self._pg_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(_postgres_schema_sql())
+            conn.commit()
+        except Exception as exc:  # noqa: BLE001 - fail closed without DSN leakage
+            _safe_rollback(conn)
+            raise RuntimeError(
+                "failed to initialize PostgreSQL deep-memory schema "
+                f"for {_redact_db_url(self._db_url_or_path)}: {exc.__class__.__name__}"
+            ) from None
 
     def _init_db(self) -> None:
         conn = self._conn()
@@ -150,6 +235,111 @@ class RelationalMemoryRecordBackend:
         )
         conn.commit()
 
+    def _run_postgres_write(self, sql: str, params: tuple[Any, ...]) -> Mapping[str, Any] | None:
+        conn = self._pg_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                row = _coerce_mapping_row(cur.fetchone(), getattr(cur, "description", None)) if getattr(cur, "description", None) else None
+            conn.commit()
+            return row
+        except Exception as exc:  # noqa: BLE001 - sanitize database/runtime failures
+            _safe_rollback(conn)
+            raise RuntimeError(
+                "PostgreSQL deep-memory write failed "
+                f"for {_redact_db_url(self._db_url_or_path)}: {exc.__class__.__name__}"
+            ) from None
+
+    def _fetchone_postgres(self, sql: str, params: tuple[Any, ...]) -> Mapping[str, Any] | None:
+        conn = self._pg_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                row = _coerce_mapping_row(cur.fetchone(), getattr(cur, "description", None))
+            conn.commit()
+            return row
+        except Exception as exc:  # noqa: BLE001 - sanitize database/runtime failures
+            _safe_rollback(conn)
+            raise RuntimeError(
+                "PostgreSQL deep-memory read failed "
+                f"for {_redact_db_url(self._db_url_or_path)}: {exc.__class__.__name__}"
+            ) from None
+
+    def _fetchall_postgres(self, sql: str, params: tuple[Any, ...]) -> list[Mapping[str, Any]]:
+        conn = self._pg_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = [
+                    row
+                    for row in (_coerce_mapping_row(row, getattr(cur, "description", None)) for row in cur.fetchall())
+                    if row is not None
+                ]
+            conn.commit()
+            return rows
+        except Exception as exc:  # noqa: BLE001 - sanitize database/runtime failures
+            _safe_rollback(conn)
+            raise RuntimeError(
+                "PostgreSQL deep-memory read failed "
+                f"for {_redact_db_url(self._db_url_or_path)}: {exc.__class__.__name__}"
+            ) from None
+
+    def _pg_upsert_record(
+        self,
+        context: RuntimeContext | None,
+        *,
+        text: str,
+        metadata: Mapping[str, Any] | None = None,
+        source: str = "unknown",
+        source_uri: str = "",
+        timestamp: float | None = None,
+        record_kind: str = "verbatim",
+        parent_id: str | None = None,
+        provenance: Mapping[str, Any] | None = None,
+        record_id: str | None = None,
+    ) -> MemoryRecord:
+        scope = _scope_values(context)
+        rid = record_id or _generate_record_id(text)
+        text_hash = hashlib.sha256(text.encode()).hexdigest()
+        now = time.time()
+        metadata_dict = dict(metadata or {})
+        provenance_dict = dict(provenance or {})
+        stored_row = self._run_postgres_write(
+            _postgres_upsert_sql(),
+            (
+                *scope,
+                rid,
+                text,
+                text_hash,
+                json.dumps(metadata_dict),
+                json.dumps(provenance_dict),
+                source,
+                source_uri,
+                timestamp,
+                now,
+                now,
+                record_kind,
+                parent_id,
+                None,
+            ),
+        )
+        if stored_row:
+            return _dict_to_record(stored_row)
+        return MemoryRecord(
+            id=rid,
+            text=text,
+            text_hash=text_hash,
+            metadata=metadata_dict,
+            source=source,
+            source_uri=source_uri,
+            timestamp=timestamp,
+            created_at=now,
+            updated_at=now,
+            record_kind=record_kind,
+            parent_id=parent_id,
+            provenance=provenance_dict,
+        )
+
     def upsert_record(
         self,
         context: RuntimeContext | None,
@@ -164,6 +354,20 @@ class RelationalMemoryRecordBackend:
         provenance: Mapping[str, Any] | None = None,
         record_id: str | None = None,
     ) -> MemoryRecord:
+        if self._driver == "postgres":
+            return self._pg_upsert_record(
+                context,
+                text=text,
+                metadata=metadata,
+                source=source,
+                source_uri=source_uri,
+                timestamp=timestamp,
+                record_kind=record_kind,
+                parent_id=parent_id,
+                provenance=provenance,
+                record_id=record_id,
+            )
+
         scope = _scope_values(context)
         rid = record_id or _generate_record_id(text)
         text_hash = hashlib.sha256(text.encode()).hexdigest()
@@ -217,6 +421,19 @@ class RelationalMemoryRecordBackend:
 
     def get_record(self, context: RuntimeContext | None, record_id: str) -> MemoryRecord | None:
         scope = _scope_values(context)
+        if self._driver == "postgres":
+            row = self._fetchone_postgres(
+                """
+                SELECT *
+                FROM memory_records
+                WHERE scope_mode = %s AND scope_org_id = %s AND scope_workspace_id = %s
+                  AND scope_project_id = %s AND scope_agent_profile_id = %s
+                  AND scope_conversation_id = %s AND scope_user_id = %s
+                  AND record_id = %s
+                """,
+                (*scope, record_id),
+            )
+            return _dict_to_record(row) if row else None
         row = self._conn().execute(
             f"SELECT * FROM memory_records WHERE {_SCOPE_PRED} AND record_id=?",
             (*scope, record_id),
@@ -228,6 +445,20 @@ class RelationalMemoryRecordBackend:
         if not id_list:
             return []
         scope = _scope_values(context)
+        if self._driver == "postgres":
+            rows = self._fetchall_postgres(
+                """
+                SELECT *
+                FROM memory_records
+                WHERE scope_mode = %s AND scope_org_id = %s AND scope_workspace_id = %s
+                  AND scope_project_id = %s AND scope_agent_profile_id = %s
+                  AND scope_conversation_id = %s AND scope_user_id = %s
+                  AND record_id = ANY(%s)
+                """,
+                (*scope, id_list),
+            )
+            rows_by_id = {str(r["record_id"]): _dict_to_record(r) for r in rows}
+            return [rows_by_id[rid] for rid in id_list if rid in rows_by_id]
         placeholders = ",".join("?" * len(id_list))
         rows = self._conn().execute(
             f"SELECT * FROM memory_records WHERE {_SCOPE_PRED} AND record_id IN ({placeholders})",
@@ -259,6 +490,42 @@ class RelationalMemoryRecordBackend:
         if not tokens:
             return []
         scope = _scope_values(context)
+        if self._driver == "postgres":
+            filter_json = json.dumps(dict(filters)) if filters else None
+            ts_query = _postgres_search_query(query)
+            rows = self._fetchall_postgres(
+                _postgres_search_sql(),
+                (
+                    *scope,
+                    filter_json,
+                    filter_json,
+                    None,
+                    ts_query,
+                    None,
+                    ts_query,
+                    safe_limit,
+                ),
+            )
+            results = []
+            for rank, row in enumerate(rows[:safe_limit]):
+                excerpt = _make_excerpt(str(row["text"]))
+                results.append(
+                    SearchResult(
+                        id=str(row["record_id"]),
+                        score=float(row.get("score") or 0.0),
+                        rank=rank,
+                        excerpt=excerpt,
+                        text=excerpt,
+                        metadata=dict(row.get("metadata") or {}),
+                        source=str(row.get("source") or "unknown"),
+                        source_uri=str(row.get("source_uri") or ""),
+                        timestamp=row.get("ts"),
+                        record_kind=str(row.get("record_kind") or "verbatim"),
+                        bm25_score=float(row.get("score") or 0.0),
+                        matched_via="bm25",
+                    )
+                )
+            return results
         rows = self._conn().execute(
             f"SELECT * FROM memory_records WHERE {_SCOPE_PRED}",
             scope,
@@ -307,12 +574,11 @@ class RelationalMemoryRecordBackend:
 
 
 # ---------------------------------------------------------------------------
-# Postgres SQL contract scaffold (dependency-free; no live connection here)
+# Postgres SQL for the live psycopg2/pgvector adapter
 # ---------------------------------------------------------------------------
-# These three functions define the intended SQL contract for the future
-# Postgres/pgvector adapter. They return static SQL strings suitable for use
-# with psycopg2 (%s placeholders). No Postgres package is imported; callers
-# must supply their own connection and cursor.
+# These functions define SQL strings used by RelationalMemoryRecordBackend's
+# PostgreSQL path. The psycopg2 dependency is imported lazily by the adapter so
+# local-only SQLite users do not need the optional postgres extra installed.
 # ---------------------------------------------------------------------------
 
 _PG_SCOPE_COLS = (
@@ -394,11 +660,13 @@ def _postgres_upsert_sql() -> str:
         if c not in {*_PG_CONFLICT_COLS, "created_at"}
     ]
     update_set = ",\n        ".join(f"{c} = EXCLUDED.{c}" for c in mutable_cols)
+    returning_cols = ", ".join(c for c in all_cols if c != "embedding")
     return (
         f"INSERT INTO memory_records ({col_list})\n"
         f"VALUES ({placeholders})\n"
         f"ON CONFLICT ({conflict_target}) DO UPDATE SET\n"
-        f"        {update_set};"
+        f"        {update_set}\n"
+        f"RETURNING {returning_cols};"
     )
 
 
@@ -409,7 +677,14 @@ WITH scope_filtered AS (
     SELECT *
     FROM memory_records
     WHERE {scope_filter}
-      AND (%s::jsonb IS NULL OR metadata @> %s::jsonb)
+      AND (
+        %s::jsonb IS NULL
+        OR NOT EXISTS (
+            SELECT 1
+            FROM jsonb_each(%s::jsonb) AS filter(k, v)
+            WHERE NOT (metadata ? filter.k AND metadata -> filter.k = filter.v)
+        )
+      )
 ),
 ranked AS (
     SELECT
@@ -427,11 +702,11 @@ ranked AS (
         parent_id,
         (
             COALESCE(1.0 - (embedding <=> %s::vector), 0.0) * 0.6
-            + COALESCE(ts_rank(ts_vec, plainto_tsquery('english', %s)), 0.0) * 0.4
+            + COALESCE(ts_rank(ts_vec, websearch_to_tsquery('english', %s)), 0.0) * 0.4
         ) AS score
     FROM scope_filtered
     WHERE (%s::vector IS NOT NULL AND embedding IS NOT NULL)
-       OR ts_vec @@ plainto_tsquery('english', %s)
+       OR ts_vec @@ websearch_to_tsquery('english', %s)
 )
 SELECT *
 FROM ranked
