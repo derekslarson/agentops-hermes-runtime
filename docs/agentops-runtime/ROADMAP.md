@@ -616,9 +616,11 @@ Caveats:
 
 ### M5B. Remote durable deep-memory adapter + parity correction
 
-**Status:** Pending
+**Status:** Started
 
 **Goal:** Make deep-memory record recall feature-parity for compose/cloud profiles, not just local/local-multi. The cloud runtime must ingest completed turns, prefetch scoped hints, and serve `memory_record_search` / `memory_record_get` / `memory_record_get_many` through a durable remote backend with the same user-visible semantics as Derek's local Hermes.
+
+**In-progress note (2026-06-03, TDD):** Only the provider-neutral HTTP adapter/registration seam is in place so far — this does NOT complete M5B. `agent/runtime_memory_record_http.py` adds a stdlib-only `HttpMemoryRecordBackend` satisfying `MemoryRecordBackend` (the `DEEP_MEMORY` capability): scoped `upsert_record`/`search`/`get_record`/`get_many` against a control-plane HTTP API, sanitized RuntimeContext scope in payload/query, bearer token via `Authorization` header only (never URL/body), fail-closed base-URL/timeout/upsert-response validation, and JSON→local `MemoryRecord`/`SearchResult` conversion so the native record tools/prefetch keep routing through `BackendCapability.DEEP_MEMORY` unchanged. `agentops_runtime/compose_backends.py` now registers it for `compose-self-hosted` alongside the other HTTP backends (driven by `AGENTOPS_DEEP_MEMORY_URL`/`deep_memory_url` with `AGENTOPS_API_URL` fallback), and `agent.agent_init._bind_deep_memory_backend` binds that configured compose adapter into the native `memory_record_*`/prefetch path instead of silently leaving the profile without record tools. Test evidence (RED→GREEN): `tests/agentops_runtime/test_compose_backends.py::test_registers_http_backends_for_each_capability` plus new `tests/agent/test_remote_memory_record_backend.py` (26 tests). **Still remaining before Done:** the durable Postgres + `pgvector` + full-text control-plane storage API, completed-turn ingest parity, idempotent scoped import, managed-cloud profile registration, cross-scope isolation coverage, and `docs/agentops-runtime/memory-surfaces.md` documentation.
 
 **Audit correction:** M5A is correctly Done for the local provider plus scoped fail-closed seams, but that is not enough for the first cloud-deployable version. The roadmap previously allowed compose/cloud to fail closed with no `DEEP_MEMORY` adapter. That was too small: fail-closed remains correct for misconfiguration, but a completed MVP profile must ship and register a real scoped deep-memory backend.
 

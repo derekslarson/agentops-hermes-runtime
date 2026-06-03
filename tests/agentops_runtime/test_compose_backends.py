@@ -9,6 +9,7 @@ from agent.runtime_backends import BackendCapability, RuntimeBackendRegistry
 from agent.runtime_context import RuntimeContext
 from agent.runtime_cron_http import HttpCronBackend
 from agent.runtime_memory_http import HttpMemoryBackend
+from agent.runtime_memory_record_http import HttpMemoryRecordBackend
 from agentops_runtime.compose_backends import configure_compose_runtime_backends
 
 _PROFILE = "compose-self-hosted"
@@ -26,6 +27,7 @@ def test_registers_http_backends_for_each_capability():
 
     context = _context()
     assert isinstance(registry.get(BackendCapability.MEMORY, context), HttpMemoryBackend)
+    assert isinstance(registry.get(BackendCapability.DEEP_MEMORY, context), HttpMemoryRecordBackend)
     assert isinstance(registry.get(BackendCapability.CRON, context), HttpCronBackend)
     assert isinstance(registry.get(BackendCapability.ARTIFACT, context), HttpArtifactBackend)
     assert isinstance(registry.get(BackendCapability.AUDIT, context), HttpAuditBackend)

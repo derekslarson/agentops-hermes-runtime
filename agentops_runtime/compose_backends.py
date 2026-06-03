@@ -31,18 +31,21 @@ from agent.runtime_artifacts_audit import (
 from agent.runtime_backends import BackendCapability, RuntimeBackendRegistry
 from agent.runtime_cron_http import register_http_cron_backend
 from agent.runtime_memory_http import register_http_memory_backend
+from agent.runtime_memory_record_http import register_http_memory_record_backend
 
 _COMPOSE_PROFILE = "compose-self-hosted"
 _API_URL_ENV = "AGENTOPS_API_URL"
 _TOKEN_ENV = "AGENTOPS_RUNTIME_TOKEN"
 _CAPABILITY_URL_ENV: dict[BackendCapability, str] = {
     BackendCapability.MEMORY: "AGENTOPS_MEMORY_URL",
+    BackendCapability.DEEP_MEMORY: "AGENTOPS_DEEP_MEMORY_URL",
     BackendCapability.CRON: "AGENTOPS_CRON_URL",
     BackendCapability.ARTIFACT: "AGENTOPS_ARTIFACT_URL",
     BackendCapability.AUDIT: "AGENTOPS_AUDIT_URL",
 }
 _CAPABILITY_CONFIG_KEY: dict[BackendCapability, str] = {
     BackendCapability.MEMORY: "memory_url",
+    BackendCapability.DEEP_MEMORY: "deep_memory_url",
     BackendCapability.CRON: "cron_url",
     BackendCapability.ARTIFACT: "artifact_url",
     BackendCapability.AUDIT: "audit_url",
@@ -81,6 +84,7 @@ def configure_compose_runtime_backends(
         registry.set_capability_options(capability, options, merge=False)
 
     register_http_memory_backend(registry, profile)
+    register_http_memory_record_backend(registry, profile)
     register_http_cron_backend(registry, profile)
     register_http_artifact_backend(registry, profile=profile)
     register_http_audit_backend(registry, profile=profile)

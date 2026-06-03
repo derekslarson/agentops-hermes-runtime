@@ -204,10 +204,13 @@ def _bind_deep_memory_backend(agent: Any, config: Dict[str, Any]) -> None:
     # resolving, so remote-with-adapter profiles bind the scoped backend instead
     # of failing closed. Profiles without a registered adapter stay fail-closed.
     apply_deep_memory_adapters(deep_registry)
+    _register_configured_compose_deep_memory_adapter(deep_registry, ctx)
     try:
         deep_registry.get(BackendCapability.DEEP_MEMORY, ctx)
-    except BackendSelectionError as exc:
-        # No scoped adapter for this profile — fail closed, do not open a store.
+    except (BackendSelectionError, ValueError) as exc:
+        # No scoped adapter for this profile, or its config is invalid (e.g. a
+        # compose adapter selected without a base_url) — fail closed, do not open
+        # a store.
         logger.warning(
             "Deep memory unavailable for this profile; failing closed (no native record tools): %s",
             exc,
@@ -219,6 +222,30 @@ def _bind_deep_memory_backend(agent: Any, config: Dict[str, Any]) -> None:
     register_memory_record_tools()
     set_active_deep_memory_registry(deep_registry, context=ctx)
     _inject_deep_memory_tool_schemas(agent)
+
+
+def _register_configured_compose_deep_memory_adapter(deep_registry: Any, ctx: Any) -> None:
+    """Wire the HTTP DEEP_MEMORY adapter when config selects the compose profile.
+
+    ``apply_deep_memory_adapters`` only surfaces process-level adapters registered
+    at startup. A run whose config selects the compose-self-hosted profile (with a
+    ``deep_memory`` ``base_url`` option) must still bind the HTTP record adapter so
+    native ``memory_record_*``/prefetch resolve through the control plane instead of
+    failing closed. Other profiles are left untouched so they keep their existing
+    binding or fail-closed behavior.
+    """
+    from agent.runtime_backends import BackendCapability, BackendSelectionError
+    from agent.runtime_memory_record_http import (
+        _DEFAULT_PROFILE as _COMPOSE_DEEP_MEMORY_PROFILE,
+        register_http_memory_record_backend,
+    )
+
+    try:
+        profile = deep_registry.resolve_profile(BackendCapability.DEEP_MEMORY, ctx)
+    except BackendSelectionError:
+        return
+    if profile == _COMPOSE_DEEP_MEMORY_PROFILE:
+        register_http_memory_record_backend(deep_registry, profile=profile)
 
 
 class _UnavailableCronBackend:
