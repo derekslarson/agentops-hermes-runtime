@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import sys
 import threading
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -63,6 +65,13 @@ class _Handler(BaseHTTPRequestHandler):
     server_version = "AgentOpsRuntimeCompose/0.1"
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib callback name
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path.startswith("/memory/records"):
+            if self.server.service_name != "api":  # type: ignore[attr-defined]
+                self.send_error(404)
+                return
+            self._dispatch_memory_records("GET", parsed)
+            return
         if self.path not in {"/healthz", "/readyz"}:
             self.send_error(404)
             return
@@ -74,12 +83,72 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_POST(self) -> None:  # noqa: N802 - stdlib callback name
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path.startswith("/memory/records"):
+            if self.server.service_name != "api":  # type: ignore[attr-defined]
+                self.send_error(404)
+                return
+            self._dispatch_memory_records("POST", parsed)
+            return
+        self.send_error(404)
+
+    def _dispatch_memory_records(self, method: str, parsed: urllib.parse.ParseResult) -> None:
+        from agentops_runtime.memory_records_api import handle_memory_records_request
+
+        body_bytes = b""
+        if method == "POST":
+            length = int(self.headers.get("Content-Length") or "0")
+            body_bytes = self.rfile.read(length)
+
+        token = os.getenv("AGENTOPS_RUNTIME_TOKEN") or None
+        auth_header = self.headers.get("Authorization")
+        backend = getattr(self.server, "memory_backend", None) or _get_or_create_memory_backend()
+
+        status, response = handle_memory_records_request(
+            method=method,
+            path=parsed.path,
+            query_string=parsed.query,
+            body_bytes=body_bytes,
+            auth_header=auth_header,
+            token=token,
+            backend=backend,
+        )
+
+        body = json.dumps(response).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - stdlib signature
-        print(f"{self.server.service_name}: " + format % args, file=sys.stderr)  # type: ignore[attr-defined]
+        rendered = _sanitize_log_message(format % args)
+        print(f"{self.server.service_name}: " + rendered, file=sys.stderr)  # type: ignore[attr-defined]
 
 
 class _Server(ThreadingHTTPServer):
     service_name: str
+    memory_backend: Any = None
+
+
+_memory_backend_lock = threading.Lock()
+_memory_backend_instance: Any = None
+
+
+def _sanitize_log_message(message: str) -> str:
+    """Redact /memory/records query strings from stdlib access logs."""
+    return re.sub(r"(/memory/records[^\s?\"]*)\?[^\s\"]+", r"\1?<redacted>", message)
+
+
+def _get_or_create_memory_backend() -> Any:
+    global _memory_backend_instance
+    with _memory_backend_lock:
+        if _memory_backend_instance is None:
+            from agent.runtime_backends import LocalDeepMemoryBackend
+
+            _memory_backend_instance = LocalDeepMemoryBackend(partition=True)
+        return _memory_backend_instance
 
 
 def main(argv: list[str] | None = None) -> int:
