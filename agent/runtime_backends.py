@@ -34,11 +34,12 @@ import threading
 import time
 from datetime import datetime
 from enum import Enum
-from typing import Any, Callable, Mapping, Protocol, runtime_checkable
+from typing import Any, Callable, Iterable, Mapping, Protocol, runtime_checkable
 
 from agent.runtime_context import RuntimeContext
 
 _DEFAULT_PROFILE = "local"
+_LOCAL_MULTI_PROFILE = "local-multi"
 _SENSITIVE_EVENT_KEYS = ("secret", "token", "password", "api_key", "apikey", "credential", "authorization", "auth")
 _PATH_EVENT_KEYS = ("path", "file", "filename", "dirname", "cwd", "workdir", "directory")
 _SENSITIVE_TEXT_PATTERN = re.compile(
@@ -287,6 +288,11 @@ class BackendCapability(str, Enum):
     ARTIFACT = "artifact"
     AUDIT = "audit"
     DELIVERY = "delivery"
+    # Optional, additively-registered capability (M5A). Deep memory is the
+    # separate historical completed-turn recall surface; it is NOT part of the
+    # MVP-required contract set so AgentOps/remote profiles without a registered
+    # adapter fail closed rather than falling back to an unscoped local store.
+    DEEP_MEMORY = "deep_memory"
 
 
 _AUDITED_BACKEND_METHODS: dict[BackendCapability, tuple[str, ...]] = {
@@ -332,7 +338,13 @@ _AUDITED_BACKEND_METHODS: dict[BackendCapability, tuple[str, ...]] = {
 }
 
 
-REQUIRED_CAPABILITIES: frozenset[BackendCapability] = frozenset(BackendCapability)
+# The MVP-required runtime backend contract. Every required capability has a
+# local default and must be satisfiable under every deployment profile.
+# ``DEEP_MEMORY`` is intentionally excluded: it is an optional capability that
+# fails closed on profiles without a registered adapter.
+REQUIRED_CAPABILITIES: frozenset[BackendCapability] = frozenset(
+    cap for cap in BackendCapability if cap is not BackendCapability.DEEP_MEMORY
+)
 
 
 class BackendSelectionError(LookupError):
@@ -370,6 +382,49 @@ class MemoryBackend(Protocol):
         target: str = "memory",
         action: str = "add",
     ) -> None: ...
+
+
+@runtime_checkable
+class MemoryRecordBackend(Protocol):
+    """Scoped backend for deep-memory historical records.
+
+    This is the ``DEEP_MEMORY`` capability contract — a separate surface from the
+    curated ``MemoryBackend`` above. Every method takes the RuntimeContext first
+    and the backend owns scoping: a record ingested under one tenant/user/thread
+    must never be searchable or fetchable (even by stable ID) under another. The
+    native ``memory_record_search`` / ``memory_record_get`` / ``memory_record_get_many``
+    tools dispatch through this contract using the current bound RuntimeContext.
+    """
+
+    def upsert_record(
+        self,
+        context: RuntimeContext | None,
+        *,
+        text: str,
+        metadata: Mapping[str, Any] | None = None,
+        source: str = "unknown",
+        source_uri: str = "",
+        timestamp: float | None = None,
+        record_kind: str = "verbatim",
+        parent_id: str | None = None,
+        provenance: Mapping[str, Any] | None = None,
+        record_id: str | None = None,
+    ) -> Any: ...
+
+    def search(
+        self,
+        context: RuntimeContext | None,
+        query: str,
+        *,
+        filters: Mapping[str, Any] | None = None,
+        limit: int = 5,
+        max_distance: float = 0.0,
+        candidate_strategy: str = "union",
+    ) -> list[Any]: ...
+
+    def get_record(self, context: RuntimeContext | None, record_id: str) -> Any: ...
+
+    def get_many(self, context: RuntimeContext | None, ids: Iterable[str]) -> list[Any]: ...
 
 
 @runtime_checkable
@@ -714,6 +769,147 @@ class LocalMemoryBackend:
     ) -> None:
         with self._lock:
             self._store.setdefault(_runtime_scope_key(context), {})[target] = content
+
+
+def _deep_memory_scope_key(context: RuntimeContext | None) -> tuple[Any, ...]:
+    """Durable tenant/user/project/thread scope for deep-memory records.
+
+    Reuses the session-scope shape (excludes per-execution ``run_id``/``job_id``)
+    so a restarted/rescheduled worker resolves the same partition while another
+    user/org/project/thread stays isolated. Including ``conversation_id`` gives
+    thread-level isolation in multi-tenant mode.
+    """
+
+    return _session_scope_key(context)
+
+
+class LocalDeepMemoryBackend:
+    """RuntimeContext-scoped wrapper over the local flat deep-memory store.
+
+    ``partition=False`` (the ``local`` single-user profile) keeps one shared store
+    rooted exactly at the base dir (the current ``$HERMES_HOME/deep-memory``
+    behaviour, with cross-session recall for the single user). ``partition=True``
+    (the ``local-multi`` profile) gives each RuntimeContext scope its own store
+    subdirectory so there is no cross-user/org/project/thread record leakage.
+
+    The ChromaDB-backed store is imported lazily and created on first use per
+    scope, so importing this module (and constructing the backend) never pulls in
+    the optional Chroma/ONNX dependencies.
+    """
+
+    def __init__(
+        self,
+        *,
+        base_dir: Any = None,
+        partition: bool = False,
+        embedding_device: str = "auto",
+    ) -> None:
+        self._base_dir = base_dir
+        self._partition = bool(partition)
+        self._embedding_device = embedding_device or "auto"
+        self._stores: dict[tuple[Any, ...], Any] = {}
+        self._lock = threading.RLock()
+
+    def _resolve_base_dir(self):
+        from pathlib import Path
+
+        if self._base_dir:
+            return Path(self._base_dir)
+        from agent.local_memory.provider import load_deep_memory_config, resolve_storage_dir
+        from hermes_constants import get_hermes_home
+
+        cfg = load_deep_memory_config()
+        return resolve_storage_dir(str(cfg.get("storage_dir")), str(get_hermes_home()))
+
+    def _scope_key(self, context: RuntimeContext | None) -> tuple[Any, ...]:
+        if not self._partition:
+            return ()
+        return _deep_memory_scope_key(context)
+
+    @staticmethod
+    def _scope_dirname(scope: tuple[Any, ...]) -> str:
+        import hashlib
+
+        digest = hashlib.sha256(repr(scope).encode("utf-8", errors="replace")).hexdigest()
+        return "scope_" + digest[:32]
+
+    def _store_for(self, context: RuntimeContext | None):
+        from pathlib import Path
+
+        scope = self._scope_key(context)
+        with self._lock:
+            store = self._stores.get(scope)
+            if store is not None:
+                return store
+            from agent.local_memory.store import LocalMemoryStore
+
+            base = Path(self._resolve_base_dir())
+            root = base if not self._partition else base / self._scope_dirname(scope)
+            store = LocalMemoryStore(root, embedding_device=self._embedding_device)
+            self._stores[scope] = store
+            return store
+
+    def upsert_record(
+        self,
+        context: RuntimeContext | None,
+        *,
+        text: str,
+        metadata: Mapping[str, Any] | None = None,
+        source: str = "unknown",
+        source_uri: str = "",
+        timestamp: float | None = None,
+        record_kind: str = "verbatim",
+        parent_id: str | None = None,
+        provenance: Mapping[str, Any] | None = None,
+        record_id: str | None = None,
+    ) -> Any:
+        return self._store_for(context).upsert_record(
+            text=text,
+            metadata=dict(metadata) if metadata else None,
+            source=source,
+            source_uri=source_uri,
+            timestamp=timestamp,
+            record_kind=record_kind,
+            parent_id=parent_id,
+            provenance=dict(provenance) if provenance else None,
+            record_id=record_id,
+        )
+
+    def search(
+        self,
+        context: RuntimeContext | None,
+        query: str,
+        *,
+        filters: Mapping[str, Any] | None = None,
+        limit: int = 5,
+        max_distance: float = 0.0,
+        candidate_strategy: str = "union",
+    ) -> list[Any]:
+        return self._store_for(context).search(
+            query,
+            filters=dict(filters) if filters else None,
+            limit=limit,
+            max_distance=max_distance,
+            candidate_strategy=candidate_strategy,
+        )
+
+    def get_record(self, context: RuntimeContext | None, record_id: str) -> Any:
+        return self._store_for(context).get_record(record_id)
+
+    def get_many(self, context: RuntimeContext | None, ids: Iterable[str]) -> list[Any]:
+        return self._store_for(context).get_many(ids)
+
+    def stats(self, context: RuntimeContext | None) -> Mapping[str, Any]:
+        return self._store_for(context).stats()
+
+    def close(self) -> None:
+        with self._lock:
+            for store in self._stores.values():
+                try:
+                    store.close()
+                except Exception:
+                    pass
+            self._stores.clear()
 
 
 class LocalSkillBackend:
@@ -1523,6 +1719,49 @@ _LOCAL_BACKEND_TYPES: dict[BackendCapability, Callable[[], Any]] = {
 }
 
 
+# Process-level DEEP_MEMORY adapter registry. Deep memory has no MVP-required
+# local default for non-local profiles (it fails closed), so a deployment that
+# wants remote/compose deep memory registers a cloud/database-agnostic adapter
+# factory here at startup, keyed by deployment profile. Agent init applies these
+# to each per-agent registry before resolving, giving "remote-with-adapter" a
+# real binding path without baking any provider/service name into this module.
+_DEEP_MEMORY_ADAPTER_FACTORIES: dict[str, "BackendFactory"] = {}
+_deep_memory_adapter_lock = threading.RLock()
+
+
+def register_deep_memory_adapter(profile: str, factory: "BackendFactory") -> None:
+    """Register a DEEP_MEMORY adapter factory for ``profile`` process-wide.
+
+    The factory receives static capability options and returns any object
+    satisfying :class:`MemoryRecordBackend`. Stays cloud/database agnostic: no
+    provider/service name appears here. Re-registering a profile replaces it.
+    """
+
+    with _deep_memory_adapter_lock:
+        _DEEP_MEMORY_ADAPTER_FACTORIES[str(profile)] = factory
+
+
+def clear_deep_memory_adapters() -> None:
+    """Drop all process-registered DEEP_MEMORY adapter factories."""
+
+    with _deep_memory_adapter_lock:
+        _DEEP_MEMORY_ADAPTER_FACTORIES.clear()
+
+
+def apply_deep_memory_adapters(registry: "RuntimeBackendRegistry") -> None:
+    """Register every process-level DEEP_MEMORY adapter onto ``registry``.
+
+    Called before resolution so a non-local profile with a registered adapter
+    binds the scoped backend instead of failing closed. Profiles without an
+    adapter remain unregistered and still fail closed.
+    """
+
+    with _deep_memory_adapter_lock:
+        items = list(_DEEP_MEMORY_ADAPTER_FACTORIES.items())
+    for profile, factory in items:
+        registry.register(BackendCapability.DEEP_MEMORY, factory, profile=profile)
+
+
 def _coerce_capability(capability: BackendCapability | str) -> BackendCapability:
     if isinstance(capability, BackendCapability):
         return capability
@@ -1612,6 +1851,28 @@ class RuntimeBackendRegistry:
                 lambda options, _type=local_type: _type(),
                 profile=_DEFAULT_PROFILE,
             )
+        # Optional deep-memory capability. Registered only under the local
+        # single-user and local-multi profiles; AgentOps/remote profiles
+        # intentionally have NO local default so they fail closed unless a
+        # remote/durable adapter is explicitly registered.
+        self.register(
+            BackendCapability.DEEP_MEMORY,
+            lambda options: LocalDeepMemoryBackend(
+                base_dir=options.get("storage_dir"),
+                partition=bool(options.get("partition", False)),
+                embedding_device=options.get("embedding_device", "auto"),
+            ),
+            profile=_DEFAULT_PROFILE,
+        )
+        self.register(
+            BackendCapability.DEEP_MEMORY,
+            lambda options: LocalDeepMemoryBackend(
+                base_dir=options.get("storage_dir"),
+                partition=True,
+                embedding_device=options.get("embedding_device", "auto"),
+            ),
+            profile=_LOCAL_MULTI_PROFILE,
+        )
 
     def register(
         self,
@@ -1631,17 +1892,56 @@ class RuntimeBackendRegistry:
         context: RuntimeContext | None,
     ) -> str:
         cap = _coerce_capability(capability)
+        candidate: str | None = None
         overrides = self._backends_config.get("capabilities")
         if isinstance(overrides, Mapping):
             override = overrides.get(cap.value)
             if override:
-                return str(override)
-        if context is not None and context.backend_profile:
-            return context.backend_profile
-        default = self._backends_config.get("default_profile")
-        if default:
-            return str(default)
-        return _DEFAULT_PROFILE
+                candidate = str(override)
+        if candidate is None and context is not None and context.backend_profile:
+            candidate = context.backend_profile
+        if candidate is None:
+            default = self._backends_config.get("default_profile")
+            if default:
+                candidate = str(default)
+        if candidate is None:
+            candidate = _DEFAULT_PROFILE
+        return self._guard_deep_memory_failclosed(cap, context, candidate)
+
+    @staticmethod
+    def _guard_deep_memory_failclosed(
+        cap: BackendCapability,
+        context: RuntimeContext | None,
+        candidate: str,
+    ) -> str:
+        """Fail closed when a non-local DEEP_MEMORY context selects built-in local.
+
+        The built-in ``local`` DEEP_MEMORY backend is unpartitioned (one shared
+        scope), so a non-local (AgentOps/remote) context must never resolve to it
+        — whether by the implicit fallback OR an *explicit* ``local`` selection
+        (context ``backend_profile``, config ``default_profile``, or the
+        per-capability override). Raise ``BackendSelectionError`` unconditionally
+        rather than redirecting to the deployment ``mode``: a process-level adapter
+        can be registered under any profile string (including the mode), so a
+        redirect could silently substitute it for the unpartitioned local store.
+        ``local-multi`` (scoped multi-user partitioning) is preserved, as is a
+        remote/compose adapter selected by an explicit non-``local`` profile (even
+        one equal to the mode string); genuine local-mode contexts keep ``local``.
+        """
+        if (
+            cap is BackendCapability.DEEP_MEMORY
+            and candidate == _DEFAULT_PROFILE
+            and context is not None
+            and context.mode
+            and context.mode != "local"
+        ):
+            raise BackendSelectionError(
+                f"Deep memory fails closed for non-local mode {context.mode!r}: the "
+                f"built-in unpartitioned {_DEFAULT_PROFILE!r} deep-memory backend "
+                f"cannot serve a non-local context. Register a scoped adapter under "
+                f"an explicit deployment profile instead."
+            )
+        return candidate
 
     def _capability_options(self, capability: BackendCapability) -> Mapping[str, Any]:
         options = self._backends_config.get("options")

@@ -64,6 +64,21 @@ from utils import base_url_host_matches, env_var_enabled
 logger = logging.getLogger(__name__)
 
 
+def apply_current_turn_user_injections(api_msg: Dict[str, Any], injections: List[str]) -> None:
+    """Append current-turn context injections to the API-call copy in place.
+
+    ``api_msg`` MUST already be a shallow copy of the persisted message (callers
+    build it via ``msg.copy()``), so the persisted transcript / conversation
+    history message object is never mutated. Non-string content (multimodal
+    blocks) and empty injection lists are left untouched.
+    """
+    if not injections:
+        return
+    base = api_msg.get("content", "")
+    if isinstance(base, str):
+        api_msg["content"] = base + "\n\n" + "\n\n".join(injections)
+
+
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
     """Return a user-facing error when Ollama is loaded with too little context."""
     if not getattr(agent, "tools", None):
@@ -795,6 +810,19 @@ def run_conversation(
         except Exception:
             pass
 
+    # Scoped native deep-memory prefetch (M5A). Only active when agent init bound
+    # the scoped DEEP_MEMORY path (local-multi / remote); local single-user keeps
+    # the MemoryManager prefetch above. Injected ONLY into the API-call copy of
+    # the current user message below — never written back to the transcript.
+    _deep_memory_prefetch_cache = ""
+    try:
+        from tools.memory_record_tools import deep_memory_prefetch_for_agent
+
+        _dm_query = original_user_message if isinstance(original_user_message, str) else ""
+        _deep_memory_prefetch_cache = deep_memory_prefetch_for_agent(agent, _dm_query) or ""
+    except Exception:
+        logger.debug("scoped deep-memory prefetch failed (non-fatal)", exc_info=True)
+
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
     # all run inside Codex). Default Hermes path is bypassed entirely.
@@ -968,12 +996,13 @@ def run_conversation(
                     _fenced = build_memory_context_block(_ext_prefetch_cache)
                     if _fenced:
                         _injections.append(_fenced)
+                if _deep_memory_prefetch_cache:
+                    _dm_fenced = build_memory_context_block(_deep_memory_prefetch_cache)
+                    if _dm_fenced:
+                        _injections.append(_dm_fenced)
                 if _plugin_user_context:
                     _injections.append(_plugin_user_context)
-                if _injections:
-                    _base = api_msg.get("content", "")
-                    if isinstance(_base, str):
-                        api_msg["content"] = _base + "\n\n" + "\n\n".join(_injections)
+                apply_current_turn_user_injections(api_msg, _injections)
 
             # For ALL assistant messages, pass reasoning back to the API
             # This ensures multi-turn reasoning context is preserved

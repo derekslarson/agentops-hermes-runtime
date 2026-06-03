@@ -75,6 +75,152 @@ def _bind_agentops_skill_backend(agent: Any, config: Dict[str, Any]) -> None:
     set_active_skill_backend(skill_backend, context=skill_runtime_context)
 
 
+def _inject_deep_memory_tool_schemas(agent: Any) -> None:
+    """Inject native record tool schemas into the agent surface (dedup-safe)."""
+    from tools.memory_record_tools import MEMORY_RECORD_TOOL_NAMES
+    from agent.local_memory.provider import RECORD_TOOL_SCHEMAS
+
+    tools = getattr(agent, "tools", None)
+    if tools is None:
+        return
+    enabled_toolsets = getattr(agent, "enabled_toolsets", None)
+    if not (enabled_toolsets is None or "memory" in enabled_toolsets):
+        return
+    valid_names = getattr(agent, "valid_tool_names", None)
+    if valid_names is None:
+        valid_names = set()
+        agent.valid_tool_names = valid_names
+    existing = {t.get("function", {}).get("name") for t in tools if isinstance(t, dict)}
+    by_name = {schema["name"]: schema for schema in RECORD_TOOL_SCHEMAS}
+    for name in MEMORY_RECORD_TOOL_NAMES:
+        if name in existing:
+            continue
+        tools.append({"type": "function", "function": dict(by_name[name])})
+        valid_names.add(name)
+        existing.add(name)
+
+
+def _strip_deep_memory_record_tools(agent: Any) -> None:
+    """Remove any ``memory_record_*`` schemas/names from an agent's tool surface.
+
+    The native record tools are gated by a module-global active-registry check,
+    so in a long-lived process a prior successful scoped bind can leave them
+    discovered onto a later agent whose own profile must fail closed (or is
+    local single-user). Scrubbing here keeps fail-closed/local paths from
+    exposing stale native record tools regardless of discovery order.
+    """
+    from tools.memory_record_tools import MEMORY_RECORD_TOOL_NAMES
+
+    record_names = set(MEMORY_RECORD_TOOL_NAMES)
+    tools = getattr(agent, "tools", None)
+    if isinstance(tools, list):
+        agent.tools = [
+            tool
+            for tool in tools
+            if not (isinstance(tool, dict) and tool.get("function", {}).get("name") in record_names)
+        ]
+    valid_names = getattr(agent, "valid_tool_names", None)
+    if isinstance(valid_names, set):
+        valid_names.difference_update(record_names)
+
+
+def _restore_provider_record_tools(agent: Any) -> None:
+    """Re-inject MemoryManager provider-owned ``memory_record_*`` schemas.
+
+    The local single-user path keeps the MemoryManager ``LocalDeepMemoryProvider``
+    in charge of deep memory, so its record tool schemas are legitimate and must
+    survive the stale-tool scrub. Restore them (deduped, exactly once each) only
+    when a provider is active and the memory toolset is enabled. Never called on
+    the remote/no-adapter fail-closed path, where these tools must stay gone.
+    """
+    memory_manager = getattr(agent, "_memory_manager", None)
+    if memory_manager is None:
+        return
+    enabled_toolsets = getattr(agent, "enabled_toolsets", None)
+    if not (enabled_toolsets is None or "memory" in enabled_toolsets):
+        return
+    tools = getattr(agent, "tools", None)
+    if not isinstance(tools, list):
+        return
+
+    from tools.memory_record_tools import MEMORY_RECORD_TOOL_NAMES
+
+    record_names = set(MEMORY_RECORD_TOOL_NAMES)
+    try:
+        schemas = memory_manager.get_all_tool_schemas()
+    except Exception:
+        return
+    existing = {t.get("function", {}).get("name") for t in tools if isinstance(t, dict)}
+    valid_names = getattr(agent, "valid_tool_names", None)
+    for schema in schemas:
+        name = schema.get("name", "") if isinstance(schema, dict) else ""
+        if name not in record_names or name in existing:
+            continue
+        tools.append({"type": "function", "function": schema})
+        existing.add(name)
+        if isinstance(valid_names, set):
+            valid_names.add(name)
+
+
+def _bind_deep_memory_backend(agent: Any, config: Dict[str, Any]) -> None:
+    """Select the deep-memory path for this agent's RuntimeContext/profile (M5A).
+
+    * Local single-user (mode ``local`` with the default/``local`` profile): leave
+      the MemoryManager ``LocalDeepMemoryProvider`` path in charge — return
+      without binding the scoped native tools so the two surfaces never both
+      register the ``memory_record_*`` tool names.
+    * local-multi (and remote/compose profiles that registered a DEEP_MEMORY
+      adapter): bind the scoped backend registry + inject the native record tools.
+    * AgentOps/remote profiles WITHOUT a registered adapter: fail closed — no
+      binding, no native tools, and never a fallback to an unscoped local store.
+    """
+    from agent.local_memory.provider import _runtime_context_allows_local_store
+    from tools.memory_record_tools import (
+        clear_active_deep_memory_registry,
+        register_memory_record_tools,
+        set_active_deep_memory_registry,
+    )
+
+    ctx = getattr(agent, "runtime_context", None)
+    allowed_local, _reason = _runtime_context_allows_local_store(ctx)
+    if allowed_local:
+        # Local single-user keeps the MemoryManager provider path: scrub any stale
+        # native record tools, then restore the provider-owned record schemas so
+        # the LocalDeepMemoryProvider surface is preserved (not over-stripped).
+        clear_active_deep_memory_registry()
+        _strip_deep_memory_record_tools(agent)
+        _restore_provider_record_tools(agent)
+        return
+
+    from agent.runtime_backends import (
+        BackendCapability,
+        BackendSelectionError,
+        RuntimeBackendRegistry,
+        apply_deep_memory_adapters,
+    )
+
+    deep_registry = RuntimeBackendRegistry(config)
+    # Apply any deployment-registered remote/compose DEEP_MEMORY adapters before
+    # resolving, so remote-with-adapter profiles bind the scoped backend instead
+    # of failing closed. Profiles without a registered adapter stay fail-closed.
+    apply_deep_memory_adapters(deep_registry)
+    try:
+        deep_registry.get(BackendCapability.DEEP_MEMORY, ctx)
+    except BackendSelectionError as exc:
+        # No scoped adapter for this profile — fail closed, do not open a store.
+        logger.warning(
+            "Deep memory unavailable for this profile; failing closed (no native record tools): %s",
+            exc,
+        )
+        clear_active_deep_memory_registry()
+        _strip_deep_memory_record_tools(agent)
+        return
+
+    register_memory_record_tools()
+    set_active_deep_memory_registry(deep_registry, context=ctx)
+    _inject_deep_memory_tool_schemas(agent)
+
+
 class _UnavailableCronBackend:
     """Fail-closed sentinel for misconfigured AgentOps cron routing."""
 
@@ -1291,6 +1437,16 @@ def init_agent(
                 from plugins.memory import load_memory_provider as _load_mem
                 agent._memory_manager = _MemoryManager()
                 _mp = _load_mem(_mem_provider_name)
+                if _mp is not None:
+                    # Supply the agent's runtime context BEFORE the availability
+                    # check: the ContextVar is only bound later (at turn start),
+                    # so providers that fail closed for AgentOps/remote contexts
+                    # (e.g. the local deep-memory provider, which must not open an
+                    # unscoped local store) need it now.
+                    try:
+                        _mp.set_runtime_context(getattr(agent, "runtime_context", None))
+                    except Exception:
+                        logger.debug("memory provider set_runtime_context failed", exc_info=True)
                 if _mp and _mp.is_available():
                     agent._memory_manager.add_provider(_mp)
                 if agent._memory_manager.providers:
@@ -1376,6 +1532,18 @@ def init_agent(
             if _tname:
                 agent.valid_tool_names.add(_tname)
                 _existing_tool_names.add(_tname)
+
+    # Deep memory (M5A) native record-tool path. Runs AFTER the MemoryManager
+    # provider injection so local single-user (which keeps the provider surface)
+    # is detected and the scoped native tools are never double-registered. For
+    # local-multi / remote-with-adapter profiles this binds the scoped backend
+    # and injects memory_record_* into the tool surface; AgentOps/remote profiles
+    # without an adapter fail closed (no tools, no unscoped store).
+    if not skip_memory:
+        try:
+            _bind_deep_memory_backend(agent, _agent_cfg)
+        except Exception as _deep_mem_err:
+            logger.warning("Failed to initialize scoped deep-memory backend: %s", _deep_mem_err)
 
     # Skills config: nudge interval for skill creation reminders
     agent._skill_nudge_interval = 10

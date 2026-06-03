@@ -148,6 +148,16 @@ class MemoryProvider(ABC):
         """
         raise NotImplementedError(f"Provider {self.name} does not handle tool {tool_name}")
 
+    def set_runtime_context(self, context: Any) -> None:
+        """Supply the agent's RuntimeContext before availability/initialization.
+
+        Called by agent init while loading the configured memory provider, before
+        ``is_available()`` and ``initialize()``. The ContextVar is not yet bound
+        at that point (it binds later, at turn start), so providers whose scoping
+        or fail-closed policy depends on the runtime context must consult what is
+        supplied here. Default is no-op for providers that don't need it.
+        """
+
     def shutdown(self) -> None:
         """Clean shutdown — flush queues, close connections."""
 

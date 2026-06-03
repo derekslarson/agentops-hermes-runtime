@@ -1458,6 +1458,48 @@ DEFAULT_CONFIG = {
         "provider": "",
     },
 
+    # Deep memory — historical completed-turn recall, kept DISTINCT from the
+    # curated ``memory`` surface above (native memory tool / MEMORY.md + USER.md)
+    # and from session search. Deep memory stores successful user-facing turns
+    # as flat verbatim records, injects bounded historical hints automatically,
+    # and exposes native ``memory_record_*`` tools for verbatim fetch by ID.
+    #
+    # On local-compatible profiles this defaults on and uses the local flat
+    # provider (ChromaDB + ONNX all-MiniLM-L6-v2) at ``$HERMES_HOME/deep-memory``.
+    # AgentOps/remote profiles select a scoped backend via RuntimeContext (the
+    # ``DEEP_MEMORY`` runtime capability) and FAIL CLOSED rather than silently
+    # falling back to an unscoped local store. See docs/agentops-runtime.
+    "deep_memory": {
+        "enabled": True,
+        "storage_dir": "$HERMES_HOME/deep-memory",
+        "prefetch_enabled": True,
+        "prefetch_limit": 5,
+        "prefetch_max_chars": 1800,
+        "sync_turns": True,
+        # Only capture normal user-facing gateway conversations by default. Cron,
+        # subagent/review forks, CLI automation, and other internal sessions stay
+        # out of deep-memory auto-recall unless policy opts them in.
+        "sync_platforms": ["telegram"],
+        # RuntimeContext.run_type allowlist for completed-turn ingestion. Only
+        # user-facing conversation/event turns are ingested by default; cron,
+        # delegation (subagent), manual, and other internal traces are excluded
+        # unless explicitly listed here.
+        "ingest_run_types": ["conversation", "event"],
+        "sync_source": "conversation_turn",
+        "embedding_provider": "onnx-minilm",
+        "embedding_model": "all-MiniLM-L6-v2",
+        "embedding_device": "auto",
+        "redact_secrets": True,
+        # Local out-of-request-path summary generation (Ollama/Gemma). Best-effort:
+        # a missing model or failure never blocks the verbatim record insert.
+        "summarize_records": True,
+        "summary_model": "gemma4:e4b-mlx",
+        "summary_backend": "ollama",
+        "summary_timeout_seconds": 60,
+        "summary_max_chars": 700,
+        "summary_min_chars": 300,
+    },
+
     # Subagent delegation — override the provider:model used by delegate_task
     # so child agents can run on a different (cheaper/faster) provider and model.
     # Uses the same runtime provider resolution as CLI/gateway startup, so all

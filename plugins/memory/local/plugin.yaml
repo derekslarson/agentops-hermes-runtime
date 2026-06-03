@@ -1,0 +1,10 @@
+name: local
+version: 1.0.0
+description: "Local flat deep memory — MemPalace-style ChromaDB + ONNX all-MiniLM-L6-v2 semantic retrieval with hybrid BM25 reranking, automatic prefetch/injection, and lazy verbatim record fetch. No palace ontology."
+pip_dependencies:
+  - chromadb==1.5.9
+  - onnxruntime==1.26.0
+hooks:
+  - prefetch
+  - sync_turn
+  - on_session_switch

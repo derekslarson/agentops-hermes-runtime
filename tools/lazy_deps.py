@@ -119,6 +119,11 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # ─── Memory providers ──────────────────────────────────────────────────
     "memory.honcho": ("honcho-ai==2.0.1",),
     "memory.hindsight": ("hindsight-client==0.6.1",),
+    # Local flat deep-memory backend (MemPalace-compatible ChromaDB + ONNX
+    # all-MiniLM-L6-v2 semantic retrieval). Lazily installable so packaged
+    # installs without these wheels degrade to a clean no-op rather than
+    # crashing agent init.
+    "memory.local": ("chromadb==1.5.9", "onnxruntime==1.26.0"),
 
     # ─── Messaging platforms (lazy-installable on demand) ──────────────────
     "platform.telegram": ("python-telegram-bot[webhooks]==22.6",),
