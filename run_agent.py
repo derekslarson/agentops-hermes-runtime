@@ -291,6 +291,81 @@ class _StreamErrorEvent(Exception):
         }
 
 
+def _ingest_scoped_deep_memory_turn(
+    *,
+    scoped_registry: Any,
+    runtime_context: Any,
+    deep_memory_config: Any,
+    platform: Any,
+    original_user_message: Any,
+    final_response: Any,
+) -> None:
+    """Best-effort ingest of a completed turn into the active scoped DEEP_MEMORY backend.
+
+    No-op when no scoped registry is bound, content is empty, or the run type is
+    not user-facing (conversation/event by default). Never falls back to local
+    Chroma/files when absent. Exceptions are swallowed so the caller's response
+    is never blocked.
+    """
+    from agent.local_memory.provider import _redact, run_type_allows_ingest
+    from agent.local_memory.store import stable_record_id
+    from agent.runtime_backends import BackendCapability
+
+    if scoped_registry is None:
+        return
+    run_type = getattr(runtime_context, "run_type", "conversation") or "conversation"
+    if isinstance(deep_memory_config, dict) and deep_memory_config.get("enabled") is False:
+        return
+    if isinstance(deep_memory_config, dict) and deep_memory_config.get("sync_turns") is False:
+        return
+    if isinstance(deep_memory_config, dict):
+        allowed_platforms = {str(p).strip().lower() for p in (deep_memory_config.get("sync_platforms") or []) if str(p).strip()}
+        if allowed_platforms and "*" not in allowed_platforms and "all" not in allowed_platforms:
+            current_platform = str(platform or "").strip().lower()
+            if current_platform not in allowed_platforms:
+                return
+    if not run_type_allows_ingest(run_type, deep_memory_config if isinstance(deep_memory_config, dict) else None):
+        return
+    try:
+        user_text = _redact(str(original_user_message or ""), True)
+        asst_text = _redact(str(final_response or ""), True)
+    except Exception:
+        logger.debug("scoped deep memory turn ingest redaction failed", exc_info=True)
+        return
+    if not user_text.strip() or not asst_text.strip():
+        return
+    try:
+        backend = scoped_registry.get(BackendCapability.DEEP_MEMORY, runtime_context)
+        text = f"User:\n{user_text}\n\nAssistant:\n{asst_text}"
+        source_uri = _scoped_deep_memory_source_uri(runtime_context, text)
+        backend.upsert_record(
+            runtime_context,
+            text=text,
+            metadata={"type": "conversation_turn", "record_kind": "conversation_turn"},
+            source="conversation_turn",
+            source_uri=source_uri,
+            timestamp=time.time(),
+            record_kind="conversation_turn",
+            provenance={"captured_by": "AIAgent._sync_external_memory_for_turn"},
+            record_id=stable_record_id(source_uri, "conversation_turn", "", text),
+        )
+    except Exception:
+        logger.debug("scoped deep memory turn ingest failed", exc_info=True)
+
+
+def _scoped_deep_memory_source_uri(runtime_context: Any, text: str) -> str:
+    """Build a deterministic, secret-safe source URI for scoped turn ingest."""
+    parts = []
+    for attr in ("org_id", "workspace_id", "project_id", "user_id", "conversation_id"):
+        value = getattr(runtime_context, attr, None) if runtime_context is not None else None
+        if value not in (None, ""):
+            parts.append(f"{attr.removesuffix('_id')}={hashlib.sha256(str(value).encode('utf-8')).hexdigest()[:16]}")
+    if not parts:
+        parts.append("scope=unknown")
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    return f"hermes://runtime-turn/{';'.join(parts)}/turn/{digest}"
+
+
 class AIAgent:
     """
     AI Agent with tool calling capabilities.
@@ -2448,6 +2523,7 @@ class AIAgent:
         original_user_message: Any,
         final_response: Any,
         interrupted: bool,
+        failed: bool = False,
         messages: list | None = None,
     ) -> None:
         """Mirror a completed turn into external memory providers.
@@ -2462,7 +2538,7 @@ class AIAgent:
         because the latter may carry injected skill content that bloats
         or breaks provider queries.
 
-        Interrupted turns are skipped entirely (#15218).  A partial
+        Interrupted or failed turns are skipped entirely (#15218).  A partial
         assistant output, an aborted tool chain, or a mid-stream reset
         is not durable conversational truth — mirroring it into an
         external memory backend pollutes future recall with state the
@@ -2476,9 +2552,18 @@ class AIAgent:
         providers are strictly best-effort — a misconfigured or offline
         backend must not block the user from seeing their response.
         """
-        if interrupted:
+        if interrupted or failed:
             return
+        scoped_registry = getattr(self, "_scoped_deep_memory_registry", None)
         if not (self._memory_manager and final_response and original_user_message):
+            _ingest_scoped_deep_memory_turn(
+                scoped_registry=scoped_registry,
+                runtime_context=getattr(self, "runtime_context", None),
+                deep_memory_config=getattr(self, "_deep_memory_config", None),
+                platform=getattr(self, "platform", None),
+                original_user_message=original_user_message,
+                final_response=final_response,
+            )
             return
         try:
             sync_kwargs = {"session_id": self.session_id or ""}
@@ -2495,6 +2580,14 @@ class AIAgent:
             )
         except Exception:
             pass
+        _ingest_scoped_deep_memory_turn(
+            scoped_registry=scoped_registry,
+            runtime_context=getattr(self, "runtime_context", None),
+            deep_memory_config=getattr(self, "_deep_memory_config", None),
+            platform=getattr(self, "platform", None),
+            original_user_message=original_user_message,
+            final_response=final_response,
+        )
 
     def release_clients(self) -> None:
         """Release LLM client resources WITHOUT tearing down session tool state.

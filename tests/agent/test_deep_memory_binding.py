@@ -15,10 +15,11 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import tools.memory_record_tools as mrt
 from agent.agent_init import _bind_deep_memory_backend
-from agent.runtime_backends import BackendCapability
+from agent.runtime_backends import BackendCapability, RuntimeBackendRegistry
 from agent.runtime_context import RuntimeContext, use_runtime_context
 from tools.registry import registry
 
@@ -41,6 +42,20 @@ def _agent(ctx):
         valid_tool_names=set(),
         enabled_toolsets=None,
     )
+
+
+def _tool_defs(*names: str) -> list[dict]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": f"{name} tool",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+        for name in names
+    ]
 
 
 def _ctx(**overrides):
@@ -68,6 +83,58 @@ def test_record_tool_dispatch_fails_closed_without_active_binding():
     assert "error" in out
     out = json.loads(registry.dispatch("memory_record_get", {"id": "mem_x"}))
     assert "error" in out
+
+
+def test_skip_memory_scrubs_stale_native_record_tools_and_registry(tmp_path):
+    from run_agent import AIAgent
+
+    mrt.set_active_deep_memory_registry(RuntimeBackendRegistry(_config(tmp_path)))
+    with (
+        patch("run_agent.get_tool_definitions", return_value=_tool_defs(*MEMORY_RECORD_TOOL_NAMES)),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-k...7890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            enabled_toolsets=["memory"],
+        )
+
+    assert mrt.get_active_deep_memory_registry() is None
+    assert getattr(agent, "_scoped_deep_memory_registry", "sentinel") is None
+    valid_tool_names = getattr(agent, "valid_tool_names")
+    for name in MEMORY_RECORD_TOOL_NAMES:
+        assert name not in valid_tool_names
+
+
+def test_deep_memory_enabled_false_disables_scoped_native_binding(tmp_path):
+    from run_agent import AIAgent
+
+    ctx = _ctx(backend_profile="local-multi")
+    cfg = {"deep_memory": {"enabled": False}, "backends": _config(tmp_path)["backends"]}
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("run_agent.get_tool_definitions", return_value=_tool_defs(*MEMORY_RECORD_TOOL_NAMES)),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-k...7890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            runtime_context=ctx,
+            enabled_toolsets=["memory"],
+        )
+
+    assert mrt.get_active_deep_memory_registry() is None
+    assert getattr(agent, "_scoped_deep_memory_registry", "sentinel") is None
+    valid_tool_names = getattr(agent, "valid_tool_names")
+    for name in MEMORY_RECORD_TOOL_NAMES:
+        assert name not in valid_tool_names
 
 
 def test_local_single_user_keeps_provider_path_no_native_tools(tmp_path):

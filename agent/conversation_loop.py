@@ -4707,6 +4707,7 @@ def run_conversation(
         original_user_message=original_user_message,
         final_response=final_response,
         interrupted=interrupted,
+        failed=failed,
         messages=messages,
     )
 

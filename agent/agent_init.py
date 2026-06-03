@@ -182,6 +182,7 @@ def _bind_deep_memory_backend(agent: Any, config: Dict[str, Any]) -> None:
     )
 
     ctx = getattr(agent, "runtime_context", None)
+    setattr(agent, "_scoped_deep_memory_registry", None)
     allowed_local, _reason = _runtime_context_allows_local_store(ctx)
     if allowed_local:
         # Local single-user keeps the MemoryManager provider path: scrub any stale
@@ -221,6 +222,7 @@ def _bind_deep_memory_backend(agent: Any, config: Dict[str, Any]) -> None:
 
     register_memory_record_tools()
     set_active_deep_memory_registry(deep_registry, context=ctx)
+    setattr(agent, "_scoped_deep_memory_registry", deep_registry)
     _inject_deep_memory_tool_schemas(agent)
 
 
@@ -244,8 +246,15 @@ def _register_configured_compose_deep_memory_adapter(deep_registry: Any, ctx: An
         profile = deep_registry.resolve_profile(BackendCapability.DEEP_MEMORY, ctx)
     except BackendSelectionError:
         return
-    if profile == _COMPOSE_DEEP_MEMORY_PROFILE:
-        register_http_memory_record_backend(deep_registry, profile=profile)
+    if profile != _COMPOSE_DEEP_MEMORY_PROFILE:
+        return
+    cap_factories = getattr(deep_registry, "_factories", {}).get(BackendCapability.DEEP_MEMORY, {})
+    if profile in cap_factories:
+        # A deployment/test registered an explicit profile adapter already. Do
+        # not overwrite it with the configured HTTP adapter, especially when
+        # the HTTP options are intentionally absent in that scenario.
+        return
+    register_http_memory_record_backend(deep_registry, profile=profile)
 
 
 class _UnavailableCronBackend:
@@ -580,6 +589,13 @@ def init_agent(
         _bind_agentops_credential_broker(agent, _runtime_cfg or {})
     except Exception as _credential_init_err:
         logger.warning("Failed to initialize AgentOps credential broker: %s", _credential_init_err)
+
+    try:
+        from agent.local_memory.provider import load_deep_memory_config as _load_deep_memory_config
+
+        agent._deep_memory_config = _load_deep_memory_config(_runtime_cfg or {})
+    except Exception:
+        agent._deep_memory_config = {}
 
     # Pluggable print function — CLI replaces this with _cprint so that
     # raw ANSI status lines are routed through prompt_toolkit's renderer
@@ -1567,10 +1583,29 @@ def init_agent(
     # and injects memory_record_* into the tool surface; AgentOps/remote profiles
     # without an adapter fail closed (no tools, no unscoped store).
     if not skip_memory:
+        if isinstance(getattr(agent, "_deep_memory_config", None), dict) and agent._deep_memory_config.get("enabled") is False:
+            try:
+                from tools.memory_record_tools import clear_active_deep_memory_registry
+
+                setattr(agent, "_scoped_deep_memory_registry", None)
+                clear_active_deep_memory_registry()
+                _strip_deep_memory_record_tools(agent)
+            except Exception:
+                pass
+        else:
+            try:
+                _bind_deep_memory_backend(agent, _agent_cfg)
+            except Exception as _deep_mem_err:
+                logger.warning("Failed to initialize scoped deep-memory backend: %s", _deep_mem_err)
+    else:
         try:
-            _bind_deep_memory_backend(agent, _agent_cfg)
-        except Exception as _deep_mem_err:
-            logger.warning("Failed to initialize scoped deep-memory backend: %s", _deep_mem_err)
+            from tools.memory_record_tools import clear_active_deep_memory_registry
+
+            setattr(agent, "_scoped_deep_memory_registry", None)
+            clear_active_deep_memory_registry()
+            _strip_deep_memory_record_tools(agent)
+        except Exception:
+            pass
 
     # Skills config: nudge interval for skill creation reminders
     agent._skill_nudge_interval = 10
