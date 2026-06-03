@@ -364,3 +364,104 @@ def test_in_memory_sqlite_path_fails_closed():
 
     with pytest.raises(ValueError):
         RelationalMemoryRecordBackend(":memory:")
+
+
+# ---------------------------------------------------------------------------
+# BM25 keyword ranking (M5B fifth slice)
+# ---------------------------------------------------------------------------
+
+
+def test_bm25_length_normalization_short_outranks_long(backend):
+    """Short doc with one query hit must rank above a longer doc with one hit.
+
+    BM25 length normalisation (b=0.75) penalises the longer document.
+    The long doc is inserted first so insertion order cannot explain a win.
+    Under token-presence scoring both get equal score 1/1 = 1.0, so this
+    verifies that BM25 replaces the old scorer.
+    """
+    long_text = "rocket " + ("padding " * 60)
+    short_text = "rocket launch"
+    backend.upsert_record(_CTX_A, text=long_text, record_id="mem_bm25_long")
+    backend.upsert_record(_CTX_A, text=short_text, record_id="mem_bm25_short")
+
+    results = backend.search(_CTX_A, "rocket")
+    assert len(results) >= 2
+    ids = [r.id for r in results]
+    assert ids.index("mem_bm25_short") < ids.index("mem_bm25_long"), (
+        f"short doc should rank above long doc but got order {ids}"
+    )
+
+
+def test_bm25_term_frequency_high_tf_outranks_low_tf(backend):
+    """A doc with the query term repeated must rank above a single-occurrence doc.
+
+    Both docs have the same token count to isolate the TF effect.
+    Under token-presence scoring both match the query once, giving equal score 1/1.
+    The low-TF doc is given a record_id that sorts BEFORE high-TF alphabetically
+    so that neither insertion order nor B-tree order can explain a high-TF win.
+    """
+    low_tf_text = "python java ruby go"
+    high_tf_text = "python python python go"
+    # aaa < zzz: SQLite B-tree returns low_tf first for tied token-presence scores
+    backend.upsert_record(_CTX_A, text=low_tf_text, record_id="mem_bm25_tf_aaa")
+    backend.upsert_record(_CTX_A, text=high_tf_text, record_id="mem_bm25_tf_zzz")
+
+    results = backend.search(_CTX_A, "python")
+    assert len(results) >= 2
+    ids = [r.id for r in results]
+    assert ids.index("mem_bm25_tf_zzz") < ids.index("mem_bm25_tf_aaa"), (
+        f"high-TF doc should rank above low-TF doc but got {ids}"
+    )
+
+
+def test_bm25_matched_via_and_score_fields(backend):
+    """Top search result must report matched_via='bm25' and bm25_score > 0."""
+    backend.upsert_record(_CTX_A, text="neural network training", record_id="mem_bm25_fields")
+    results = backend.search(_CTX_A, "neural network")
+    assert len(results) >= 1
+    r = results[0]
+    assert r.matched_via == "bm25", f"expected 'bm25', got {r.matched_via!r}"
+    assert r.bm25_score > 0, f"expected bm25_score > 0, got {r.bm25_score}"
+
+
+def test_bm25_scope_isolation_high_score_other_context_excluded(backend):
+    """A very high-scoring record from a different RuntimeContext must not appear
+    in results for another scope, and results must carry matched_via='bm25'.
+    """
+    backend.upsert_record(
+        _CTX_B,
+        text="satellite satellite satellite satellite orbit tracking",
+        record_id="mem_bm25_scope_b",
+    )
+    backend.upsert_record(_CTX_A, text="satellite orbit", record_id="mem_bm25_scope_a")
+
+    results = backend.search(_CTX_A, "satellite")
+    ids = [r.id for r in results]
+    assert "mem_bm25_scope_b" not in ids
+    assert "mem_bm25_scope_a" in ids
+    assert results[0].matched_via == "bm25", f"expected 'bm25', got {results[0].matched_via!r}"
+
+
+def test_bm25_score_values_reflect_length_normalization(backend):
+    """The bm25_score field must reflect Okapi BM25 values, not token-presence.
+
+    A short doc containing the query term once must have a strictly higher
+    bm25_score than a long doc containing it once.  Under token-presence both
+    receive bm25_score = 1.0 (hits/n_tokens), so this test is RED until BM25 is
+    applied.  The long doc gets a lower record_id so B-tree order cannot explain
+    the correct answer via a tied secondary sort.
+    """
+    long_text = "cluster " + ("padding " * 80)
+    short_text = "cluster nodes"
+    # aaa < zzz: B-tree returns long doc first for tied token-presence scores
+    backend.upsert_record(_CTX_A, text=long_text, record_id="mem_bm25_score_aaa")
+    backend.upsert_record(_CTX_A, text=short_text, record_id="mem_bm25_score_zzz")
+
+    results = backend.search(_CTX_A, "cluster")
+    by_id = {r.id: r for r in results}
+    assert "mem_bm25_score_aaa" in by_id
+    assert "mem_bm25_score_zzz" in by_id
+    assert by_id["mem_bm25_score_zzz"].bm25_score > by_id["mem_bm25_score_aaa"].bm25_score, (
+        f"short doc bm25_score {by_id['mem_bm25_score_zzz'].bm25_score} should exceed "
+        f"long doc bm25_score {by_id['mem_bm25_score_aaa'].bm25_score}"
+    )

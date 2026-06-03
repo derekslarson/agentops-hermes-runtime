@@ -9,8 +9,8 @@ Scope isolation: every read/write predicate includes all seven scope columns
 user_id) derived from RuntimeContext. A record ingested under scope A is never
 visible or fetchable under scope B even when B knows the record_id.
 
-Search is keyword-based (token presence) for this slice. Vector/BM25 union
-search and extracted-signal boosts remain TODO for the Postgres/pgvector slice.
+Search is BM25 keyword-based for this slice. Vector union search and
+extracted-signal boosts remain TODO for the Postgres/pgvector slice.
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ import time
 from typing import Any, Iterable, Mapping
 from urllib.parse import urlparse
 
-from agent.local_memory.store import MemoryRecord, SearchResult
+from agent.local_memory.store import MemoryRecord, SearchResult, _bm25_scores
 from agent.runtime_context import RuntimeContext
 
 _SCOPE_FIELDS = (
@@ -263,21 +263,29 @@ class RelationalMemoryRecordBackend:
             scope,
         ).fetchall()
 
-        scored: list[tuple[float, sqlite3.Row]] = []
+        candidates: list[tuple[sqlite3.Row, dict]] = []
         for row in rows:
             metadata = json.loads(row["metadata_json"] or "{}")
             if filters and any(metadata.get(k) != v for k, v in filters.items()):
                 continue
-            text_lower = row["text"].lower()
-            hits = sum(1 for t in tokens if t in text_lower)
-            if hits:
-                scored.append((hits / len(tokens), row))
+            candidates.append((row, metadata))
 
-        scored.sort(key=lambda x: -x[0])
+        if not candidates:
+            return []
+
+        texts = [row["text"] for row, _ in candidates]
+        bm25_raw = _bm25_scores(query, texts)
+
+        scored: list[tuple[float, str, sqlite3.Row, dict]] = []
+        for (row, metadata), score in zip(candidates, bm25_raw):
+            if score > 0:
+                scored.append((score, row["record_id"], row, metadata))
+
+        scored.sort(key=lambda x: (-x[0], x[1]))
+
         results = []
-        for rank, (score, row) in enumerate(scored[:safe_limit]):
+        for rank, (score, _, row, metadata) in enumerate(scored[:safe_limit]):
             excerpt = _make_excerpt(row["text"])
-            metadata = json.loads(row["metadata_json"] or "{}")
             results.append(
                 SearchResult(
                     id=row["record_id"],
@@ -291,7 +299,7 @@ class RelationalMemoryRecordBackend:
                     timestamp=row["ts"],
                     record_kind=row["record_kind"],
                     bm25_score=score,
-                    matched_via="keyword",
+                    matched_via="bm25",
                 )
             )
         return results

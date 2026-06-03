@@ -620,6 +620,20 @@ Caveats:
 
 **Goal:** Make deep-memory record recall feature-parity for compose/cloud profiles, not just local/local-multi. The cloud runtime must ingest completed turns, prefetch scoped hints, and serve `memory_record_search` / `memory_record_get` / `memory_record_get_many` through a durable remote backend with the same user-visible semantics as Derek's local Hermes.
 
+**In-progress note (2026-06-03, TDD — fifth slice):** BM25 keyword-ranking parity for `RelationalMemoryRecordBackend`. This does NOT complete M5B.
+
+Delivered:
+- `agentops_runtime/memory_record_store.py` — `search()` now scores candidates using Okapi BM25 (`_bm25_scores` from `agent.local_memory.store`) instead of the previous token-presence fraction. Scope predicate and metadata filtering still apply before scoring. Results are sorted primary by descending BM25 score, secondary by ascending `record_id` for deterministic stable tie-breaking. `matched_via` is now `"bm25"` and `bm25_score` reflects the actual BM25 value. All existing constraints preserved: `candidate_strategy` accepted values unchanged (`"union"`, `"keyword"`; `"bm25"`, `"vector"`, others still raise `ValueError`), limit clamping, bounded 512-char excerpts, no DB schema changes, Postgres fail-closed scaffold unchanged.
+
+Test evidence (RED→GREEN, all 5 new tests confirmed FAIL before production change):
+1. `test_bm25_length_normalization_short_outranks_long` — short doc (1 term, 2 tokens) outranks long doc (1 term, 61 tokens); both tied at 1.0 under token-presence.
+2. `test_bm25_term_frequency_high_tf_outranks_low_tf` — 3-occurrence doc outranks 1-occurrence doc of same length; both tied at 1.0 under token-presence (low-TF doc given alphabetically-earlier record_id to defeat B-tree coincidence).
+3. `test_bm25_matched_via_and_score_fields` — `matched_via == "bm25"` and `bm25_score > 0`; was `"keyword"` before.
+4. `test_bm25_scope_isolation_high_score_other_context_excluded` — high-TF scope-B record never appears in scope-A results; `matched_via == "bm25"` confirmed.
+5. `test_bm25_score_values_reflect_length_normalization` — `bm25_score` for short doc strictly exceeds that for long doc; both were `1.0` under token-presence.
+
+`python -m pytest tests/agentops_runtime/test_memory_record_store.py -q` → 39 passed. Regressions `tests/agentops_runtime/test_memory_records_api.py tests/agent/test_remote_memory_record_backend.py tests/tools/test_memory_record_tools.py` → 97 passed. `ruff check` and `git diff --check` clean.
+
 **In-progress note (2026-06-03, TDD — fourth slice):** Durable scope-isolated relational store seam has landed. This does NOT complete M5B.
 
 Delivered:
