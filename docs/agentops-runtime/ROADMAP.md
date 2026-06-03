@@ -620,6 +620,24 @@ Caveats:
 
 **Goal:** Make deep-memory record recall feature-parity for compose/cloud profiles, not just local/local-multi. The cloud runtime must ingest completed turns, prefetch scoped hints, and serve `memory_record_search` / `memory_record_get` / `memory_record_get_many` through a durable remote backend with the same user-visible semantics as Derek's local Hermes.
 
+**In-progress note (2026-06-03, TDD — sixth slice):** Postgres SQL contract scaffold for `RelationalMemoryRecordBackend`. This does NOT complete M5B.
+
+Delivered:
+- `agentops_runtime/memory_record_store.py` — three dependency-free helper functions (`_postgres_schema_sql()`, `_postgres_upsert_sql()`, `_postgres_search_sql()`) that expose the intended Postgres/pgvector SQL contract for the later live adapter. No Postgres package imported; no live DB connection created. Schema SQL includes: `CREATE EXTENSION IF NOT EXISTS vector`, `memory_records` table with the same seven scope columns plus `record_id` as composite primary key, `JSONB` metadata/provenance, `text_hash`/`source`/`source_uri`/`ts`/`record_kind`/`parent_id` fields, `embedding vector(384)` (dimension via `EMBEDDING_DIM = 384`), generated/STORED `tsvector` column for full-text search, and indexes for vector (HNSW cosine), FTS (GIN), JSONB metadata/provenance (GIN), and scope columns. Upsert SQL is idempotent (`ON CONFLICT (...) DO UPDATE SET`) using `%s` placeholders (psycopg2 style), conflict target includes all seven scope columns plus `record_id`, and `created_at` is excluded from the `DO UPDATE SET` clause to preserve the original creation time. Search SQL uses a CTE to apply scope filter first, then JSONB containment (`@>`) for metadata filtering, then a combined score from vector cosine distance (`embedding <=> %s::vector`) and FTS rank (`ts_rank(ts_vec, plainto_tsquery(...))`), with an FTS predicate (`@@`) and positive-score filter to avoid returning every scoped row, ordered by score DESC then `record_id` ASC with a `LIMIT %s` parameter. Postgres URL initialization path still fails closed with a safe message and no DSN credential leak; SQLite behavior unchanged.
+
+Test evidence (RED→GREEN: initial SQL-contract tests were confirmed failing before production; independent quality review then tightened broad substring assertions into exact SQL-clause checks before commit):
+- 11 schema SQL tests: pgvector extension, vector(384) column, JSONB metadata/provenance, all seven scope columns, record_id, composite PK/unique, tsvector, vector index, GIN FTS/JSONB index, scope index, text_hash/source_uri/record_kind/parent_id fields.
+- 5 upsert SQL tests: ON CONFLICT DO UPDATE present, all 7 scope cols + record_id in conflict target, `%s` placeholders (no `{` interpolation), `created_at` excluded from DO UPDATE SET, sentinel value not in SQL string.
+- 7 search SQL tests: scope filter in WHERE before ranking, JSONB metadata containment (`@>`), vector rank (`<=>` cosine distance), FTS rank (`ts_rank`/`plainto_tsquery`), FTS predicate/positive-score candidate filtering, ORDER BY score DESC then record_id ASC, LIMIT `%s` placeholder.
+
+`python -m pytest tests/agentops_runtime/test_memory_record_store.py -q` → 62 passed. Regressions `tests/agentops_runtime/test_compose_services.py tests/agent/test_remote_memory_record_backend.py tests/tools/test_memory_record_tools.py` → 63 passed. `ruff check` and `git diff --check` clean.
+
+**Remaining before Done (runtime Postgres/pgvector adapter, compose registration, managed-cloud parity, and final docs are all still incomplete):**
+1. Live Postgres + psycopg2 adapter wiring `_postgres_schema_sql`/`_postgres_upsert_sql`/`_postgres_search_sql` into `RelationalMemoryRecordBackend` when a `postgresql://` URL is configured.
+2. Compose service registration of the Postgres-backed `RelationalMemoryRecordBackend`.
+3. Managed-cloud profile registration (AWS/GCP backends register their own `DEEP_MEMORY` adapter).
+4. `docs/agentops-runtime/memory-surfaces.md` updated to document both local and remote deep-memory flows, the exact first cloud backend, and the no-local-fallback rule.
+
 **In-progress note (2026-06-03, TDD — fifth slice):** BM25 keyword-ranking parity for `RelationalMemoryRecordBackend`. This does NOT complete M5B.
 
 Delivered:

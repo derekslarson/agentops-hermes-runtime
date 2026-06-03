@@ -5,6 +5,8 @@ All tests written before implementation — run RED first, then GREEN.
 """
 from __future__ import annotations
 
+import re
+
 import pytest
 from agent.runtime_context import RuntimeContext
 
@@ -465,3 +467,219 @@ def test_bm25_score_values_reflect_length_normalization(backend):
         f"short doc bm25_score {by_id['mem_bm25_score_zzz'].bm25_score} should exceed "
         f"long doc bm25_score {by_id['mem_bm25_score_aaa'].bm25_score}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Postgres SQL contract scaffold (M5B sixth slice)
+# ---------------------------------------------------------------------------
+# These tests verify the static SQL contract returned by the three helpers
+# _postgres_schema_sql(), _postgres_upsert_sql(), _postgres_search_sql().
+# No Postgres connection is required — all assertions are pure string checks.
+# ---------------------------------------------------------------------------
+
+
+def _schema_sql() -> str:
+    from agentops_runtime.memory_record_store import _postgres_schema_sql
+
+    return _postgres_schema_sql()
+
+
+def _upsert_sql() -> str:
+    from agentops_runtime.memory_record_store import _postgres_upsert_sql
+
+    return _postgres_upsert_sql()
+
+
+def _search_sql() -> str:
+    from agentops_runtime.memory_record_store import _postgres_search_sql
+
+    return _postgres_search_sql()
+
+
+def _scope_cols() -> tuple[str, ...]:
+    return (
+        "scope_mode",
+        "scope_org_id",
+        "scope_workspace_id",
+        "scope_project_id",
+        "scope_agent_profile_id",
+        "scope_conversation_id",
+        "scope_user_id",
+    )
+
+
+def _single_spaced(sql: str) -> str:
+    return " ".join(sql.lower().split())
+
+
+# --- schema SQL ---
+
+
+def test_postgres_schema_sql_creates_vector_extension():
+    sql = _schema_sql().lower()
+    assert "create extension" in sql
+    assert "vector" in sql
+
+
+def test_postgres_schema_sql_has_vector_column_with_named_dimension():
+    from agentops_runtime.memory_record_store import EMBEDDING_DIM
+
+    sql = _schema_sql().lower()
+    assert f"embedding vector({EMBEDDING_DIM})" in sql
+
+
+def test_postgres_schema_sql_has_jsonb_metadata_and_provenance():
+    sql = _schema_sql().lower()
+    assert "jsonb" in sql
+    assert "metadata" in sql
+    assert "provenance" in sql
+
+
+def test_postgres_schema_sql_has_all_seven_scope_columns():
+    sql = _schema_sql().lower()
+    for col in _scope_cols():
+        assert col in sql, f"expected scope column {col!r} in schema SQL"
+
+
+def test_postgres_schema_sql_has_record_id_in_table():
+    sql = _schema_sql().lower()
+    assert "record_id" in sql
+
+
+def test_postgres_schema_sql_has_composite_pk_or_unique_with_scope_and_record_id():
+    sql = _schema_sql().lower()
+    match = re.search(r"(?:primary key|unique)\s*\(([^)]*)\)", sql)
+    assert match, "schema must declare a primary key or unique constraint"
+    constraint_cols = [col.strip() for col in match.group(1).split(",")]
+    assert constraint_cols == [*_scope_cols(), "record_id"]
+
+
+def test_postgres_schema_sql_has_fts_tsvector():
+    sql = _schema_sql().lower()
+    assert "tsvector" in sql
+
+
+def test_postgres_schema_sql_has_vector_index():
+    sql = _single_spaced(_schema_sql())
+    assert (
+        "create index if not exists memory_records_embedding_idx "
+        "on memory_records using hnsw (embedding vector_cosine_ops)"
+    ) in sql
+
+
+def test_postgres_schema_sql_has_gin_indexes_for_fts_and_jsonb():
+    sql = _single_spaced(_schema_sql())
+    assert "on memory_records using gin (ts_vec)" in sql
+    assert "on memory_records using gin (metadata)" in sql
+    assert "on memory_records using gin (provenance)" in sql
+
+
+def test_postgres_schema_sql_has_scope_index():
+    sql = _single_spaced(_schema_sql())
+    assert f"on memory_records ({', '.join(_scope_cols())})" in sql
+
+
+def test_postgres_schema_sql_has_text_hash_source_source_uri_kind_parent_fields():
+    sql = _schema_sql().lower()
+    for field in ("text_hash", "source_uri", "record_kind", "parent_id"):
+        assert field in sql, f"expected field {field!r} in schema SQL"
+
+
+# --- upsert SQL ---
+
+
+def test_postgres_upsert_sql_is_on_conflict_do_update():
+    sql = _upsert_sql().lower()
+    assert "on conflict" in sql
+    assert "do update" in sql
+
+
+def test_postgres_upsert_sql_conflict_target_includes_all_scope_fields_and_record_id():
+    sql = _upsert_sql().lower()
+    match = re.search(r"on conflict\s*\(([^)]*)\)", sql)
+    assert match, "upsert SQL must declare an ON CONFLICT target"
+    conflict_target = [col.strip() for col in match.group(1).split(",")]
+    assert conflict_target == [*_scope_cols(), "record_id"]
+
+
+def test_postgres_upsert_sql_uses_placeholders_not_string_interpolation():
+    sql = _upsert_sql()
+    # 7 scope cols + 13 record payload cols, all bound as psycopg2 parameters.
+    assert sql.count("%s") == 20
+    assert "VALUES (" + ", ".join("%s" for _ in range(20)) + ")" in sql
+    # must NOT contain Python f-string markers or format placeholders that imply interpolation
+    assert "{" not in sql
+
+
+def test_postgres_upsert_sql_preserves_created_at_on_conflict():
+    sql = _upsert_sql().lower()
+    # created_at must not appear in the DO UPDATE SET clause after "do update set"
+    do_update_idx = sql.find("do update set")
+    assert do_update_idx != -1, "upsert SQL must contain DO UPDATE SET"
+    after_do_update = sql[do_update_idx:]
+    # created_at must not be assigned in the update portion
+    # (it is in INSERT columns but must be excluded from SET)
+    assert "created_at" not in after_do_update, (
+        "created_at must not appear in DO UPDATE SET — preserve original value"
+    )
+
+
+def test_postgres_upsert_sql_no_sentinel_value_in_sql_string():
+    sentinel = "LEAKSENTINEL123"
+    sql = _upsert_sql()
+    assert sentinel not in sql
+    assert "literal_secret" not in sql.lower()
+
+
+# --- search SQL ---
+
+
+def test_postgres_search_sql_has_scope_filter_before_ranking():
+    sql = _single_spaced(_search_sql())
+    scope_cte_idx = sql.find("with scope_filtered as")
+    ranked_cte_idx = sql.find("ranked as")
+    assert scope_cte_idx != -1
+    assert ranked_cte_idx != -1
+    assert scope_cte_idx < ranked_cte_idx
+    scope_cte = sql[scope_cte_idx:ranked_cte_idx]
+    for col in _scope_cols():
+        assert f"{col} = %s" in scope_cte, f"expected {col!r} predicate before ranking"
+    assert "from scope_filtered" in sql[ranked_cte_idx:]
+
+
+def test_postgres_search_sql_has_metadata_jsonb_containment_or_filter_param():
+    sql = _single_spaced(_search_sql())
+    assert "(%s::jsonb is null or metadata @> %s::jsonb)" in sql
+
+
+def test_postgres_search_sql_has_vector_rank_component():
+    sql = _single_spaced(_search_sql())
+    assert "1.0 - (embedding <=> %s::vector)" in sql
+
+
+def test_postgres_search_sql_has_text_rank_component():
+    sql = _single_spaced(_search_sql())
+    assert "ts_rank(ts_vec, plainto_tsquery('english', %s))" in sql
+
+
+def test_postgres_search_sql_uses_fts_predicate_or_positive_score_filter():
+    sql = _single_spaced(_search_sql())
+    ranked_idx = sql.find("ranked as")
+    select_idx = sql.find("select * from ranked")
+    assert ranked_idx != -1
+    assert select_idx != -1
+    ranked_cte = sql[ranked_idx:select_idx]
+    assert "ts_vec @@ plainto_tsquery('english', %s)" in ranked_cte
+    assert "where score > 0" in sql[select_idx:]
+
+
+def test_postgres_search_sql_has_order_by_score_desc_record_id_asc():
+    sql = _single_spaced(_search_sql())
+    assert "order by score desc, record_id asc" in sql
+
+
+def test_postgres_search_sql_has_exact_placeholder_count_and_limit_placeholder():
+    sql = _search_sql()
+    # 7 scope + 2 metadata + vector rank + text rank + vector candidate + FTS candidate + limit.
+    assert sql.count("%s") == 14
+    assert re.search(r"LIMIT\s+%s\s*;", sql)

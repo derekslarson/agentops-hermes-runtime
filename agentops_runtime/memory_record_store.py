@@ -35,6 +35,7 @@ _SCOPE_FIELDS = (
     "user_id",
 )
 _EXCERPT_MAX = 512
+EMBEDDING_DIM = 384
 
 
 def _scope_values(context: RuntimeContext | None) -> tuple[str, ...]:
@@ -303,3 +304,138 @@ class RelationalMemoryRecordBackend:
                 )
             )
         return results
+
+
+# ---------------------------------------------------------------------------
+# Postgres SQL contract scaffold (dependency-free; no live connection here)
+# ---------------------------------------------------------------------------
+# These three functions define the intended SQL contract for the future
+# Postgres/pgvector adapter. They return static SQL strings suitable for use
+# with psycopg2 (%s placeholders). No Postgres package is imported; callers
+# must supply their own connection and cursor.
+# ---------------------------------------------------------------------------
+
+_PG_SCOPE_COLS = (
+    "scope_mode",
+    "scope_org_id",
+    "scope_workspace_id",
+    "scope_project_id",
+    "scope_agent_profile_id",
+    "scope_conversation_id",
+    "scope_user_id",
+)
+_PG_CONFLICT_COLS = (*_PG_SCOPE_COLS, "record_id")
+
+
+def _postgres_schema_sql() -> str:
+    scope_col_defs = "\n    ".join(f"{c} TEXT NOT NULL DEFAULT ''," for c in _PG_SCOPE_COLS)
+    conflict_cols = ", ".join(_PG_CONFLICT_COLS)
+    return f"""
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE IF NOT EXISTS memory_records (
+    {scope_col_defs}
+    record_id TEXT NOT NULL,
+    text TEXT NOT NULL,
+    text_hash TEXT NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{{}}',
+    provenance JSONB NOT NULL DEFAULT '{{}}',
+    source TEXT NOT NULL DEFAULT 'unknown',
+    source_uri TEXT NOT NULL DEFAULT '',
+    ts DOUBLE PRECISION,
+    created_at DOUBLE PRECISION NOT NULL,
+    updated_at DOUBLE PRECISION NOT NULL,
+    record_kind TEXT NOT NULL DEFAULT 'verbatim',
+    parent_id TEXT,
+    embedding vector({EMBEDDING_DIM}),
+    ts_vec tsvector GENERATED ALWAYS AS (to_tsvector('english', text)) STORED,
+    PRIMARY KEY ({conflict_cols})
+);
+
+CREATE INDEX IF NOT EXISTS memory_records_embedding_idx
+    ON memory_records USING hnsw (embedding vector_cosine_ops);
+
+CREATE INDEX IF NOT EXISTS memory_records_ts_vec_gin_idx
+    ON memory_records USING gin (ts_vec);
+
+CREATE INDEX IF NOT EXISTS memory_records_metadata_gin_idx
+    ON memory_records USING gin (metadata);
+
+CREATE INDEX IF NOT EXISTS memory_records_provenance_gin_idx
+    ON memory_records USING gin (provenance);
+
+CREATE INDEX IF NOT EXISTS memory_records_scope_idx
+    ON memory_records ({", ".join(_PG_SCOPE_COLS)});
+"""
+
+
+def _postgres_upsert_sql() -> str:
+    all_cols = (
+        *_PG_SCOPE_COLS,
+        "record_id",
+        "text",
+        "text_hash",
+        "metadata",
+        "provenance",
+        "source",
+        "source_uri",
+        "ts",
+        "created_at",
+        "updated_at",
+        "record_kind",
+        "parent_id",
+        "embedding",
+    )
+    col_list = ", ".join(all_cols)
+    placeholders = ", ".join("%s" for _ in all_cols)
+    conflict_target = ", ".join(_PG_CONFLICT_COLS)
+    mutable_cols = [
+        c for c in all_cols
+        if c not in {*_PG_CONFLICT_COLS, "created_at"}
+    ]
+    update_set = ",\n        ".join(f"{c} = EXCLUDED.{c}" for c in mutable_cols)
+    return (
+        f"INSERT INTO memory_records ({col_list})\n"
+        f"VALUES ({placeholders})\n"
+        f"ON CONFLICT ({conflict_target}) DO UPDATE SET\n"
+        f"        {update_set};"
+    )
+
+
+def _postgres_search_sql() -> str:
+    scope_filter = " AND ".join(f"{c} = %s" for c in _PG_SCOPE_COLS)
+    return f"""
+WITH scope_filtered AS (
+    SELECT *
+    FROM memory_records
+    WHERE {scope_filter}
+      AND (%s::jsonb IS NULL OR metadata @> %s::jsonb)
+),
+ranked AS (
+    SELECT
+        record_id,
+        text,
+        text_hash,
+        metadata,
+        provenance,
+        source,
+        source_uri,
+        ts,
+        created_at,
+        updated_at,
+        record_kind,
+        parent_id,
+        (
+            COALESCE(1.0 - (embedding <=> %s::vector), 0.0) * 0.6
+            + COALESCE(ts_rank(ts_vec, plainto_tsquery('english', %s)), 0.0) * 0.4
+        ) AS score
+    FROM scope_filtered
+    WHERE (%s::vector IS NOT NULL AND embedding IS NOT NULL)
+       OR ts_vec @@ plainto_tsquery('english', %s)
+)
+SELECT *
+FROM ranked
+WHERE score > 0
+ORDER BY score DESC, record_id ASC
+LIMIT %s;
+"""
