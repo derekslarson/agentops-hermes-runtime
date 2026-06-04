@@ -240,11 +240,9 @@ def test_memory_records_log_message_redacts_query_values():
 # ---------------------------------------------------------------------------
 
 
-def test_make_memory_backend_returns_local_by_default():
-    from agent.runtime_backends import LocalDeepMemoryBackend
-
-    backend = compose_services._make_memory_backend({})
-    assert isinstance(backend, LocalDeepMemoryBackend)
+def test_make_memory_backend_fails_closed_when_unconfigured():
+    with pytest.raises(ValueError, match="AGENTOPS_DEEP_MEMORY_DB_URL"):
+        compose_services._make_memory_backend({})
 
 
 def test_make_memory_backend_selects_sqlite_via_db_url(tmp_path):
@@ -331,6 +329,11 @@ def test_make_memory_backend_fails_closed_on_postgres_store_even_with_sqlite_url
         })
 
 
+def test_make_memory_backend_fails_closed_on_sqlite_store_without_explicit_url():
+    with pytest.raises(ValueError, match="AGENTOPS_DEEP_MEMORY_DB_URL"):
+        compose_services._make_memory_backend({"AGENTOPS_DEEP_MEMORY_STORE": "sqlite"})
+
+
 def test_make_memory_backend_fails_closed_on_unknown_store_type():
     with pytest.raises(Exception):
         compose_services._make_memory_backend({"AGENTOPS_DEEP_MEMORY_STORE": "postgress"})
@@ -351,10 +354,106 @@ def test_make_memory_backend_postgres_error_does_not_leak_password(monkeypatch):
     assert sentinel_password not in str(exc_info.value)
 
 
-def test_get_or_create_memory_backend_falls_back_to_local(monkeypatch):
+def test_get_or_create_memory_backend_fails_closed_when_unconfigured(monkeypatch):
     monkeypatch.setattr(compose_services, "_memory_backend_instance", None)
     monkeypatch.setattr(compose_services.os, "environ", {})
-    from agent.runtime_backends import LocalDeepMemoryBackend
+    with pytest.raises(ValueError, match="AGENTOPS_DEEP_MEMORY_DB_URL"):
+        compose_services._get_or_create_memory_backend()
 
-    backend = compose_services._get_or_create_memory_backend()
-    assert isinstance(backend, LocalDeepMemoryBackend)
+
+# ---------------------------------------------------------------------------
+# _health_payload api deep-memory requirement (M5B)
+# ---------------------------------------------------------------------------
+
+
+def test_api_readiness_requires_deep_memory_db_url(monkeypatch):
+    env = {
+        "HERMES_RUNTIME_MODE": "agentops",
+        "HERMES_BACKEND_PROFILE": "compose-self-hosted",
+        "AGENTOPS_DATABASE_URL": "postgresql://agentops:pass@postgres:5432/agentops",
+        "AGENTOPS_QUEUE_URL": "redis://redis:6379/0",
+        "AGENTOPS_ARTIFACT_ENDPOINT": "http://minio:9000",
+        "AGENTOPS_SECRET_STORE_URL": "http://local-secrets:8713",
+        "AGENTOPS_API_URL": "http://api:8710",
+        # AGENTOPS_DEEP_MEMORY_DB_URL intentionally absent
+    }
+    monkeypatch.setattr(compose_services.os, "environ", env)
+    monkeypatch.setattr(
+        compose_services,
+        "configure_compose_runtime_backends",
+        lambda registry, *, environ: None,
+        raising=False,
+    )
+
+    api_payload = compose_services._health_payload("api")
+    assert api_payload["ok"] is False
+    assert "AGENTOPS_DEEP_MEMORY_DB_URL" in api_payload.get("missing", [])
+
+    # worker and scheduler must NOT require AGENTOPS_DEEP_MEMORY_DB_URL
+    worker_payload = compose_services._health_payload("worker")
+    assert worker_payload["ok"] is True
+    scheduler_payload = compose_services._health_payload("scheduler")
+    assert scheduler_payload["ok"] is True
+
+
+def test_api_readiness_treats_whitespace_deep_memory_db_url_as_missing(monkeypatch):
+    env = {
+        "HERMES_RUNTIME_MODE": "agentops",
+        "HERMES_BACKEND_PROFILE": "compose-self-hosted",
+        "AGENTOPS_DATABASE_URL": "postgresql://agentops:***@postgres:5432/agentops",
+        "AGENTOPS_QUEUE_URL": "redis://redis:6379/0",
+        "AGENTOPS_ARTIFACT_ENDPOINT": "http://minio:9000",
+        "AGENTOPS_SECRET_STORE_URL": "http://local-secrets:8713",
+        "AGENTOPS_API_URL": "http://api:8710",
+        "AGENTOPS_DEEP_MEMORY_DB_URL": "   ",
+    }
+    monkeypatch.setattr(compose_services.os, "environ", env)
+    monkeypatch.setattr(
+        compose_services,
+        "configure_compose_runtime_backends",
+        lambda registry, *, environ: None,
+        raising=False,
+    )
+
+    api_payload = compose_services._health_payload("api")
+    assert api_payload["ok"] is False
+    assert "AGENTOPS_DEEP_MEMORY_DB_URL" in api_payload.get("missing", [])
+
+
+# ---------------------------------------------------------------------------
+# _dispatch_memory_records 503 on backend failure (M5B)
+# ---------------------------------------------------------------------------
+
+
+def test_memory_records_request_returns_503_when_backend_unavailable(monkeypatch):
+    def _raise_backend_error():
+        raise ValueError("LEAKSENTINEL password=secret")
+
+    monkeypatch.setattr(compose_services, "_get_or_create_memory_backend", _raise_backend_error)
+
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    # memory_backend is None by default — forces call to _get_or_create_memory_backend
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({"context": _CONTEXT, "record": {"text": "test"}}).encode()
+        req = urllib.request.Request(f"{base}/memory/records", data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Content-Length", str(len(body)))
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                status = r.status
+                response_body = r.read()
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            response_body = exc.read()
+        assert status == 503
+        response_text = response_body.decode("utf-8")
+        assert "LEAKSENTINEL" not in response_text
+        assert "password=secret" not in response_text
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
