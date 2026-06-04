@@ -1741,6 +1741,13 @@ def register_deep_memory_adapter(profile: str, factory: "BackendFactory") -> Non
         _DEEP_MEMORY_ADAPTER_FACTORIES[str(profile)] = factory
 
 
+def unregister_deep_memory_adapter(profile: str) -> None:
+    """Drop the process-registered DEEP_MEMORY adapter factory for ``profile`` if present."""
+
+    with _deep_memory_adapter_lock:
+        _DEEP_MEMORY_ADAPTER_FACTORIES.pop(str(profile), None)
+
+
 def clear_deep_memory_adapters() -> None:
     """Drop all process-registered DEEP_MEMORY adapter factories."""
 

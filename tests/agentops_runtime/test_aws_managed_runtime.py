@@ -296,3 +296,244 @@ def test_core_contract_modules_do_not_contain_aws_provider_strings():
         for token in _AWS_SERVICE_TOKENS:
             pattern = re.compile(rf"\b{re.escape(token)}\b")
             assert not pattern.search(source), f"{relative} leaks AWS token {token!r}"
+
+
+# --- M5B: aws-managed DEEP_MEMORY registration (new slice) ---------------
+
+
+def _aws_managed_dm_context(
+    run_id: str,
+    *,
+    user_id: str = "derek",
+    conversation_id: str = "aws-dm-thread",
+) -> RuntimeContext:
+    return RuntimeContext(
+        mode="agentops",
+        org_id="org-m5b",
+        workspace_id="workspace-m5b",
+        user_id=user_id,
+        conversation_id=conversation_id,
+        agent_profile_id="default",
+        project_id="runtime",
+        run_id=run_id,
+        run_type="manual",
+        backend_profile=AWS_MANAGED_PROFILE,
+    )
+
+
+def test_aws_managed_unconfigured_deep_memory_fails_closed():
+    from agent.runtime_backends import BackendSelectionError
+
+    registry = RuntimeBackendRegistry()
+    configure_aws_managed_runtime_backends(registry, config={}, environ={})
+    context = _aws_managed_dm_context("run-dm-unconfigured")
+    with pytest.raises(BackendSelectionError):
+        registry.get(BackendCapability.DEEP_MEMORY, context)
+
+
+def test_aws_managed_configured_sqlite_resolves_relational_backend(tmp_path):
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    db_path = str(tmp_path / "aws_dm.db")
+    config = {"agentops": {"deep_memory_db_url": f"sqlite:///{db_path}"}}
+    registry = RuntimeBackendRegistry()
+    configure_aws_managed_runtime_backends(registry, config=config, environ={})
+
+    context = _aws_managed_dm_context("run-dm-sqlite")
+    backend = registry.get(BackendCapability.DEEP_MEMORY, context)
+    assert isinstance(backend, RelationalMemoryRecordBackend)
+
+
+def test_aws_managed_env_deep_memory_url_overrides_config(tmp_path):
+    config_db_path = tmp_path / "config_should_not_win.db"
+    env_db_path = tmp_path / "env_should_win.db"
+    config = {"agentops": {"deep_memory_db_url": f"sqlite:///{config_db_path}"}}
+    environ = {"AGENTOPS_DEEP_MEMORY_DB_URL": f"sqlite:///{env_db_path}"}
+    registry = RuntimeBackendRegistry()
+    configure_aws_managed_runtime_backends(registry, config=config, environ=environ)
+
+    context = _aws_managed_dm_context("run-dm-env")
+    registry.get(BackendCapability.DEEP_MEMORY, context)
+
+    assert env_db_path.exists()
+    assert not config_db_path.exists()
+
+
+def _assert_factory_does_not_expose_secret(factory, sentinel_password: str, raw_db_url: str) -> None:
+    exposed = "\n".join(
+        repr(value)
+        for value in (
+            factory,
+            getattr(factory, "__defaults__", None),
+            getattr(factory, "__kwdefaults__", None),
+            getattr(factory, "__closure__", None),
+            getattr(factory, "__dict__", None),
+        )
+    )
+    assert sentinel_password not in exposed
+    assert raw_db_url not in exposed
+
+
+def test_aws_managed_deep_memory_registry_factory_hides_raw_dsn(tmp_path):
+    sentinel_password = "POSTGRES_SENTINEL_SECRET_4567"
+    db_url = "postgresql://user:" + sentinel_password + "@rds-host.example.com:5432/deepmem"
+    assert sentinel_password in db_url
+    registry = RuntimeBackendRegistry()
+    configure_aws_managed_runtime_backends(
+        registry,
+        config={"agentops": {"deep_memory_db_url": db_url}},
+        environ={},
+    )
+
+    factory = registry._factories[BackendCapability.DEEP_MEMORY][AWS_MANAGED_PROFILE]
+    _assert_factory_does_not_expose_secret(factory, sentinel_password, db_url)
+
+
+def test_register_aws_managed_deep_memory_adapter_hides_raw_dsn():
+    from agent.runtime_backends import _DEEP_MEMORY_ADAPTER_FACTORIES, clear_deep_memory_adapters
+    from agentops_runtime.aws_managed import register_aws_managed_deep_memory_adapter
+
+    sentinel_password = "POSTGRES_SENTINEL_SECRET_9876"
+    db_url = "postgresql://user:" + sentinel_password + "@rds-host.example.com:5432/deepmem"
+    assert sentinel_password in db_url
+    clear_deep_memory_adapters()
+    try:
+        register_aws_managed_deep_memory_adapter(
+            config={"agentops": {"deep_memory_db_url": db_url}},
+            environ={},
+        )
+        factory = _DEEP_MEMORY_ADAPTER_FACTORIES[AWS_MANAGED_PROFILE]
+        _assert_factory_does_not_expose_secret(factory, sentinel_password, db_url)
+    finally:
+        clear_deep_memory_adapters()
+
+
+def test_aws_managed_sqlite_backend_upsert_get_search(tmp_path):
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    db_path = str(tmp_path / "aws_dm_rtrip.db")
+    config = {"agentops": {"deep_memory_db_url": f"sqlite:///{db_path}"}}
+    registry = RuntimeBackendRegistry()
+    configure_aws_managed_runtime_backends(registry, config=config, environ={})
+
+    context = _aws_managed_dm_context("run-dm-rtrip")
+    backend = registry.get(BackendCapability.DEEP_MEMORY, context)
+
+    rec = backend.upsert_record(context, text="aws-managed magenta record verbatim", source="unit")
+    assert rec.id.startswith("mem_")
+    fetched = backend.get_record(context, rec.id)
+    assert fetched is not None and fetched.id == rec.id
+    results = backend.search(context, "magenta record")
+    assert any(r.id == rec.id for r in results)
+
+
+def test_aws_managed_two_contexts_isolated(tmp_path):
+    db_path = str(tmp_path / "aws_dm_iso.db")
+    config = {"agentops": {"deep_memory_db_url": f"sqlite:///{db_path}"}}
+    registry = RuntimeBackendRegistry()
+    configure_aws_managed_runtime_backends(registry, config=config, environ={})
+
+    ctx_a = _aws_managed_dm_context("run-iso-a", user_id="alice", conversation_id="thread-alice")
+    ctx_b = _aws_managed_dm_context("run-iso-b", user_id="bob", conversation_id="thread-bob")
+    backend = registry.get(BackendCapability.DEEP_MEMORY, ctx_a)
+
+    rec = backend.upsert_record(ctx_a, text="alice-only cerulean secret record", source="unit")
+    assert backend.get_record(ctx_b, rec.id) is None
+    assert not any(r.id == rec.id for r in backend.search(ctx_b, "cerulean secret"))
+    assert backend.get_many(ctx_b, [rec.id]) == []
+
+
+def test_aws_managed_postgres_dsn_fails_closed_without_leaking_password(monkeypatch):
+    import sys
+
+    class _FailingPsycopg2:
+        def connect(self, *a, **kw):
+            raise Exception("synthetic postgres unavailable")
+
+    monkeypatch.setitem(sys.modules, "psycopg2", _FailingPsycopg2())
+    sentinel_password = "POSTGRES_SENTINEL_SECRET_7890"
+    db_url = "postgresql://user:" + sentinel_password + "@rds-host.example.com:5432/deepmem"
+    config = {"agentops": {"deep_memory_db_url": db_url}}
+    assert sentinel_password in db_url
+    registry = RuntimeBackendRegistry()
+    configure_aws_managed_runtime_backends(registry, config=config, environ={})
+    context = _aws_managed_dm_context("run-pg-fail")
+
+    with pytest.raises(Exception) as exc_info:
+        registry.get(BackendCapability.DEEP_MEMORY, context)
+
+    error = str(exc_info.value)
+    assert sentinel_password not in error
+    assert db_url not in error
+    assert "[REDACTED]@rds-host.example.com" in error
+
+
+def test_register_aws_managed_deep_memory_adapter_noop_when_unconfigured():
+    from agent.runtime_backends import _DEEP_MEMORY_ADAPTER_FACTORIES, clear_deep_memory_adapters
+    from agentops_runtime.aws_managed import register_aws_managed_deep_memory_adapter
+
+    clear_deep_memory_adapters()
+    try:
+        register_aws_managed_deep_memory_adapter(config={}, environ={})
+        assert AWS_MANAGED_PROFILE not in _DEEP_MEMORY_ADAPTER_FACTORIES
+    finally:
+        clear_deep_memory_adapters()
+
+
+def test_aws_managed_unconfigured_reconfigure_removes_stale_registry_deep_memory(tmp_path):
+    from agent.runtime_backends import BackendSelectionError
+
+    db_path = tmp_path / "stale_should_not_survive.db"
+    registry = RuntimeBackendRegistry()
+    context = _aws_managed_dm_context("run-stale-registry")
+
+    configure_aws_managed_runtime_backends(
+        registry,
+        config={"agentops": {"deep_memory_db_url": f"sqlite:///{db_path}"}},
+        environ={},
+    )
+    assert registry.get(BackendCapability.DEEP_MEMORY, context)
+
+    configure_aws_managed_runtime_backends(registry, config={}, environ={})
+
+    with pytest.raises(BackendSelectionError):
+        registry.get(BackendCapability.DEEP_MEMORY, context)
+
+
+def test_register_aws_managed_deep_memory_adapter_unconfigured_removes_stale_global(tmp_path):
+    from agent.runtime_backends import _DEEP_MEMORY_ADAPTER_FACTORIES, clear_deep_memory_adapters
+    from agentops_runtime.aws_managed import register_aws_managed_deep_memory_adapter
+
+    db_path = tmp_path / "stale_global_should_not_survive.db"
+    clear_deep_memory_adapters()
+    try:
+        register_aws_managed_deep_memory_adapter(
+            config={"agentops": {"deep_memory_db_url": f"sqlite:///{db_path}"}},
+            environ={},
+        )
+        assert AWS_MANAGED_PROFILE in _DEEP_MEMORY_ADAPTER_FACTORIES
+
+        register_aws_managed_deep_memory_adapter(config={}, environ={})
+
+        assert AWS_MANAGED_PROFILE not in _DEEP_MEMORY_ADAPTER_FACTORIES
+    finally:
+        clear_deep_memory_adapters()
+
+
+def test_register_aws_managed_deep_memory_adapter_binds_through_apply(tmp_path):
+    from agent.runtime_backends import apply_deep_memory_adapters, clear_deep_memory_adapters
+    from agentops_runtime.aws_managed import register_aws_managed_deep_memory_adapter
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    db_path = str(tmp_path / "aws_dm_apply.db")
+    config = {"agentops": {"deep_memory_db_url": f"sqlite:///{db_path}"}}
+    clear_deep_memory_adapters()
+    try:
+        register_aws_managed_deep_memory_adapter(config=config, environ={})
+        registry = build_aws_managed_test_registry()
+        apply_deep_memory_adapters(registry)
+        context = _aws_managed_dm_context("run-apply")
+        backend = registry.get(BackendCapability.DEEP_MEMORY, context)
+        assert isinstance(backend, RelationalMemoryRecordBackend)
+    finally:
+        clear_deep_memory_adapters()

@@ -18,8 +18,9 @@ This is a SPIKE, not a real AWS deployment:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, ClassVar, Mapping
 
 from agent.runtime_backends import (
     _LOCAL_BACKEND_TYPES,
@@ -30,6 +31,8 @@ from agent.runtime_context import RuntimeContext
 from agent.runtime_supervisor import LocalRunSupervisor, RunResult
 
 AWS_MANAGED_PROFILE = "aws-managed"
+_DEEP_MEMORY_DB_URL_ENV = "AGENTOPS_DEEP_MEMORY_DB_URL"
+_DEEP_MEMORY_DB_URL_CONFIG_KEY = "deep_memory_db_url"
 
 # Handler receives the bound RuntimeContext and the queued payload.
 AwsManagedHandler = Callable[[RuntimeContext, Mapping[str, Any]], Any]
@@ -130,18 +133,77 @@ class AwsManagedWorkItem:
         )
 
 
+def _agentops_section(config: object | None) -> Mapping[str, Any]:
+    if not isinstance(config, Mapping):
+        return {}
+    section = config.get("agentops")
+    return section if isinstance(section, Mapping) else {}
+
+
+@dataclass(frozen=True, repr=False, slots=True)
+class _DeepMemoryDbUrlSecret:
+    """Non-printing DB URL holder used by lazy backend factories.
+
+    The raw DSN is deliberately not kept as a string in the factory defaults,
+    registry options, or process-global adapter map. Factories decode it only
+    when constructing the backend.
+    """
+
+    _encoded: tuple[int, ...]
+    _mask: ClassVar[int] = 73
+
+    @classmethod
+    def from_url(cls, db_url: str) -> "_DeepMemoryDbUrlSecret":
+        return cls(tuple(ord(char) ^ cls._mask for char in db_url))
+
+    def reveal(self) -> str:
+        return "".join(chr(value ^ self._mask) for value in self._encoded)
+
+    def __repr__(self) -> str:
+        return "_DeepMemoryDbUrlSecret([REDACTED])"
+
+
+
+def _resolve_deep_memory_db_url(
+    config: object | None,
+    environ: Mapping[str, str] | None,
+) -> str:
+    agentops_cfg = _agentops_section(config)
+    env = environ if environ is not None else os.environ
+    for candidate in (
+        env.get(_DEEP_MEMORY_DB_URL_ENV),
+        agentops_cfg.get(_DEEP_MEMORY_DB_URL_CONFIG_KEY),
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return ""
+
+
+def _unregister_registry_deep_memory(registry: RuntimeBackendRegistry, profile: str) -> None:
+    """Remove an aws-managed DEEP_MEMORY binding from a registry without touching local defaults."""
+
+    lock = getattr(registry, "_lock")
+    with lock:
+        factories = registry._factories.get(BackendCapability.DEEP_MEMORY)
+        if factories is not None:
+            factories.pop(profile, None)
+        registry._instances.pop((BackendCapability.DEEP_MEMORY, profile), None)
+
+
 def configure_aws_managed_runtime_backends(
     registry: RuntimeBackendRegistry,
     *,
     profile: str = AWS_MANAGED_PROFILE,
+    config: object | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> None:
     """Register backends for the ``aws-managed`` profile on ``registry``.
 
-    The spike registers the same local/fake backends the registry uses for its
-    built-in ``local`` default, scoped under ``profile``. This proves the
-    profile is selectable through the provider-neutral contracts without any
-    AWS SDK, credentials, or network dependency. Real managed AWS backends
-    (durable lease/queue/audit stores) replace these factories later.
+    Registers local-compatible backends for all required capabilities.
+    For DEEP_MEMORY: if a DB URL is resolved from ``config`` or ``environ``,
+    registers a lazy ``RelationalMemoryRecordBackend`` factory; otherwise
+    DEEP_MEMORY is left unregistered so the profile fails closed without
+    any local/fake fallback.
     """
 
     for capability, local_type in _LOCAL_BACKEND_TYPES.items():
@@ -151,14 +213,59 @@ def configure_aws_managed_runtime_backends(
             profile=profile,
         )
 
+    db_url = _resolve_deep_memory_db_url(config, environ)
+    if not db_url:
+        _unregister_registry_deep_memory(registry, profile)
+        return
+
+    db_url_secret = _DeepMemoryDbUrlSecret.from_url(db_url)
+
+    def _deep_memory_factory(options, _secret=db_url_secret):
+        from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+        return RelationalMemoryRecordBackend(_secret.reveal())
+
+    registry.register(BackendCapability.DEEP_MEMORY, _deep_memory_factory, profile=profile)
+
+
+def register_aws_managed_deep_memory_adapter(
+    config: object | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> None:
+    """Register a DEEP_MEMORY adapter factory for the aws-managed profile process-wide.
+
+    No-ops when unconfigured (no resolved DB URL). When configured, registers a
+    lazy ``RelationalMemoryRecordBackend`` factory via ``register_deep_memory_adapter``
+    so ``apply_deep_memory_adapters`` binds it during native agent_init. Does not
+    store the DSN in registry options or metadata.
+    """
+
+    from agent.runtime_backends import register_deep_memory_adapter, unregister_deep_memory_adapter
+
+    db_url = _resolve_deep_memory_db_url(config, environ)
+    if not db_url:
+        unregister_deep_memory_adapter(AWS_MANAGED_PROFILE)
+        return
+    db_url_secret = _DeepMemoryDbUrlSecret.from_url(db_url)
+
+    def _factory(options, _secret=db_url_secret):
+        from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+        return RelationalMemoryRecordBackend(_secret.reveal())
+
+    register_deep_memory_adapter(AWS_MANAGED_PROFILE, _factory)
+
 
 def build_aws_managed_test_registry(
     config: object | None = None,
 ) -> RuntimeBackendRegistry:
-    """Create a registry with the ``aws-managed`` profile registered."""
+    """Create a registry with the ``aws-managed`` profile registered.
+
+    Registers all required capabilities with local-compatible backends.
+    DEEP_MEMORY is not registered here — use ``apply_deep_memory_adapters``
+    after calling ``register_aws_managed_deep_memory_adapter`` if needed.
+    """
 
     registry = RuntimeBackendRegistry(config if isinstance(config, dict) else None)
-    configure_aws_managed_runtime_backends(registry)
+    configure_aws_managed_runtime_backends(registry, environ={})
     return registry
 
 
@@ -223,5 +330,6 @@ __all__ = [
     "build_aws_managed_run_supervisor",
     "build_aws_managed_test_registry",
     "configure_aws_managed_runtime_backends",
+    "register_aws_managed_deep_memory_adapter",
     "run_aws_managed_work_item",
 ]

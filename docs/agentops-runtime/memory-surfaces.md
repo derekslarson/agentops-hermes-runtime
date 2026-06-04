@@ -52,10 +52,36 @@ Key properties (see `agent/local_memory/` and `agent/runtime_backends.py`):
     conversation/thread / agent profile). No cross-user/org/project/thread
     leakage: a record cannot be searched or fetched (even by ID) from another
     scope.
-  - **AgentOps/remote profiles:** **fail closed.** With no registered deep-memory
-    adapter, backend selection raises `BackendSelectionError` rather than falling
-    back to an unscoped local Chroma store. Compose/cloud deployments register a
-    durable/remote adapter behind the same `MemoryRecordBackend` contract.
+  - **Compose self-hosted (`compose-self-hosted` profile):** uses the
+    `HttpMemoryRecordBackend` HTTP adapter against the compose control-plane
+    API (`AGENTOPS_DEEP_MEMORY_URL`). The API is backed by a
+    `RelationalMemoryRecordBackend` (Postgres/pgvector by default via
+    `AGENTOPS_DEEP_MEMORY_DB_URL`). Scope isolation is enforced on the
+    server side by all seven `RuntimeContext` scope columns. Missing or
+    misconfigured URLs fail closed before any store write.
+  - **AWS-managed (`aws-managed` profile):** the first managed-cloud
+    deep-memory path uses `RelationalMemoryRecordBackend` directly via an
+    explicit RDS/Postgres (or SQLite for local testing) DB URL configured in
+    `agentops.deep_memory_db_url` (config) or `AGENTOPS_DEEP_MEMORY_DB_URL`
+    (environment variable, which takes precedence over config). The factory is
+    registered lazily so no connection
+    is made at startup — connection errors are raised only on first access.
+    Scope isolation (seven `RuntimeContext` columns) is enforced by the
+    relational backend on every read and write. Missing/blank configuration
+    leaves `DEEP_MEMORY` unregistered for the profile, so the backend fails
+    closed rather than falling back to any local store.
+  - **AgentOps/remote profiles without a registered adapter:** **fail closed.**
+    Backend selection raises `BackendSelectionError` rather than falling back
+    to an unscoped local Chroma store, a process-local dict, or another
+    tenant's records. There is no `$HERMES_HOME/deep-memory`, Chroma, or
+    in-process fallback for AgentOps remote/managed profiles.
+
+**Open work (M5B not yet complete):** Vector embedding population for the
+Postgres/pgvector path and extracted-signal boost parity with the local
+deep-memory provider remain unfinished. The current Postgres adapter stores
+`embedding` as `NULL` and searches use full-text/BM25 only. Do not assume full
+vector search or extracted-signal rank parity in managed cloud profiles until
+these items land.
 - **Imports** (`scripts/local_memory_import.py`) are idempotent and
   source-preserving, and **require an explicit target scope/profile**
   (`--storage-dir` or `--profile`/`--hermes-home`) so bulk history cannot
