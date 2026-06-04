@@ -155,6 +155,8 @@ _SCOPE_PRED = (
     "scope_conversation_id=? AND scope_user_id=?"
 )
 
+_SIGNAL_BOOST_LADDER = (0.40, 0.25, 0.15, 0.08, 0.04)
+
 
 class RelationalMemoryRecordBackend:
     """Relational MemoryRecordBackend with full RuntimeContext scope isolation.
@@ -307,6 +309,46 @@ class RelationalMemoryRecordBackend:
                )"""
         )
         conn.commit()
+
+    def _sqlite_signal_boosts(
+        self,
+        context: RuntimeContext | None,
+        query: str,
+        candidate_ids: list[str],
+    ) -> dict[str, float]:
+        if not candidate_ids:
+            return {}
+        try:
+            scope = _scope_values(context)
+            placeholders = ",".join("?" * len(candidate_ids))
+            rows = self._conn().execute(
+                f"SELECT record_id, signal_line FROM memory_signals "
+                f"WHERE {_SCOPE_PRED} AND record_id IN ({placeholders})",
+                (*scope, *candidate_ids),
+            ).fetchall()
+        except Exception:
+            return {}
+        signals_by_id: dict[str, list[str]] = {}
+        for row in rows:
+            rid = row["record_id"]
+            if rid not in signals_by_id:
+                signals_by_id[rid] = []
+            signals_by_id[rid].append(row["signal_line"])
+        if not signals_by_id:
+            return {}
+        best_by_id: list[tuple[float, str]] = []
+        for rid, lines in signals_by_id.items():
+            scores = _bm25_scores(query, lines)
+            best = max((s for s in scores if s > 0), default=0.0)
+            if best > 0:
+                best_by_id.append((best, rid))
+        if not best_by_id:
+            return {}
+        best_by_id.sort(key=lambda x: (-x[0], x[1]))
+        return {
+            rid: _SIGNAL_BOOST_LADDER[min(i, len(_SIGNAL_BOOST_LADDER) - 1)]
+            for i, (_, rid) in enumerate(best_by_id)
+        }
 
     def _signals_for_record(self, context: RuntimeContext | None, record_id: str) -> list[str]:
         scope = _scope_values(context)
@@ -651,21 +693,29 @@ class RelationalMemoryRecordBackend:
 
         texts = [row["text"] for row, _ in candidates]
         bm25_raw = _bm25_scores(query, texts)
+        positive_candidate_ids = [
+            row["record_id"] for (row, _), bm25 in zip(candidates, bm25_raw) if bm25 > 0
+        ]
+        signal_boosts = self._sqlite_signal_boosts(context, query, positive_candidate_ids)
 
-        scored: list[tuple[float, str, sqlite3.Row, dict]] = []
-        for (row, metadata), score in zip(candidates, bm25_raw):
-            if score > 0:
-                scored.append((score, row["record_id"], row, metadata))
+        scored: list[tuple[float, float, str, sqlite3.Row, dict, str]] = []
+        for (row, metadata), bm25 in zip(candidates, bm25_raw):
+            if bm25 > 0:
+                rid = row["record_id"]
+                boost = signal_boosts.get(rid, 0.0)
+                effective_score = bm25 + boost
+                matched_via = "record+signal" if boost > 0 else "bm25"
+                scored.append((effective_score, bm25, rid, row, metadata, matched_via))
 
-        scored.sort(key=lambda x: (-x[0], x[1]))
+        scored.sort(key=lambda x: (-x[0], x[2]))
 
         results = []
-        for rank, (score, _, row, metadata) in enumerate(scored[:safe_limit]):
+        for rank, (eff_score, bm25, _, row, metadata, matched_via) in enumerate(scored[:safe_limit]):
             excerpt = _make_excerpt(row["text"])
             results.append(
                 SearchResult(
                     id=row["record_id"],
-                    score=score,
+                    score=eff_score,
                     rank=rank,
                     excerpt=excerpt,
                     text=excerpt,
@@ -674,8 +724,8 @@ class RelationalMemoryRecordBackend:
                     source_uri=row["source_uri"],
                     timestamp=row["ts"],
                     record_kind=row["record_kind"],
-                    bm25_score=score,
-                    matched_via="bm25",
+                    bm25_score=bm25,
+                    matched_via=matched_via,
                 )
             )
         return results

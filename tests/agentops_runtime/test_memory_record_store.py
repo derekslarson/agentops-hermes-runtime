@@ -1433,3 +1433,159 @@ def test_sidecar_insert_failure_rollbacks_and_preserves_prior_signals(backend, m
     assert signals_after == signals_before, (
         f"signals must be unchanged: before={signals_before}, after={signals_after}"
     )
+
+
+# ---------------------------------------------------------------------------
+# M5B — SQLite signal boost application in search() (fourteenth slice)
+# ---------------------------------------------------------------------------
+
+
+def test_signal_boost_marks_matched_via_record_plus_signal(backend):
+    """A record whose extracted signal lines BM25-match the query must surface
+    with matched_via=='record+signal' and score > bm25_score."""
+    # "Kafka" repeated twice → entity word → signal line contains "kafka" token
+    backend.upsert_record(
+        _CTX_A,
+        text="Kafka Kafka pipeline notes",
+        record_id="mem_boost_sig_001",
+    )
+    results = backend.search(_CTX_A, "kafka")
+    assert len(results) >= 1
+    r = results[0]
+    assert r.id == "mem_boost_sig_001"
+    assert r.matched_via == "record+signal", (
+        f"expected 'record+signal', got {r.matched_via!r}"
+    )
+    assert r.bm25_score > 0, f"expected bm25_score > 0, got {r.bm25_score}"
+    assert r.score > r.bm25_score, (
+        f"score {r.score} must exceed bm25_score {r.bm25_score} when signal boost applies"
+    )
+
+
+def test_signal_boost_reorders_above_equal_bm25_peer(backend):
+    """Boosted record must rank above a peer with equal raw BM25 score.
+
+    Both records have 'kafka' twice at equal doc length → equal raw BM25.
+    The capitalized record has a lexicographically later ID so the pre-boost
+    tie-break (sort by record_id asc for equal scores) would place it second.
+    After the signal boost its effective score exceeds the peer's and it ranks
+    first.
+    """
+    # All-lowercase → no capitalized entity words → no signal boost
+    backend.upsert_record(
+        _CTX_A,
+        text="kafka pipeline notes kafka",
+        record_id="mem_kafka_aaa",
+    )
+    # Capitalized Kafka × 2 → entity extracted → signal line has "kafka" token → boost
+    backend.upsert_record(
+        _CTX_A,
+        text="Kafka pipeline notes Kafka",
+        record_id="mem_kafka_zzz",
+    )
+    results = backend.search(_CTX_A, "kafka")
+    ids = [r.id for r in results]
+    assert len(results) >= 2, f"expected at least 2 results, got {ids}"
+    assert ids.index("mem_kafka_zzz") < ids.index("mem_kafka_aaa"), (
+        f"boosted 'mem_kafka_zzz' should rank before 'mem_kafka_aaa', got order {ids}"
+    )
+
+
+def test_non_signal_match_keeps_matched_via_bm25(backend):
+    """A record whose signal lines do not BM25-match the query keeps matched_via=='bm25'."""
+    # All-lowercase → no capitalized entity words → signal line has no 'kafka' token
+    backend.upsert_record(
+        _CTX_A,
+        text="kafka pipeline notes",
+        record_id="mem_no_boost_001",
+    )
+    results = backend.search(_CTX_A, "kafka")
+    assert len(results) >= 1
+    r = results[0]
+    assert r.id == "mem_no_boost_001"
+    assert r.matched_via == "bm25", (
+        f"expected 'bm25' for non-signal match, got {r.matched_via!r}"
+    )
+
+
+def test_signal_boost_does_not_create_signal_only_candidate(backend):
+    """Signal matches may rerank only records with positive raw BM25."""
+    # No 'kafka' in text, but source_uri stem becomes a signal line containing 'kafka'.
+    backend.upsert_record(
+        _CTX_A,
+        text="postgres pipeline notes",
+        record_id="mem_signal_only_not_candidate",
+        source_uri="file:///tmp/kafka.md",
+    )
+    results = backend.search(_CTX_A, "kafka")
+    assert [r.id for r in results] == []
+
+
+def test_signal_only_candidates_do_not_consume_boost_ladder_slots(backend):
+    """Signal-only rows must not reduce the boost assigned to eligible BM25 hits."""
+    # This record has a matching signal via source_uri but raw record BM25 is zero.
+    # Its lexically earlier id would consume the top boost if signal-only rows were eligible.
+    backend.upsert_record(
+        _CTX_A,
+        text="postgres pipeline notes",
+        record_id="mem_a_signal_only",
+        source_uri="file:///tmp/kafka.md",
+    )
+    backend.upsert_record(
+        _CTX_A,
+        text="Kafka Kafka pipeline notes",
+        record_id="mem_z_bm25_and_signal",
+    )
+
+    results = backend.search(_CTX_A, "kafka")
+    hit = next(r for r in results if r.id == "mem_z_bm25_and_signal")
+    assert hit.matched_via == "record+signal"
+    assert hit.score - hit.bm25_score == pytest.approx(0.40)
+
+
+def test_signal_boost_respects_metadata_filter(backend):
+    """Signal-bearing records excluded by metadata filter must not appear in results."""
+    backend.upsert_record(
+        _CTX_A,
+        text="Kafka Kafka pipeline notes",
+        record_id="mem_sig_filtered_out",
+        metadata={"kind": "filtered"},
+    )
+    backend.upsert_record(
+        _CTX_A,
+        text="kafka search match notes",
+        record_id="mem_sig_kept",
+        metadata={"kind": "kept"},
+    )
+    results = backend.search(_CTX_A, "kafka", filters={"kind": "kept"})
+    ids = [r.id for r in results]
+    assert "mem_sig_filtered_out" not in ids, (
+        "filtered signal record must be absent regardless of signal strength"
+    )
+    assert "mem_sig_kept" in ids, "matching unfiltered record must be present"
+
+
+def test_signal_boost_is_scope_isolated(backend):
+    """Signal rows from another RuntimeContext must not boost results in this scope.
+
+    CTX_B holds 'mem_shared_scope' with capitalized Kafka × 2 (strong signal).
+    CTX_A holds the same record_id but with all-lowercase text (no signal boost).
+    Searching in CTX_A must not inherit CTX_B's signal rows.
+    """
+    backend.upsert_record(
+        _CTX_B,
+        text="Kafka Kafka pipeline notes",
+        record_id="mem_shared_scope",
+    )
+    backend.upsert_record(
+        _CTX_A,
+        text="kafka pipeline notes",
+        record_id="mem_shared_scope",
+    )
+    results = backend.search(_CTX_A, "kafka")
+    assert len(results) >= 1
+    r = results[0]
+    assert r.id == "mem_shared_scope"
+    assert r.matched_via == "bm25", (
+        f"cross-scope signals must not boost CTX_A results, got matched_via={r.matched_via!r}"
+    )
