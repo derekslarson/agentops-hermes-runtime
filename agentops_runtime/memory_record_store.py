@@ -156,6 +156,12 @@ _SCOPE_PRED = (
 )
 
 _SIGNAL_BOOST_LADDER = (0.40, 0.25, 0.15, 0.08, 0.04)
+_PG_OVERFETCH_FACTOR = 4
+_PG_OVERFETCH_CAP = 100
+
+
+def _pg_overfetch_limit(safe_limit: int) -> int:
+    return min(safe_limit * _PG_OVERFETCH_FACTOR, _PG_OVERFETCH_CAP)
 
 
 class RelationalMemoryRecordBackend:
@@ -729,6 +735,7 @@ class RelationalMemoryRecordBackend:
             filter_json = json.dumps(dict(filters)) if filters else None
             ts_query = _postgres_search_query(query)
             vec_literal = self._compute_pg_embedding(query)
+            overfetch_limit = _pg_overfetch_limit(safe_limit)
             rows = self._fetchall_postgres(
                 _postgres_search_sql(),
                 (
@@ -739,14 +746,13 @@ class RelationalMemoryRecordBackend:
                     ts_query,
                     vec_literal,
                     ts_query,
-                    safe_limit,
+                    overfetch_limit,
                 ),
             )
-            window = rows[:safe_limit]
-            candidate_ids = [str(row["record_id"]) for row in window]
+            candidate_ids = [str(row["record_id"]) for row in rows]
             signal_boosts = self._pg_signal_boosts(context, query, candidate_ids)
             scored: list[tuple[float, float, str, Any]] = []
-            for row in window:
+            for row in rows:
                 rid = str(row["record_id"])
                 bm25 = float(row.get("score") or 0.0)
                 boost = signal_boosts.get(rid, 0.0)
@@ -754,7 +760,7 @@ class RelationalMemoryRecordBackend:
                 scored.append((effective_score, bm25, rid, row))
             scored.sort(key=lambda x: (-x[0], x[2]))
             results = []
-            for rank, (eff_score, bm25, rid, row) in enumerate(scored):
+            for rank, (eff_score, bm25, rid, row) in enumerate(scored[:safe_limit]):
                 excerpt = _make_excerpt(str(row["text"]))
                 matched_via = "record+signal" if eff_score > bm25 else "bm25"
                 results.append(

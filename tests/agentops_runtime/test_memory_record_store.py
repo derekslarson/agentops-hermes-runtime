@@ -640,7 +640,8 @@ def test_postgres_backend_upsert_get_many_and_search_use_bound_scope_params(monk
     assert search_params[8] == '{"kind": "pg"}'
     assert search_params[10] == "postgres OR memory"
     assert search_params[12] == "postgres OR memory"
-    assert search_params[-1] == 3
+    from agentops_runtime.memory_record_store import _pg_overfetch_limit
+    assert search_params[-1] == _pg_overfetch_limit(3)
 
 
 def test_postgres_backend_maps_default_tuple_cursor_rows(monkeypatch):
@@ -2094,3 +2095,138 @@ def test_postgres_search_signal_success_commits_read_transaction(monkeypatch):
         "Expected one commit for the ranked search SELECT and one commit for the "
         f"signal SELECT, got {search_commits}"
     )
+
+
+# ---------------------------------------------------------------------------
+# M5B — Postgres search overfetch for signal-boost candidates (seventeenth slice)
+# ---------------------------------------------------------------------------
+
+
+def test_postgres_search_overfetches_signal_strong_record_beyond_limit_window(monkeypatch):
+    """With limit=2, a third SQL row that has a strong matching signal must appear
+    in the final results after overfetch re-ranking, displacing a lower-boosted row."""
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    conn = _FakePostgresConnectionWithSignals()
+    monkeypatch.setitem(sys.modules, "psycopg2", _FakePsycopg2(conn))
+    # Two higher-base rows with no signals, plus a lower-base third row with a strong signal.
+    # After boost: row3 score = 0.10 + 0.40 = 0.50, row2 score = 0.45, row1 score = 0.80.
+    # Sorted: row1 (0.80), row3 (0.50), row2 (0.45). With limit=2 after overfetch re-rank,
+    # the final results should be [row1, row3], not [row1, row2].
+    conn.search_rows = [
+        _pg_row(record_id="mem_pg_high1", text="kafka pipeline notes", score=0.80),
+        _pg_row(record_id="mem_pg_high2", text="kafka stream notes", score=0.45),
+        _pg_row(record_id="mem_pg_low_signal", text="kafka signal notes", score=0.10),
+    ]
+    conn.signal_rows = [
+        {"record_id": "mem_pg_low_signal", "signal_line": "kafka entity term"},
+    ]
+
+    backend = RelationalMemoryRecordBackend(
+        "postgresql://user:pass@db.example/deepmem",
+        embed_fn=_make_fake_embed_fn(),
+    )
+    results = backend.search(_CTX_A, "kafka", limit=2)
+
+    assert len(results) == 2
+    result_ids = [r.id for r in results]
+    assert "mem_pg_low_signal" in result_ids, (
+        f"Signal-boosted third row must appear in limit=2 results after overfetch, got {result_ids}"
+    )
+    assert "mem_pg_high2" not in result_ids, (
+        f"Unboosted second row should be displaced by the boosted third row, got {result_ids}"
+    )
+
+
+def test_postgres_search_binds_overfetched_limit_param(monkeypatch):
+    """The SQL LIMIT bound to _postgres_search_sql() must be greater than the requested
+    limit and equal to the computed overfetch window size (not safe_limit itself)."""
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    conn = _FakePostgresConnectionWithSignals()
+    monkeypatch.setitem(sys.modules, "psycopg2", _FakePsycopg2(conn))
+    conn.search_rows = [_pg_row(record_id="mem_pg_ovf_limit", text="kafka notes", score=0.5)]
+
+    backend = RelationalMemoryRecordBackend(
+        "postgresql://user:pass@db.example/deepmem",
+        embed_fn=_make_fake_embed_fn(),
+    )
+    backend.search(_CTX_A, "kafka", limit=3)
+
+    ranked_calls = [
+        (sql, params)
+        for sql, params in conn.executed
+        if "from ranked" in " ".join(sql.lower().split())
+    ]
+    assert ranked_calls, "Expected a ranked search SQL execution"
+    _sql, params = ranked_calls[0]
+    sql_limit_param = params[-1]
+    assert sql_limit_param > 3, (
+        f"SQL LIMIT param must be greater than requested limit=3 (overfetch), got {sql_limit_param}"
+    )
+    from agentops_runtime import memory_record_store as mod
+    overfetch_limit = getattr(mod, "_pg_overfetch_limit", lambda n: None)(3)
+    assert overfetch_limit is not None, "_pg_overfetch_limit helper must exist in production module"
+    assert sql_limit_param == overfetch_limit, (
+        f"SQL LIMIT param {sql_limit_param} must equal _pg_overfetch_limit(3)={overfetch_limit}"
+    )
+
+
+def test_postgres_search_overfetch_truncates_to_requested_limit(monkeypatch):
+    """Even when SQL returns more rows than requested, final results length must equal
+    the requested limit (not the overfetch window size)."""
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    conn = _FakePostgresConnectionWithSignals()
+    monkeypatch.setitem(sys.modules, "psycopg2", _FakePsycopg2(conn))
+    conn.search_rows = [
+        _pg_row(record_id=f"mem_pg_trunc_{i}", text=f"kafka notes {i}", score=0.9 - i * 0.1)
+        for i in range(8)
+    ]
+    conn.signal_rows = []
+
+    backend = RelationalMemoryRecordBackend(
+        "postgresql://user:pass@db.example/deepmem",
+        embed_fn=_make_fake_embed_fn(),
+    )
+    results = backend.search(_CTX_A, "kafka", limit=3)
+
+    assert len(results) == 3, (
+        f"Final result count must equal requested limit=3, got {len(results)}"
+    )
+
+
+def test_postgres_search_overfetch_excludes_signal_only_record(monkeypatch):
+    """A signal row whose record_id does not appear in the SQL ranked search rows
+    must never appear in the final results or be passed as a candidate to _pg_signal_boosts."""
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    conn = _FakePostgresConnectionWithSignals()
+    monkeypatch.setitem(sys.modules, "psycopg2", _FakePsycopg2(conn))
+    conn.search_rows = [
+        _pg_row(record_id="mem_pg_real_hit", text="kafka notes", score=0.5),
+    ]
+    conn.signal_rows = [
+        {"record_id": "mem_pg_signal_only", "signal_line": "kafka entity term"},
+    ]
+
+    backend = RelationalMemoryRecordBackend(
+        "postgresql://user:pass@db.example/deepmem",
+        embed_fn=_make_fake_embed_fn(),
+    )
+    results = backend.search(_CTX_A, "kafka", limit=2)
+
+    result_ids = [r.id for r in results]
+    assert "mem_pg_signal_only" not in result_ids, (
+        f"Signal-only record must not appear in results, got {result_ids}"
+    )
+    signal_query_calls = [
+        params
+        for sql, params in conn.executed
+        if "memory_signals" in sql.lower() and "record_id = any" in sql.lower()
+    ]
+    if signal_query_calls:
+        candidate_ids = list(signal_query_calls[0][-1])
+        assert "mem_pg_signal_only" not in candidate_ids, (
+            f"Signal-only ID must not be in candidate array sent to signal query, got {candidate_ids}"
+        )
