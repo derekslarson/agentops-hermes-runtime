@@ -383,6 +383,61 @@ class RelationalMemoryRecordBackend:
             conn.rollback()
             return
 
+    def _pg_signal_boosts(
+        self,
+        context: RuntimeContext | None,
+        query: str,
+        candidate_ids: list[str],
+    ) -> dict[str, float]:
+        if not candidate_ids:
+            return {}
+        scope = _scope_values(context)
+        conn = self._pg_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT record_id, signal_line FROM memory_signals "
+                    "WHERE scope_mode = %s AND scope_org_id = %s "
+                    "AND scope_workspace_id = %s AND scope_project_id = %s "
+                    "AND scope_agent_profile_id = %s AND scope_conversation_id = %s "
+                    "AND scope_user_id = %s "
+                    "AND record_id = ANY(%s)",
+                    (*scope, candidate_ids),
+                )
+                rows = [
+                    _coerce_mapping_row(r, getattr(cur, "description", None))
+                    for r in cur.fetchall()
+                ]
+            conn.commit()
+        except Exception:
+            _safe_rollback(conn)
+            return {}
+        signals_by_id: dict[str, list[str]] = {}
+        for row in rows:
+            if row is None:
+                continue
+            rid = str(row["record_id"])
+            line = row.get("signal_line")
+            if line is not None:
+                if rid not in signals_by_id:
+                    signals_by_id[rid] = []
+                signals_by_id[rid].append(str(line))
+        if not signals_by_id:
+            return {}
+        best_by_id: list[tuple[float, str]] = []
+        for rid, lines in signals_by_id.items():
+            scores = _bm25_scores(query, lines)
+            best = max((s for s in scores if s > 0), default=0.0)
+            if best > 0:
+                best_by_id.append((best, rid))
+        if not best_by_id:
+            return {}
+        best_by_id.sort(key=lambda x: (-x[0], x[1]))
+        return {
+            rid: _SIGNAL_BOOST_LADDER[min(i, len(_SIGNAL_BOOST_LADDER) - 1)]
+            for i, (_, rid) in enumerate(best_by_id)
+        }
+
     def _pg_ingest_signals(self, context: RuntimeContext | None, record_id: str, source_uri: str, text: str) -> None:
         try:
             lines = build_extracted_signal_lines(source_uri, [record_id], text)
@@ -687,13 +742,25 @@ class RelationalMemoryRecordBackend:
                     safe_limit,
                 ),
             )
+            window = rows[:safe_limit]
+            candidate_ids = [str(row["record_id"]) for row in window]
+            signal_boosts = self._pg_signal_boosts(context, query, candidate_ids)
+            scored: list[tuple[float, float, str, Any]] = []
+            for row in window:
+                rid = str(row["record_id"])
+                bm25 = float(row.get("score") or 0.0)
+                boost = signal_boosts.get(rid, 0.0)
+                effective_score = bm25 + boost
+                scored.append((effective_score, bm25, rid, row))
+            scored.sort(key=lambda x: (-x[0], x[2]))
             results = []
-            for rank, row in enumerate(rows[:safe_limit]):
+            for rank, (eff_score, bm25, rid, row) in enumerate(scored):
                 excerpt = _make_excerpt(str(row["text"]))
+                matched_via = "record+signal" if eff_score > bm25 else "bm25"
                 results.append(
                     SearchResult(
-                        id=str(row["record_id"]),
-                        score=float(row.get("score") or 0.0),
+                        id=rid,
+                        score=eff_score,
                         rank=rank,
                         excerpt=excerpt,
                         text=excerpt,
@@ -702,8 +769,8 @@ class RelationalMemoryRecordBackend:
                         source_uri=str(row.get("source_uri") or ""),
                         timestamp=row.get("ts"),
                         record_kind=str(row.get("record_kind") or "verbatim"),
-                        bm25_score=float(row.get("score") or 0.0),
-                        matched_via="bm25",
+                        bm25_score=bm25,
+                        matched_via=matched_via,
                     )
                 )
             return results

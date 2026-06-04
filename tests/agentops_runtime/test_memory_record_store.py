@@ -1770,3 +1770,327 @@ def test_postgres_sidecar_failure_preserves_primary_record_without_raising(monke
     assert record is not None
     assert record.id == "mem_pg_sidecar_fail"
     assert conn.rollbacks >= 1, "Expected rollback after sidecar INSERT failure"
+
+
+# ---------------------------------------------------------------------------
+# M5B — Postgres memory_signals boost application in search() (sixteenth slice)
+# ---------------------------------------------------------------------------
+
+
+class _FakePostgresCursorWithSignals:
+    """Fake cursor that routes memory_signals queries separately from memory_records queries.
+
+    The existing _FakePostgresCursor matches 'record_id = any' for both get_many and
+    signal queries. This variant checks for 'memory_signals' first so signal reads
+    return signal rows rather than falling through to the memory_records get_many path.
+    """
+
+    def __init__(self, connection):
+        self.connection = connection
+        self._fetchone_val = None
+        self._fetchall_val = []
+        self.description = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc_info):
+        return False
+
+    def execute(self, sql, params=None):
+        self.connection.executed.append((sql, params))
+        lowered = " ".join(sql.lower().split())
+        if "memory_signals" in lowered and "record_id = any" in lowered:
+            requested_ids = list(params[-1]) if params else []
+            self._fetchall_val = [
+                r for r in self.connection.signal_rows
+                if r.get("record_id") in requested_ids
+            ]
+            self._fetchone_val = None
+            self.description = [("record_id",), ("signal_line",)]
+        elif "record_id = %s" in lowered and "select *" in lowered:
+            self._fetchone_val = self.connection.rows_by_id.get(params[-1])
+            self._fetchall_val = []
+            self.description = [(col,) for col in _PG_ROW_COLUMNS]
+        elif "record_id = any" in lowered:
+            requested = list(params[-1]) if params else []
+            self._fetchall_val = [
+                self.connection.rows_by_id[rid]
+                for rid in requested
+                if rid in self.connection.rows_by_id
+            ]
+            self._fetchone_val = None
+            self.description = [(col,) for col in _PG_ROW_COLUMNS]
+        elif "from ranked" in lowered:
+            self._fetchall_val = list(self.connection.search_rows)
+            self._fetchone_val = None
+            self.description = [(col,) for col in (*_PG_ROW_COLUMNS, "score")]
+        elif "on conflict" in lowered and "returning" in lowered:
+            self._fetchone_val = self.connection.upsert_row
+            self._fetchall_val = []
+            self.description = [(col,) for col in _PG_ROW_COLUMNS]
+        else:
+            self._fetchone_val = None
+            self._fetchall_val = []
+            self.description = None
+
+    def fetchone(self):
+        return self._fetchone_val
+
+    def fetchall(self):
+        return self._fetchall_val
+
+
+class _FakePostgresConnectionWithSignals:
+    def __init__(self):
+        self.executed = []
+        self.commits = 0
+        self.rollbacks = 0
+        self.rows_by_id = {}
+        self.search_rows = []
+        self.signal_rows = []
+        self.upsert_row = None
+
+    def cursor(self):
+        return _FakePostgresCursorWithSignals(self)
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
+
+
+class _FailingSignalSelectCursor:
+    """Fake cursor that raises a RuntimeError on memory_signals SELECT queries."""
+
+    def __init__(self, connection):
+        self.connection = connection
+        self._fetchall_val = []
+        self._fetchone_val = None
+        self.description = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc_info):
+        return False
+
+    def execute(self, sql, params=None):
+        self.connection.executed.append((sql, params))
+        lowered = " ".join(sql.lower().split())
+        if "memory_signals" in lowered and "record_id = any" in lowered:
+            raise RuntimeError("synthetic signal SELECT failure")
+        if "from ranked" in lowered:
+            self._fetchall_val = list(self.connection.search_rows)
+            self.description = [(col,) for col in (*_PG_ROW_COLUMNS, "score")]
+        else:
+            self._fetchone_val = None
+            self._fetchall_val = []
+            self.description = None
+
+    def fetchone(self):
+        return self._fetchone_val
+
+    def fetchall(self):
+        return self._fetchall_val
+
+
+class _FailingSignalSelectConnection:
+    def __init__(self):
+        self.executed = []
+        self.commits = 0
+        self.rollbacks = 0
+        self.search_rows = []
+
+    def cursor(self):
+        return _FailingSignalSelectCursor(self)
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
+
+
+def test_postgres_search_applies_signal_boost_marks_matched_via_record_plus_signal(monkeypatch):
+    """Postgres search result with a matching signal row gets matched_via='record+signal',
+    score > bm25_score, and raw SQL score preserved in bm25_score."""
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    conn = _FakePostgresConnectionWithSignals()
+    monkeypatch.setitem(sys.modules, "psycopg2", _FakePsycopg2(conn))
+    conn.search_rows = [_pg_row(record_id="mem_pg_sig_boost", text="kafka pipeline notes", score=0.5)]
+    conn.signal_rows = [
+        {"record_id": "mem_pg_sig_boost", "signal_line": "kafka pipeline entity"},
+        {"record_id": "mem_pg_sig_boost", "signal_line": "kafka streaming term"},
+    ]
+
+    backend = RelationalMemoryRecordBackend(
+        "postgresql://user:pass@db.example/deepmem",
+        embed_fn=_make_fake_embed_fn(),
+    )
+    results = backend.search(_CTX_A, "kafka", limit=1)
+
+    assert len(results) == 1
+    r = results[0]
+    assert r.id == "mem_pg_sig_boost"
+    assert r.matched_via == "record+signal", (
+        f"expected 'record+signal', got {r.matched_via!r}"
+    )
+    assert r.bm25_score == pytest.approx(0.5), (
+        f"bm25_score must equal raw SQL score 0.5, got {r.bm25_score}"
+    )
+    assert r.score > r.bm25_score, (
+        f"score {r.score} must exceed bm25_score {r.bm25_score} when signal boost applies"
+    )
+
+
+def test_postgres_search_signal_boost_reorders_within_returned_window(monkeypatch):
+    """A row with lower base score but a matching signal must rank above a higher-base
+    row with no matching signal after boost is applied."""
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    conn = _FakePostgresConnectionWithSignals()
+    monkeypatch.setitem(sys.modules, "psycopg2", _FakePsycopg2(conn))
+    # High base score but no signal boost
+    # Low base score but signal boost (0.20 + 0.40 = 0.60 > 0.55)
+    conn.search_rows = [
+        _pg_row(record_id="mem_pg_high_base", text="kafka processing notes", score=0.55),
+        _pg_row(record_id="mem_pg_low_base", text="kafka streaming notes", score=0.2),
+    ]
+    conn.signal_rows = [
+        {"record_id": "mem_pg_low_base", "signal_line": "kafka streaming entity"},
+    ]
+
+    backend = RelationalMemoryRecordBackend(
+        "postgresql://user:pass@db.example/deepmem",
+        embed_fn=_make_fake_embed_fn(),
+    )
+    results = backend.search(_CTX_A, "kafka", limit=2)
+
+    assert len(results) == 2
+    ids = [r.id for r in results]
+    assert ids.index("mem_pg_low_base") < ids.index("mem_pg_high_base"), (
+        f"boosted record 'mem_pg_low_base' should rank above 'mem_pg_high_base', got {ids}"
+    )
+
+
+def test_postgres_search_signal_boost_uses_bound_scope_params(monkeypatch):
+    """Signal query must bind all seven RuntimeContext scope predicates and
+    record_id = ANY(%s) for candidate IDs; no ID must be interpolated into SQL."""
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    conn = _FakePostgresConnectionWithSignals()
+    monkeypatch.setitem(sys.modules, "psycopg2", _FakePsycopg2(conn))
+    conn.search_rows = [_pg_row(record_id="mem_pg_scope_check", score=0.5)]
+
+    backend = RelationalMemoryRecordBackend(
+        "postgresql://user:pass@db.example/deepmem",
+        embed_fn=_make_fake_embed_fn(),
+    )
+    backend.search(_CTX_A, "kafka", limit=1)
+
+    signal_calls = [
+        (sql, params)
+        for sql, params in conn.executed
+        if "memory_signals" in sql.lower() and "record_id = any" in sql.lower()
+    ]
+    assert signal_calls, "Expected a signal query after Postgres search"
+
+    sig_sql, sig_params = signal_calls[0]
+
+    # No candidate ID literal in the SQL text
+    assert "mem_pg_scope_check" not in sig_sql, (
+        "Candidate ID must be a bound parameter, not interpolated into SQL"
+    )
+
+    # 7 scope params + 1 candidate IDs array param
+    assert sig_params is not None
+    assert len(sig_params) == 8, (
+        f"Signal query must have 8 params (7 scope + 1 candidate IDs), got {len(sig_params)}"
+    )
+    assert sig_params[:7] == _scope_values_for_test(_CTX_A), (
+        f"First 7 params must match scope values, got {sig_params[:7]}"
+    )
+    assert "mem_pg_scope_check" in list(sig_params[7]), (
+        f"Last param must contain the candidate record ID, got {sig_params[7]}"
+    )
+
+
+def test_postgres_search_signal_read_failure_degrades_to_plain_bm25(monkeypatch):
+    """When signal SELECT raises, search rolls back and returns plain BM25 results."""
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    conn = _FailingSignalSelectConnection()
+    monkeypatch.setitem(sys.modules, "psycopg2", _FakePsycopg2(conn))
+    conn.search_rows = [_pg_row(record_id="mem_pg_degrade", text="kafka notes", score=0.5)]
+
+    backend = RelationalMemoryRecordBackend(
+        "postgresql://user:pass@db.example/deepmem",
+        embed_fn=_make_fake_embed_fn(),
+    )
+    results = backend.search(_CTX_A, "kafka", limit=1)
+
+    assert len(results) == 1
+    r = results[0]
+    assert r.id == "mem_pg_degrade"
+    assert r.matched_via == "bm25", (
+        f"signal read failure must degrade to 'bm25', got {r.matched_via!r}"
+    )
+    assert r.bm25_score == pytest.approx(0.5)
+    assert r.score == pytest.approx(r.bm25_score), (
+        f"score {r.score} must equal bm25_score {r.bm25_score} when no boost applied"
+    )
+    assert conn.rollbacks >= 1, "Signal SELECT failure must trigger rollback"
+
+
+def test_postgres_search_nonmatching_signal_does_not_boost(monkeypatch):
+    """Signal lines whose text does not BM25-match the query must not boost the record."""
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    conn = _FakePostgresConnectionWithSignals()
+    monkeypatch.setitem(sys.modules, "psycopg2", _FakePsycopg2(conn))
+    conn.search_rows = [_pg_row(record_id="mem_pg_no_signal_boost", text="kafka notes", score=0.5)]
+    conn.signal_rows = [
+        {"record_id": "mem_pg_no_signal_boost", "signal_line": "unrelated entity term xyz"},
+    ]
+
+    backend = RelationalMemoryRecordBackend(
+        "postgresql://user:***@db.example/deepmem",
+        embed_fn=_make_fake_embed_fn(),
+    )
+    results = backend.search(_CTX_A, "kafka", limit=1)
+
+    assert len(results) == 1
+    r = results[0]
+    assert r.matched_via == "bm25", (
+        f"non-matching signal must not boost, expected 'bm25', got {r.matched_via!r}"
+    )
+    assert r.score == pytest.approx(r.bm25_score)
+
+
+def test_postgres_search_signal_success_commits_read_transaction(monkeypatch):
+    """Successful signal SELECT must commit so Postgres sessions are not left idle in transaction."""
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    conn = _FakePostgresConnectionWithSignals()
+    monkeypatch.setitem(sys.modules, "psycopg2", _FakePsycopg2(conn))
+    conn.search_rows = [_pg_row(record_id="mem_pg_signal_commit", text="kafka notes", score=0.5)]
+    conn.signal_rows = [
+        {"record_id": "mem_pg_signal_commit", "signal_line": "kafka commit signal"},
+    ]
+
+    backend = RelationalMemoryRecordBackend(
+        "postgresql://user:***@db.example/deepmem",
+        embed_fn=_make_fake_embed_fn(),
+    )
+    before_search_commits = conn.commits
+    results = backend.search(_CTX_A, "kafka", limit=1)
+
+    assert len(results) == 1
+    search_commits = conn.commits - before_search_commits
+    assert search_commits >= 2, (
+        "Expected one commit for the ranked search SELECT and one commit for the "
+        f"signal SELECT, got {search_commits}"
+    )
