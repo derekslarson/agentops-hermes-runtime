@@ -2078,3 +2078,13 @@ class RuntimeBackendRegistry:
             instance = self._instrument_for_audit(cap, instance)
             self._instances[cache_key] = instance
             return instance
+
+    def registered_profiles(self, capability: "BackendCapability | str") -> frozenset[str]:
+        """Return the set of explicitly registered profile names for ``capability``.
+
+        Reads the factory table without instantiating any backend. Returns an
+        empty frozenset when no factory has been registered for the capability.
+        """
+        cap = _coerce_capability(capability)
+        with self._lock:
+            return frozenset(self._factories.get(cap, {}))

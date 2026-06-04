@@ -471,3 +471,40 @@ def test_no_provider_specific_names_leak_into_core_module():
     leaked = [token for token in forbidden if re.search(rf"\b{re.escape(token)}\b", source)]
 
     assert leaked == []
+
+
+def test_registered_profiles_lists_local_for_default_memory_capability():
+    registry = RuntimeBackendRegistry()
+    profiles = registry.registered_profiles(BackendCapability.MEMORY)
+    assert "local" in profiles
+
+
+def test_registered_profiles_includes_newly_registered_profile():
+    registry = RuntimeBackendRegistry()
+    registry.register(BackendCapability.CONVERSATION_ROUTER, lambda opts: None, profile="compose-self-hosted")
+    assert "compose-self-hosted" in registry.registered_profiles(BackendCapability.CONVERSATION_ROUTER)
+
+
+def test_registered_profiles_does_not_instantiate_factories():
+    registry = RuntimeBackendRegistry()
+    calls = []
+
+    def factory(_opts):
+        calls.append("called")
+        raise AssertionError("factory must not be called")
+
+    registry.register(BackendCapability.CONVERSATION_ROUTER, factory, profile="compose-self-hosted")
+
+    assert "compose-self-hosted" in registry.registered_profiles(BackendCapability.CONVERSATION_ROUTER)
+    assert calls == []
+
+
+def test_registered_profiles_excludes_unregistered_profile():
+    registry = RuntimeBackendRegistry()
+    assert "compose-self-hosted" not in registry.registered_profiles(BackendCapability.CONVERSATION_ROUTER)
+
+
+def test_registered_profiles_returns_empty_frozenset_when_no_factories():
+    registry = RuntimeBackendRegistry()
+    registry._factories.pop(BackendCapability.MEMORY, None)
+    assert registry.registered_profiles(BackendCapability.MEMORY) == frozenset()

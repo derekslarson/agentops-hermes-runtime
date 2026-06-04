@@ -38,6 +38,7 @@ def test_worker_readiness_configures_compose_runtime_backends(monkeypatch):
         calls.append((registry, environ))
 
     monkeypatch.setattr(compose_services, "configure_compose_runtime_backends", fake_configure, raising=False)
+    monkeypatch.setattr(compose_services, "validate_compose_backend_registration", lambda registry, **kwargs: None, raising=False)
     monkeypatch.setattr(compose_services.os, "environ", _ready_env())
 
     payload = compose_services._health_payload("worker")
@@ -62,6 +63,49 @@ def test_readiness_fails_closed_when_compose_backend_wiring_fails(monkeypatch):
     assert payload["ok"] is False
     assert payload["compose_backends_configured"] is False
     assert "compose backend wiring requires" in payload["backend_error"]
+
+
+def test_readiness_backend_error_redacts_unexpected_exception_details(monkeypatch):
+    def fake_configure(registry: RuntimeBackendRegistry, *, environ: dict[str, str]) -> None:
+        raise RuntimeError("token=cp-secret-sentinel path=/Users/derek/secret postgresql://db")
+
+    monkeypatch.setattr(compose_services, "configure_compose_runtime_backends", fake_configure, raising=False)
+    monkeypatch.setattr(compose_services.os, "environ", _ready_env())
+
+    payload = compose_services._health_payload("worker")
+
+    assert payload["ok"] is False
+    assert payload["compose_backends_configured"] is False
+    assert payload["backend_error"] == "compose backend wiring failed"
+
+
+def test_readiness_backend_error_redacts_safe_prefix_spoofing(monkeypatch):
+    def fake_configure(registry: RuntimeBackendRegistry, *, environ: dict[str, str]) -> None:
+        raise RuntimeError(
+            "compose backend wiring requires a control-plane base URL "
+            "token=cp-secret-sentinel path=/Users/derek/secret postgresql://db"
+        )
+
+    monkeypatch.setattr(compose_services, "configure_compose_runtime_backends", fake_configure, raising=False)
+    monkeypatch.setattr(compose_services.os, "environ", _ready_env())
+
+    payload = compose_services._health_payload("worker")
+
+    assert payload["backend_error"] == "compose backend wiring failed"
+
+
+def test_readiness_backend_error_redacts_registration_prefix_spoofing(monkeypatch):
+    def fake_configure(registry: RuntimeBackendRegistry, *, environ: dict[str, str]) -> None:
+        raise RuntimeError(
+            "compose backend registration incomplete; missing capabilities: cp_secret_sentinel"
+        )
+
+    monkeypatch.setattr(compose_services, "configure_compose_runtime_backends", fake_configure, raising=False)
+    monkeypatch.setattr(compose_services.os, "environ", _ready_env())
+
+    payload = compose_services._health_payload("worker")
+
+    assert payload["backend_error"] == "compose backend wiring failed"
 
 
 # ---------------------------------------------------------------------------
@@ -384,6 +428,12 @@ def test_api_readiness_requires_deep_memory_db_url(monkeypatch):
         lambda registry, *, environ: None,
         raising=False,
     )
+    monkeypatch.setattr(
+        compose_services,
+        "validate_compose_backend_registration",
+        lambda registry, **kwargs: None,
+        raising=False,
+    )
 
     api_payload = compose_services._health_payload("api")
     assert api_payload["ok"] is False
@@ -557,3 +607,92 @@ def test_make_memory_backend_sqlite_does_not_load_embedder(monkeypatch, tmp_path
 
     assert embed_calls == [], "sqlite must not invoke _load_default_embed_fn"
     assert backend._embed_fn is None
+
+
+# ---------------------------------------------------------------------------
+# M12B: Compose backend registration/readiness gate
+# ---------------------------------------------------------------------------
+
+
+def test_api_readiness_fails_closed_on_partial_compose_backend_registration(monkeypatch):
+    monkeypatch.setattr(
+        compose_services,
+        "configure_compose_runtime_backends",
+        lambda registry, *, environ: None,
+        raising=False,
+    )
+    monkeypatch.setattr(compose_services.os, "environ", _ready_env())
+
+    payload = compose_services._health_payload("api")
+
+    assert payload["ok"] is False
+    assert payload["compose_backends_configured"] is False
+    error = payload.get("backend_error", "")
+    assert "conversation_router" in error
+
+
+def test_worker_readiness_fails_closed_on_partial_compose_backend_registration(monkeypatch):
+    monkeypatch.setattr(
+        compose_services,
+        "configure_compose_runtime_backends",
+        lambda registry, *, environ: None,
+        raising=False,
+    )
+    monkeypatch.setattr(compose_services.os, "environ", _ready_env())
+
+    payload = compose_services._health_payload("worker")
+
+    assert payload["ok"] is False
+    assert payload["compose_backends_configured"] is False
+
+
+def test_scheduler_readiness_fails_closed_on_partial_compose_backend_registration(monkeypatch):
+    monkeypatch.setattr(
+        compose_services,
+        "configure_compose_runtime_backends",
+        lambda registry, *, environ: None,
+        raising=False,
+    )
+    monkeypatch.setattr(compose_services.os, "environ", _ready_env())
+
+    payload = compose_services._health_payload("scheduler")
+
+    assert payload["ok"] is False
+    assert payload["compose_backends_configured"] is False
+
+
+def test_readiness_backend_error_exposes_only_capability_names_not_secrets(monkeypatch):
+    monkeypatch.setattr(
+        compose_services,
+        "configure_compose_runtime_backends",
+        lambda registry, *, environ: None,
+        raising=False,
+    )
+    env = dict(_ready_env())
+    env["AGENTOPS_RUNTIME_TOKEN"] = "cp-secret-sentinel"
+    monkeypatch.setattr(compose_services.os, "environ", env)
+
+    payload = compose_services._health_payload("worker")
+
+    error = payload.get("backend_error", "")
+    assert "cp-secret-sentinel" not in error
+    assert "postgresql://" not in error
+    assert "redis://" not in error
+
+
+def test_readiness_payload_omits_env_derived_runtime_values(monkeypatch):
+    monkeypatch.setattr(
+        compose_services,
+        "configure_compose_runtime_backends",
+        lambda registry, *, environ: None,
+        raising=False,
+    )
+    monkeypatch.setattr(compose_services.os, "environ", _ready_env())
+
+    payload = compose_services._health_payload("worker")
+    encoded = json.dumps(payload, sort_keys=True)
+
+    assert "runtime_mode" not in payload
+    assert "backend_profile" not in payload
+    assert "compose-self-hosted" not in encoded
+    assert "agentops" not in encoded

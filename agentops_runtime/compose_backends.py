@@ -28,7 +28,7 @@ from agent.runtime_artifacts_audit import (
     register_http_artifact_backend,
     register_http_audit_backend,
 )
-from agent.runtime_backends import BackendCapability, RuntimeBackendRegistry
+from agent.runtime_backends import BackendCapability, REQUIRED_CAPABILITIES, RuntimeBackendRegistry
 from agent.runtime_cron_http import register_http_cron_backend
 from agent.runtime_memory_http import register_http_memory_backend
 from agent.runtime_memory_record_http import register_http_memory_record_backend
@@ -137,4 +137,38 @@ def _validate_base_url(url: str) -> str:
     return cleaned.rstrip("/")
 
 
-__all__ = ["configure_compose_runtime_backends"]
+COMPOSE_REQUIRED_CAPABILITIES: frozenset[BackendCapability] = REQUIRED_CAPABILITIES | {BackendCapability.DEEP_MEMORY}
+
+
+def missing_compose_capabilities(
+    registry: RuntimeBackendRegistry,
+    profile: str = _COMPOSE_PROFILE,
+) -> tuple[BackendCapability, ...]:
+    """Return capabilities in COMPOSE_REQUIRED_CAPABILITIES lacking a registered factory for ``profile``."""
+    return tuple(
+        cap for cap in sorted(COMPOSE_REQUIRED_CAPABILITIES, key=lambda item: item.value)
+        if profile not in registry.registered_profiles(cap)
+    )
+
+
+def validate_compose_backend_registration(
+    registry: RuntimeBackendRegistry,
+    profile: str = _COMPOSE_PROFILE,
+) -> None:
+    """Raise ValueError if any COMPOSE_REQUIRED_CAPABILITIES lack a factory under ``profile``.
+
+    Error message contains only capability names — no DSNs, tokens, env values,
+    or local paths.
+    """
+    missing = missing_compose_capabilities(registry, profile=profile)
+    if missing:
+        names = ", ".join(sorted(cap.value for cap in missing))
+        raise ValueError(f"compose backend registration incomplete; missing capabilities: {names}")
+
+
+__all__ = [
+    "COMPOSE_REQUIRED_CAPABILITIES",
+    "configure_compose_runtime_backends",
+    "missing_compose_capabilities",
+    "validate_compose_backend_registration",
+]

@@ -20,7 +20,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from agent.runtime_backends import RuntimeBackendRegistry
-from agentops_runtime.compose_backends import configure_compose_runtime_backends
+from agentops_runtime.compose_backends import (
+    COMPOSE_REQUIRED_CAPABILITIES,
+    configure_compose_runtime_backends,
+    validate_compose_backend_registration,
+)
 
 _SERVICE_PORTS = {
     "api": 8710,
@@ -46,21 +50,40 @@ def _health_payload(service: str) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "ok": not missing,
         "service": service,
-        "runtime_mode": os.getenv("HERMES_RUNTIME_MODE", ""),
-        "backend_profile": os.getenv("HERMES_BACKEND_PROFILE", ""),
         "missing": missing,
     }
     if service == "worker":
         payload["max_concurrent_runs"] = int(os.getenv("AGENTOPS_WORKER_MAX_CONCURRENT_RUNS", "1"))
     if service in {"api", "worker", "scheduler"}:
         try:
-            configure_compose_runtime_backends(RuntimeBackendRegistry(), environ=dict(os.environ))
+            registry = RuntimeBackendRegistry()
+            configure_compose_runtime_backends(registry, environ=dict(os.environ))
+            validate_compose_backend_registration(registry)
             payload["compose_backends_configured"] = True
         except Exception as exc:  # noqa: BLE001 - fail closed on any wiring error
             payload["ok"] = False
             payload["compose_backends_configured"] = False
-            payload["backend_error"] = str(exc)
+            payload["backend_error"] = _safe_backend_error(exc)
     return payload
+
+
+def _safe_backend_error(exc: Exception) -> str:
+    message = str(exc)
+    exact_safe_messages = {
+        "compose backend wiring requires a control-plane base URL",
+        "compose backend base URL must be an absolute http(s) URL",
+        "compose backend base URL must not contain credentials",
+        "compose backend base URL must not contain query or fragment",
+    }
+    if message in exact_safe_messages:
+        return message
+    prefix = "compose backend registration incomplete; missing capabilities: "
+    if message.startswith(prefix):
+        names = message.removeprefix(prefix).split(", ")
+        allowed = {cap.value for cap in COMPOSE_REQUIRED_CAPABILITIES}
+        if names and all(name in allowed for name in names):
+            return f"{prefix}{', '.join(names)}"
+    return "compose backend wiring failed"
 
 
 class _Handler(BaseHTTPRequestHandler):

@@ -962,7 +962,7 @@ Test evidence (RED→GREEN): `tests/agentops_runtime/test_memory_records_api.py`
 
 ### M12B. Compose control-plane durable backend parity
 
-**Status:** Pending
+**Status:** Started
 
 **Goal:** Turn Compose from topology/health scaffolding plus in-process contract smoke into a real self-hosted multi-tenant Hermes deployment backed by the Compose database/queue/object-store/secret services.
 
@@ -976,6 +976,8 @@ Test evidence (RED→GREEN): `tests/agentops_runtime/test_memory_records_api.py`
 - API/worker/scheduler `/readyz` verifies migrations and backend reachability for all required capabilities, not only that services answer HTTP.
 - A live `docker compose --scale worker=3 --scale scheduler=2` smoke runs an actual user/event-to-response path through the containers and proves: two users/threads have isolated curated memory, sessions, and deep-memory hints/fetches; shared org/project skills load in both; a cron firing is claimed once; an unrelated watchdog firing is not starved by a long-running builder; artifacts/audit entries persist; and a worker restart resumes conversation state from durable storage.
 - Tests keep the hermetic in-process smoke as a fast contract guard, but M12B completion requires at least one live Compose transcript proving real durable endpoints.
+
+**Autonomous run note (2026-06-04, registration/readiness gate slice):** Started M12B with the compose backend registration/readiness gate. Added a read-only `registered_profiles(capability)` accessor to `RuntimeBackendRegistry` that reports explicitly registered profile names without instantiating backends. Added `COMPOSE_REQUIRED_CAPABILITIES = REQUIRED_CAPABILITIES | {DEEP_MEMORY}`, deterministic `missing_compose_capabilities(registry, profile)`, and `validate_compose_backend_registration(registry, profile)` to `agentops_runtime/compose_backends.py`; validation fails closed with capability names only — no DSNs, tokens, env values, profile names, or paths. Wired API/worker/scheduler `_health_payload` through the validator after `configure_compose_runtime_backends`; partial registration now makes readiness fail closed, and readiness no longer mirrors env-derived runtime/profile values or raw unexpected exception text (including safe-prefix and registration-prefix spoofing). Current partial registration reports nine missing durable surfaces: conversation_router, credential, delivery, queue, run_lease, secret, session, skill, worker_registry. This slice creates an honest readiness gate and makes the gap visible; it does not close the gap (those nine surfaces still need real durable adapters). Test evidence: focused RED (`ImportError`/`AttributeError`/`AssertionError` plus reviewer-driven sanitizer/determinism regressions) → GREEN `python -m pytest tests/agentops_runtime/test_compose_backends.py tests/agentops_runtime/test_compose_services.py tests/agent/test_runtime_backends.py -q -o 'addopts='` → 84 passed, 1 pre-existing OpenTelemetry deprecation warning; `python -m ruff check` → passed; `git diff --check` → passed. M12B remains Started.
 
 ### M13. Slack multi-user/thread MVP
 

@@ -139,3 +139,98 @@ def test_config_url_overrides_environment():
     )
 
     assert registry._capability_options(BackendCapability.MEMORY)["base_url"] == "https://config.internal"
+
+
+def test_compose_required_capabilities_equals_required_capabilities_plus_deep_memory():
+    from agent.runtime_backends import REQUIRED_CAPABILITIES
+    from agentops_runtime.compose_backends import COMPOSE_REQUIRED_CAPABILITIES
+
+    assert COMPOSE_REQUIRED_CAPABILITIES == REQUIRED_CAPABILITIES | {BackendCapability.DEEP_MEMORY}
+    assert BackendCapability.DEEP_MEMORY in COMPOSE_REQUIRED_CAPABILITIES
+
+
+def test_missing_compose_capabilities_reports_nine_durable_surfaces_after_partial_wiring():
+    from agentops_runtime.compose_backends import missing_compose_capabilities
+
+    registry = RuntimeBackendRegistry()
+    configure_compose_runtime_backends(
+        registry, environ={"AGENTOPS_API_URL": "https://api.internal:8710"}
+    )
+    missing = missing_compose_capabilities(registry)
+    missing_values = {cap.value for cap in missing}
+    assert missing_values == {
+        "conversation_router", "credential", "delivery", "queue",
+        "run_lease", "secret", "session", "skill", "worker_registry",
+    }
+    assert [cap.value for cap in missing] == sorted(missing_values)
+
+
+def test_missing_compose_capabilities_result_contains_no_secrets_or_urls():
+    from agentops_runtime.compose_backends import missing_compose_capabilities
+
+    registry = RuntimeBackendRegistry()
+    configure_compose_runtime_backends(
+        registry,
+        environ={
+            "AGENTOPS_API_URL": "https://api.internal:8710",
+            "AGENTOPS_RUNTIME_TOKEN": "cp-secret-sentinel",
+        },
+    )
+    missing = missing_compose_capabilities(registry)
+    result_str = str(missing)
+    for sensitive in ("cp-secret-sentinel", "api.internal", "8710", "password", "postgresql://"):
+        assert sensitive not in result_str
+
+
+def test_validate_compose_backend_registration_fails_closed_on_partial_registration():
+    from agentops_runtime.compose_backends import validate_compose_backend_registration
+
+    registry = RuntimeBackendRegistry()
+    configure_compose_runtime_backends(
+        registry, environ={"AGENTOPS_API_URL": "https://api.internal:8710"}
+    )
+    with pytest.raises(ValueError) as exc_info:
+        validate_compose_backend_registration(registry)
+    error_msg = str(exc_info.value)
+    assert "conversation_router" in error_msg
+
+
+def test_validate_compose_backend_registration_error_exposes_only_capability_names():
+    from agentops_runtime.compose_backends import validate_compose_backend_registration
+
+    registry = RuntimeBackendRegistry()
+    configure_compose_runtime_backends(
+        registry,
+        environ={
+            "AGENTOPS_API_URL": "https://api.internal:8710",
+            "AGENTOPS_RUNTIME_TOKEN": "cp-secret-sentinel",
+        },
+    )
+    with pytest.raises(ValueError) as exc_info:
+        validate_compose_backend_registration(registry)
+    error_msg = str(exc_info.value)
+    for sensitive in (
+        "cp-secret-sentinel",
+        "api.internal",
+        "8710",
+        "postgresql://",
+        "/Users/",
+        "compose-self-hosted",
+        "profile",
+    ):
+        assert sensitive not in error_msg, f"{sensitive!r} leaked into error"
+
+
+def test_validate_compose_backend_registration_passes_after_full_registration():
+    from agentops_runtime.compose_backends import (
+        missing_compose_capabilities,
+        validate_compose_backend_registration,
+    )
+
+    registry = RuntimeBackendRegistry()
+    configure_compose_runtime_backends(
+        registry, environ={"AGENTOPS_API_URL": "https://api.internal:8710"}
+    )
+    for cap in missing_compose_capabilities(registry):
+        registry.register(cap, lambda opts: object(), profile=_PROFILE)
+    validate_compose_backend_registration(registry)
