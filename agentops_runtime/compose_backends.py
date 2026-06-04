@@ -34,6 +34,7 @@ from agent.runtime_conversation_router_http import register_http_conversation_ro
 from agent.runtime_cron_http import register_http_cron_backend
 from agent.runtime_memory_http import register_http_memory_backend
 from agent.runtime_memory_record_http import register_http_memory_record_backend
+from agent.runtime_run_lease_http import register_http_run_lease_backend
 
 _COMPOSE_PROFILE = "compose-self-hosted"
 _API_URL_ENV = "AGENTOPS_API_URL"
@@ -45,6 +46,7 @@ _CAPABILITY_URL_ENV: dict[BackendCapability, str] = {
     BackendCapability.ARTIFACT: "AGENTOPS_ARTIFACT_URL",
     BackendCapability.AUDIT: "AGENTOPS_AUDIT_URL",
     BackendCapability.CONVERSATION_ROUTER: "AGENTOPS_CONVERSATION_ROUTER_URL",
+    BackendCapability.RUN_LEASE: "AGENTOPS_RUN_LEASE_URL",
 }
 _CAPABILITY_CONFIG_KEY: dict[BackendCapability, str] = {
     BackendCapability.MEMORY: "memory_url",
@@ -53,6 +55,7 @@ _CAPABILITY_CONFIG_KEY: dict[BackendCapability, str] = {
     BackendCapability.ARTIFACT: "artifact_url",
     BackendCapability.AUDIT: "audit_url",
     BackendCapability.CONVERSATION_ROUTER: "conversation_router_url",
+    BackendCapability.RUN_LEASE: "run_lease_url",
 }
 
 
@@ -93,6 +96,7 @@ def configure_compose_runtime_backends(
     register_http_artifact_backend(registry, profile=profile)
     register_http_audit_backend(registry, profile=profile)
     register_http_conversation_router_backend(registry, profile)
+    register_http_run_lease_backend(registry, profile)
 
 
 def _agentops_config(config: Mapping[str, Any] | None) -> Mapping[str, Any]:

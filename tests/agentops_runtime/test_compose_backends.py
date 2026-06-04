@@ -11,6 +11,7 @@ from agent.runtime_conversation_router_http import HttpConversationRouter
 from agent.runtime_cron_http import HttpCronBackend
 from agent.runtime_memory_http import HttpMemoryBackend
 from agent.runtime_memory_record_http import HttpMemoryRecordBackend
+from agent.runtime_run_lease_http import HttpRunLeaseBackend
 from agentops_runtime.compose_backends import configure_compose_runtime_backends
 
 _PROFILE = "compose-self-hosted"
@@ -33,6 +34,7 @@ def test_registers_http_backends_for_each_capability():
     assert isinstance(registry.get(BackendCapability.ARTIFACT, context), HttpArtifactBackend)
     assert isinstance(registry.get(BackendCapability.AUDIT, context), HttpAuditBackend)
     assert isinstance(registry.get(BackendCapability.CONVERSATION_ROUTER, context), HttpConversationRouter)
+    assert isinstance(registry.get(BackendCapability.RUN_LEASE, context), HttpRunLeaseBackend)
 
 
 def test_per_capability_url_overrides_api_url():
@@ -75,6 +77,32 @@ def test_conversation_router_config_key_overrides_env():
 
     router_opts = registry._capability_options(BackendCapability.CONVERSATION_ROUTER)
     assert router_opts["base_url"] == "https://config-router.internal"
+
+
+def test_run_lease_url_env_overrides_api_url():
+    registry = RuntimeBackendRegistry()
+    configure_compose_runtime_backends(
+        registry,
+        environ={
+            "AGENTOPS_API_URL": "https://api.internal",
+            "AGENTOPS_RUN_LEASE_URL": "https://leases.internal",
+        },
+    )
+
+    run_lease_opts = registry._capability_options(BackendCapability.RUN_LEASE)
+    assert run_lease_opts["base_url"] == "https://leases.internal"
+
+
+def test_run_lease_config_key_overrides_env():
+    registry = RuntimeBackendRegistry()
+    configure_compose_runtime_backends(
+        registry,
+        config={"agentops": {"run_lease_url": "https://config-leases.internal"}},
+        environ={"AGENTOPS_API_URL": "https://api.internal", "AGENTOPS_RUN_LEASE_URL": "https://env-leases.internal"},
+    )
+
+    run_lease_opts = registry._capability_options(BackendCapability.RUN_LEASE)
+    assert run_lease_opts["base_url"] == "https://config-leases.internal"
 
 
 def test_fails_closed_when_api_url_missing():
@@ -152,6 +180,7 @@ def test_app_and_integration_secrets_are_not_passed_into_options():
         BackendCapability.ARTIFACT,
         BackendCapability.AUDIT,
         BackendCapability.CONVERSATION_ROUTER,
+        BackendCapability.RUN_LEASE,
     ):
         options = registry._capability_options(capability)
         assert set(options) <= {"base_url", "token", "timeout"}
@@ -178,7 +207,7 @@ def test_compose_required_capabilities_equals_required_capabilities_plus_deep_me
     assert BackendCapability.DEEP_MEMORY in COMPOSE_REQUIRED_CAPABILITIES
 
 
-def test_missing_compose_capabilities_reports_eight_durable_surfaces_after_partial_wiring():
+def test_missing_compose_capabilities_reports_seven_durable_surfaces_after_partial_wiring():
     from agentops_runtime.compose_backends import missing_compose_capabilities
 
     registry = RuntimeBackendRegistry()
@@ -189,9 +218,10 @@ def test_missing_compose_capabilities_reports_eight_durable_surfaces_after_parti
     missing_values = {cap.value for cap in missing}
     assert missing_values == {
         "credential", "delivery", "queue",
-        "run_lease", "secret", "session", "skill", "worker_registry",
+        "secret", "session", "skill", "worker_registry",
     }
     assert "conversation_router" not in missing_values
+    assert "run_lease" not in missing_values
     assert [cap.value for cap in missing] == sorted(missing_values)
 
 
