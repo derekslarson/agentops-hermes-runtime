@@ -24,7 +24,7 @@ import time
 from typing import Any, Iterable, Mapping
 from urllib.parse import urlparse, urlunparse
 
-from agent.local_memory.store import MemoryRecord, SearchResult, _bm25_scores, get_embedding_function as _get_chroma_embedding_function
+from agent.local_memory.store import MemoryRecord, SearchResult, _bm25_scores, build_extracted_signal_lines, get_embedding_function as _get_chroma_embedding_function
 from agent.runtime_context import RuntimeContext
 
 _SCOPE_FIELDS = (
@@ -285,7 +285,61 @@ class RelationalMemoryRecordBackend:
                 )
             )"""
         )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS memory_signals (
+                scope_mode TEXT NOT NULL DEFAULT '',
+                scope_org_id TEXT NOT NULL DEFAULT '',
+                scope_workspace_id TEXT NOT NULL DEFAULT '',
+                scope_project_id TEXT NOT NULL DEFAULT '',
+                scope_agent_profile_id TEXT NOT NULL DEFAULT '',
+                scope_conversation_id TEXT NOT NULL DEFAULT '',
+                scope_user_id TEXT NOT NULL DEFAULT '',
+                record_id TEXT NOT NULL,
+                signal_line TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE INDEX IF NOT EXISTS memory_signals_scope_record_idx
+               ON memory_signals (
+                   scope_mode, scope_org_id, scope_workspace_id, scope_project_id,
+                   scope_agent_profile_id, scope_conversation_id, scope_user_id,
+                   record_id
+               )"""
+        )
         conn.commit()
+
+    def _signals_for_record(self, context: RuntimeContext | None, record_id: str) -> list[str]:
+        scope = _scope_values(context)
+        rows = self._conn().execute(
+            f"SELECT signal_line FROM memory_signals WHERE {_SCOPE_PRED} AND record_id=?",
+            (*scope, record_id),
+        ).fetchall()
+        return [row["signal_line"] for row in rows]
+
+    def _ingest_signals(self, context: RuntimeContext | None, record_id: str, source_uri: str, text: str) -> None:
+        try:
+            lines = build_extracted_signal_lines(source_uri, [record_id], text)
+        except Exception:
+            return
+        scope = _scope_values(context)
+        conn = self._conn()
+        try:
+            conn.execute(
+                f"DELETE FROM memory_signals WHERE {_SCOPE_PRED} AND record_id=?",
+                (*scope, record_id),
+            )
+            conn.executemany(
+                """INSERT INTO memory_signals (
+                    scope_mode, scope_org_id, scope_workspace_id, scope_project_id,
+                    scope_agent_profile_id, scope_conversation_id, scope_user_id,
+                    record_id, signal_line
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [(*scope, record_id, line) for line in lines],
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            return
 
     def _run_postgres_write(self, sql: str, params: tuple[Any, ...]) -> Mapping[str, Any] | None:
         conn = self._pg_conn()
@@ -456,6 +510,7 @@ class RelationalMemoryRecordBackend:
             ),
         )
         conn.commit()
+        self._ingest_signals(context, rid, source_uri, text)
         return MemoryRecord(
             id=rid,
             text=text,

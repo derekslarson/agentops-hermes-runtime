@@ -1291,3 +1291,145 @@ def test_compute_pg_embedding_empty_embedder_return_fails_safely(monkeypatch):
     assert exc_info.value.__cause__ is None
     assert "list index out of range" not in str(exc_info.value)
     assert "IndexError" not in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# M5B — extracted-signal ingest (thirteenth slice)
+# ---------------------------------------------------------------------------
+
+
+def test_upsert_ingests_extracted_signals(backend):
+    """upsert_record must populate memory_signals for the stored record."""
+    record = backend.upsert_record(
+        _CTX_A,
+        text="fixed the authentication bug in login flow",
+        record_id="mem_sig_001",
+        source_uri="https://example.com/doc",
+    )
+    signals = backend._signals_for_record(_CTX_A, record.id)
+    assert isinstance(signals, list)
+    assert len(signals) >= 1
+
+
+def test_signals_are_scope_isolated(backend):
+    """Signals ingested under CTX_A must not be visible under CTX_B."""
+    backend.upsert_record(
+        _CTX_A,
+        text="fixed the authentication bug in login flow",
+        record_id="mem_sig_scope",
+        source_uri="https://example.com/doc",
+    )
+    signals_a = backend._signals_for_record(_CTX_A, "mem_sig_scope")
+    signals_b = backend._signals_for_record(_CTX_B, "mem_sig_scope")
+    assert len(signals_a) >= 1
+    assert signals_b == []
+
+
+def test_reupsert_replaces_signals_not_appends(backend):
+    """Re-upsert must replace signals, not accumulate them."""
+    backend.upsert_record(
+        _CTX_A,
+        text="fixed the authentication bug in login flow",
+        record_id="mem_sig_replace",
+        source_uri="https://example.com/v1",
+    )
+    count_after_first = len(backend._signals_for_record(_CTX_A, "mem_sig_replace"))
+
+    backend.upsert_record(
+        _CTX_A,
+        text="fixed the authentication bug in login flow",
+        record_id="mem_sig_replace",
+        source_uri="https://example.com/v2",
+    )
+    count_after_second = len(backend._signals_for_record(_CTX_A, "mem_sig_replace"))
+
+    assert count_after_second == count_after_first, (
+        f"Re-upsert accumulated signals: first={count_after_first}, second={count_after_second}"
+    )
+
+
+def test_signal_ingest_does_not_change_record_get_or_search(backend):
+    """Signal ingest side effect must not break get_record or search."""
+    record = backend.upsert_record(
+        _CTX_A,
+        text="fixed the authentication bug in login flow",
+        record_id="mem_sig_nobreak",
+        source_uri="https://example.com/doc",
+    )
+    fetched = backend.get_record(_CTX_A, record.id)
+    assert fetched is not None
+    assert fetched.id == record.id
+    assert fetched.text == record.text
+
+    results = backend.search(_CTX_A, "authentication bug")
+    assert any(r.id == record.id for r in results)
+
+
+def test_signal_build_failure_does_not_break_record_upsert(backend, monkeypatch):
+    """If build_extracted_signal_lines raises, upsert_record must still succeed."""
+    import agentops_runtime.memory_record_store as mod
+
+    def _failing_build(*_args, **_kwargs):
+        raise RuntimeError("synthetic signal build failure")
+
+    monkeypatch.setattr(mod, "build_extracted_signal_lines", _failing_build, raising=False)
+
+    record = backend.upsert_record(
+        _CTX_A,
+        text="should still store even if signals fail",
+        record_id="mem_sig_fail",
+    )
+    assert record.id == "mem_sig_fail"
+    fetched = backend.get_record(_CTX_A, "mem_sig_fail")
+    assert fetched is not None
+    assert fetched.text == "should still store even if signals fail"
+
+
+def test_sidecar_insert_failure_rollbacks_and_preserves_prior_signals(backend, monkeypatch):
+    """Failed sidecar INSERT must rollback (not leave stale DELETE) and preserve prior signals.
+
+    Regression: _ingest_signals() swallowed sidecar DB write failures without rolling back.
+    A DELETE+failed-INSERT left the connection in an open transaction; a later primary
+    commit would silently commit the stale DELETE, wiping signals.
+    """
+    import agentops_runtime.memory_record_store as mod
+
+    # First upsert: creates primary record and signals
+    backend.upsert_record(
+        _CTX_A,
+        text="original signal content",
+        record_id="mem_sig_rollback",
+        source_uri="https://example.com/v1",
+    )
+    signals_before = backend._signals_for_record(_CTX_A, "mem_sig_rollback")
+    assert len(signals_before) >= 1, "first upsert must create at least one signal"
+
+    # Patch build_extracted_signal_lines to return [None] — None violates signal_line TEXT NOT NULL
+    monkeypatch.setattr(mod, "build_extracted_signal_lines", lambda *_a, **_kw: [None], raising=False)
+
+    # Second upsert: primary record update succeeds; sidecar INSERT fails after DELETE
+    backend.upsert_record(
+        _CTX_A,
+        text="updated signal content",
+        record_id="mem_sig_rollback",
+        source_uri="https://example.com/v2",
+    )
+
+    # Primary record must be updated successfully
+    fetched = backend.get_record(_CTX_A, "mem_sig_rollback")
+    assert fetched is not None
+    assert fetched.text == "updated signal content"
+
+    # Connection must not be left in an open transaction after failed sidecar ingest
+    assert not backend._conn().in_transaction, (
+        "SQLite connection must not be in_transaction after failed sidecar ingest"
+    )
+
+    # Prior signals must be preserved — the stale DELETE must have been rolled back
+    signals_after = backend._signals_for_record(_CTX_A, "mem_sig_rollback")
+    assert len(signals_after) >= 1, (
+        f"prior signals must remain after failed sidecar replacement, got {signals_after}"
+    )
+    assert signals_after == signals_before, (
+        f"signals must be unchanged: before={signals_before}, after={signals_after}"
+    )
