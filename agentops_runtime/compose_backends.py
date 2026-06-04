@@ -33,6 +33,7 @@ from agent.runtime_artifacts_audit import (
 from agent.runtime_backends import BackendCapability, REQUIRED_CAPABILITIES, RuntimeBackendRegistry
 from agent.runtime_conversation_router_http import register_http_conversation_router_backend
 from agent.runtime_cron_http import register_http_cron_backend
+from agent.runtime_delivery_http import register_http_delivery_backend
 from agent.runtime_memory_http import register_http_memory_backend
 from agent.runtime_memory_record_http import register_http_memory_record_backend
 from agent.runtime_run_lease_http import register_http_run_lease_backend
@@ -52,6 +53,7 @@ _CAPABILITY_URL_ENV: dict[BackendCapability, str] = {
     BackendCapability.RUN_LEASE: "AGENTOPS_RUN_LEASE_URL",
     BackendCapability.WORKER_REGISTRY: "AGENTOPS_WORKER_REGISTRY_URL",
     BackendCapability.SESSION: "AGENTOPS_SESSION_URL",
+    BackendCapability.DELIVERY: "AGENTOPS_DELIVERY_URL",
 }
 _CAPABILITY_CONFIG_KEY: dict[BackendCapability, str] = {
     BackendCapability.MEMORY: "memory_url",
@@ -63,6 +65,7 @@ _CAPABILITY_CONFIG_KEY: dict[BackendCapability, str] = {
     BackendCapability.RUN_LEASE: "run_lease_url",
     BackendCapability.WORKER_REGISTRY: "worker_registry_url",
     BackendCapability.SESSION: "session_url",
+    BackendCapability.DELIVERY: "delivery_url",
 }
 
 
@@ -107,6 +110,7 @@ def configure_compose_runtime_backends(
     register_http_run_lease_backend(registry, profile)
     register_http_worker_registry_backend(registry, profile)
     register_http_session_backend(registry, profile)
+    register_http_delivery_backend(registry, profile)
 
 
 def _agentops_config(config: Mapping[str, Any] | None) -> Mapping[str, Any]:

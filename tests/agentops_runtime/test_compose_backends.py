@@ -9,6 +9,7 @@ from agent.runtime_backends import BackendCapability, LocalWorkerRegistry, Runti
 from agent.runtime_context import RuntimeContext
 from agent.runtime_conversation_router_http import HttpConversationRouter
 from agent.runtime_cron_http import HttpCronBackend
+from agent.runtime_delivery_http import HttpDeliveryBackend
 from agent.runtime_memory_http import HttpMemoryBackend
 from agent.runtime_memory_record_http import HttpMemoryRecordBackend
 from agent.runtime_run_lease_http import HttpRunLeaseBackend
@@ -39,6 +40,7 @@ def test_registers_http_backends_for_each_capability():
     assert isinstance(registry.get(BackendCapability.RUN_LEASE, context), HttpRunLeaseBackend)
     assert isinstance(registry.get(BackendCapability.WORKER_REGISTRY, context), HttpWorkerRegistry)
     assert isinstance(registry.get(BackendCapability.SESSION, context), HttpSessionBackend)
+    assert isinstance(registry.get(BackendCapability.DELIVERY, context), HttpDeliveryBackend)
 
 
 def test_worker_registry_uses_compose_backend_for_supervisor_none_context():
@@ -178,6 +180,32 @@ def test_worker_registry_config_key_overrides_env():
 
     worker_opts = registry._capability_options(BackendCapability.WORKER_REGISTRY)
     assert worker_opts["base_url"] == "https://config-workers.internal"
+
+
+def test_delivery_url_env_overrides_api_url():
+    registry = RuntimeBackendRegistry()
+    configure_compose_runtime_backends(
+        registry,
+        environ={
+            "AGENTOPS_API_URL": "https://api.internal",
+            "AGENTOPS_DELIVERY_URL": "https://delivery.internal",
+        },
+    )
+
+    delivery_opts = registry._capability_options(BackendCapability.DELIVERY)
+    assert delivery_opts["base_url"] == "https://delivery.internal"
+
+
+def test_delivery_config_key_overrides_env():
+    registry = RuntimeBackendRegistry()
+    configure_compose_runtime_backends(
+        registry,
+        config={"agentops": {"delivery_url": "https://config-delivery.internal"}},
+        environ={"AGENTOPS_API_URL": "https://api.internal", "AGENTOPS_DELIVERY_URL": "https://env-delivery.internal"},
+    )
+
+    delivery_opts = registry._capability_options(BackendCapability.DELIVERY)
+    assert delivery_opts["base_url"] == "https://config-delivery.internal"
 
 
 def test_fails_closed_when_api_url_missing():
@@ -360,6 +388,7 @@ def test_app_and_integration_secrets_are_not_passed_into_options():
         BackendCapability.RUN_LEASE,
         BackendCapability.WORKER_REGISTRY,
         BackendCapability.SESSION,
+        BackendCapability.DELIVERY,
     ):
         options = registry._capability_options(capability)
         assert set(options) <= {"base_url", "token", "timeout"}
@@ -386,7 +415,7 @@ def test_compose_required_capabilities_equals_required_capabilities_plus_deep_me
     assert BackendCapability.DEEP_MEMORY in COMPOSE_REQUIRED_CAPABILITIES
 
 
-def test_missing_compose_capabilities_reports_five_durable_surfaces_after_partial_wiring():
+def test_missing_compose_capabilities_reports_four_durable_surfaces_after_partial_wiring():
     from agentops_runtime.compose_backends import missing_compose_capabilities
 
     registry = RuntimeBackendRegistry()
@@ -395,10 +424,8 @@ def test_missing_compose_capabilities_reports_five_durable_surfaces_after_partia
     )
     missing = missing_compose_capabilities(registry)
     missing_values = {cap.value for cap in missing}
-    assert missing_values == {
-        "credential", "delivery", "queue",
-        "secret", "skill",
-    }
+    assert missing_values == {"credential", "queue", "secret", "skill"}
+    assert "delivery" not in missing_values
     assert "session" not in missing_values
     assert "conversation_router" not in missing_values
     assert "run_lease" not in missing_values
