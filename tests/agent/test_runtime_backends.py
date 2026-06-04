@@ -239,6 +239,38 @@ def test_per_capability_config_override_beats_context_profile():
     assert isinstance(registry.get(BackendCapability.SESSION, context), LocalSessionBackend)
 
 
+def test_set_capability_profile_selects_backend_without_context_and_invalidates_cache():
+    class FakeMemoryBackend(LocalMemoryBackend):
+        pass
+
+    registry = RuntimeBackendRegistry()
+    original = registry.get(BackendCapability.MEMORY, None)
+    registry.register(BackendCapability.MEMORY, lambda options: FakeMemoryBackend(), profile="fake")
+
+    registry.set_capability_profile(BackendCapability.MEMORY, "fake")
+    replacement = registry.get(BackendCapability.MEMORY, None)
+
+    assert isinstance(original, LocalMemoryBackend)
+    assert isinstance(replacement, FakeMemoryBackend)
+    assert replacement is not original
+
+
+def test_set_capability_profile_does_not_override_context_profile():
+    class FakeMemoryBackend(LocalMemoryBackend):
+        pass
+
+    registry = RuntimeBackendRegistry()
+    registry.register(BackendCapability.MEMORY, lambda options: FakeMemoryBackend(), profile="fake")
+    registry.set_capability_profile(BackendCapability.MEMORY, "fake")
+
+    context = RuntimeContext(mode="local", backend_profile="local")
+
+    selected = registry.get(BackendCapability.MEMORY, context)
+
+    assert isinstance(selected, LocalMemoryBackend)
+    assert not isinstance(selected, FakeMemoryBackend)
+
+
 def test_capability_options_are_passed_to_the_factory_without_context_binding():
     seen = {}
 

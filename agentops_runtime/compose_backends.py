@@ -1,7 +1,8 @@
 """Compose self-hosted runtime backend wiring (M12).
 
-Registers the existing provider-neutral HTTP adapters (memory, cron, artifact,
-audit, conversation router) for the ``compose-self-hosted`` deployment profile,
+Registers the existing provider-neutral HTTP adapters (curated memory,
+deep-memory records, cron, artifact, audit, conversation router, run leases,
+and worker registry) for the ``compose-self-hosted`` deployment profile,
 deriving connection
 settings from AgentOps compose env/config. The wiring is intentionally narrow:
 
@@ -35,6 +36,7 @@ from agent.runtime_cron_http import register_http_cron_backend
 from agent.runtime_memory_http import register_http_memory_backend
 from agent.runtime_memory_record_http import register_http_memory_record_backend
 from agent.runtime_run_lease_http import register_http_run_lease_backend
+from agent.runtime_worker_registry_http import register_http_worker_registry_backend
 
 _COMPOSE_PROFILE = "compose-self-hosted"
 _API_URL_ENV = "AGENTOPS_API_URL"
@@ -47,6 +49,7 @@ _CAPABILITY_URL_ENV: dict[BackendCapability, str] = {
     BackendCapability.AUDIT: "AGENTOPS_AUDIT_URL",
     BackendCapability.CONVERSATION_ROUTER: "AGENTOPS_CONVERSATION_ROUTER_URL",
     BackendCapability.RUN_LEASE: "AGENTOPS_RUN_LEASE_URL",
+    BackendCapability.WORKER_REGISTRY: "AGENTOPS_WORKER_REGISTRY_URL",
 }
 _CAPABILITY_CONFIG_KEY: dict[BackendCapability, str] = {
     BackendCapability.MEMORY: "memory_url",
@@ -56,6 +59,7 @@ _CAPABILITY_CONFIG_KEY: dict[BackendCapability, str] = {
     BackendCapability.AUDIT: "audit_url",
     BackendCapability.CONVERSATION_ROUTER: "conversation_router_url",
     BackendCapability.RUN_LEASE: "run_lease_url",
+    BackendCapability.WORKER_REGISTRY: "worker_registry_url",
 }
 
 
@@ -89,6 +93,7 @@ def configure_compose_runtime_backends(
 
     for capability, options in options_by_capability.items():
         registry.set_capability_options(capability, options, merge=False)
+        registry.set_capability_profile(capability, profile)
 
     register_http_memory_backend(registry, profile)
     register_http_memory_record_backend(registry, profile)
@@ -97,6 +102,7 @@ def configure_compose_runtime_backends(
     register_http_audit_backend(registry, profile=profile)
     register_http_conversation_router_backend(registry, profile)
     register_http_run_lease_backend(registry, profile)
+    register_http_worker_registry_backend(registry, profile)
 
 
 def _agentops_config(config: Mapping[str, Any] | None) -> Mapping[str, Any]:
@@ -127,8 +133,11 @@ def _resolve_url(
 
 def _resolve_token(agentops_cfg: Mapping[str, Any], env: Mapping[str, str]) -> str | None:
     for candidate in (agentops_cfg.get("runtime_token"), env.get(_TOKEN_ENV)):
-        if isinstance(candidate, str) and candidate.strip():
-            return candidate.strip()
+        if isinstance(candidate, str):
+            if any(ord(ch) <= 32 or ord(ch) == 127 for ch in candidate):
+                raise ValueError("compose backend token must not contain control characters")
+            if candidate.strip():
+                return candidate.strip()
     return None
 
 
@@ -136,11 +145,20 @@ def _validate_base_url(url: str) -> str:
     cleaned = (url or "").strip()
     if not cleaned:
         raise ValueError("compose backend wiring requires a control-plane base URL")
+    if any(ord(ch) <= 32 or ord(ch) == 127 for ch in cleaned):
+        raise ValueError("compose backend base URL must be an absolute http(s) URL")
     parsed = urllib.parse.urlparse(cleaned)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc or not parsed.hostname:
         raise ValueError("compose backend base URL must be an absolute http(s) URL")
     if "@" in parsed.netloc or parsed.username is not None or parsed.password is not None:
         raise ValueError("compose backend base URL must not contain credentials")
+    invalid_port = False
+    try:
+        parsed.port
+    except ValueError:
+        invalid_port = True
+    if invalid_port:
+        raise ValueError("compose backend base URL must be an absolute http(s) URL")
     if parsed.query or parsed.fragment:
         raise ValueError("compose backend base URL must not contain query or fragment")
     return cleaned.rstrip("/")

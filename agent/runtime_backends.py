@@ -1832,8 +1832,9 @@ class RuntimeBackendRegistry:
 
     1. ``config["backends"]["capabilities"][<capability>]`` — per-capability override
     2. ``RuntimeContext.backend_profile`` — the run's deployment profile
-    3. ``config["backends"]["default_profile"]`` — registry-wide default
-    4. ``"local"`` — built-in compatibility default
+    3. ``config["backends"]["capability_default_profiles"][<capability>]`` — per-capability default for missing context
+    4. ``config["backends"]["default_profile"]`` — registry-wide default
+    5. ``"local"`` — built-in compatibility default
 
     Each registry owns its own factory table and instance cache, so distinct
     registries never share mutable backend state.
@@ -1907,6 +1908,12 @@ class RuntimeBackendRegistry:
                 candidate = str(override)
         if candidate is None and context is not None and context.backend_profile:
             candidate = context.backend_profile
+        if candidate is None:
+            defaults = self._backends_config.get("capability_default_profiles")
+            if isinstance(defaults, Mapping):
+                default_profile = defaults.get(cap.value)
+                if default_profile:
+                    candidate = str(default_profile)
         if candidate is None:
             default = self._backends_config.get("default_profile")
             if default:
@@ -1986,6 +1993,23 @@ class RuntimeBackendRegistry:
             else:
                 all_options[cap.value] = new_options
             backends_config["options"] = all_options
+            self._backends_config = backends_config
+            for cache_key in [key for key in self._instances if key[0] == cap]:
+                self._instances.pop(cache_key, None)
+
+    def set_capability_profile(self, capability: BackendCapability | str, profile: str) -> None:
+        """Select ``profile`` for a capability when no context-specific profile is present."""
+
+        cap = _coerce_capability(capability)
+        cleaned = str(profile).strip()
+        if not cleaned:
+            raise ValueError("capability backend profile must be non-empty")
+        with self._lock:
+            backends_config = dict(self._backends_config)
+            existing = backends_config.get("capability_default_profiles")
+            defaults = dict(existing) if isinstance(existing, Mapping) else {}
+            defaults[cap.value] = cleaned
+            backends_config["capability_default_profiles"] = defaults
             self._backends_config = backends_config
             for cache_key in [key for key in self._instances if key[0] == cap]:
                 self._instances.pop(cache_key, None)
