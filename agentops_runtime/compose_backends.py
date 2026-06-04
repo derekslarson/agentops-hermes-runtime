@@ -36,6 +36,7 @@ from agent.runtime_cron_http import register_http_cron_backend
 from agent.runtime_delivery_http import register_http_delivery_backend
 from agent.runtime_memory_http import register_http_memory_backend
 from agent.runtime_memory_record_http import register_http_memory_record_backend
+from agent.runtime_queue_http import register_http_queue_backend
 from agent.runtime_run_lease_http import register_http_run_lease_backend
 from agent.runtime_session_http import register_http_session_backend
 from agent.runtime_worker_registry_http import register_http_worker_registry_backend
@@ -54,6 +55,7 @@ _CAPABILITY_URL_ENV: dict[BackendCapability, str] = {
     BackendCapability.WORKER_REGISTRY: "AGENTOPS_WORKER_REGISTRY_URL",
     BackendCapability.SESSION: "AGENTOPS_SESSION_URL",
     BackendCapability.DELIVERY: "AGENTOPS_DELIVERY_URL",
+    BackendCapability.QUEUE: "AGENTOPS_QUEUE_BACKEND_URL",
 }
 _CAPABILITY_CONFIG_KEY: dict[BackendCapability, str] = {
     BackendCapability.MEMORY: "memory_url",
@@ -66,6 +68,7 @@ _CAPABILITY_CONFIG_KEY: dict[BackendCapability, str] = {
     BackendCapability.WORKER_REGISTRY: "worker_registry_url",
     BackendCapability.SESSION: "session_url",
     BackendCapability.DELIVERY: "delivery_url",
+    BackendCapability.QUEUE: "queue_backend_url",
 }
 
 
@@ -111,6 +114,7 @@ def configure_compose_runtime_backends(
     register_http_worker_registry_backend(registry, profile)
     register_http_session_backend(registry, profile)
     register_http_delivery_backend(registry, profile)
+    register_http_queue_backend(registry, profile)
 
 
 def _agentops_config(config: Mapping[str, Any] | None) -> Mapping[str, Any]:
