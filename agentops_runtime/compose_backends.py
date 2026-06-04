@@ -32,6 +32,7 @@ from agent.runtime_artifacts_audit import (
 )
 from agent.runtime_backends import BackendCapability, REQUIRED_CAPABILITIES, RuntimeBackendRegistry
 from agent.runtime_conversation_router_http import register_http_conversation_router_backend
+from agent.runtime_credential_http import register_http_credential_backend
 from agent.runtime_cron_http import register_http_cron_backend
 from agent.runtime_delivery_http import register_http_delivery_backend
 from agent.runtime_memory_http import register_http_memory_backend
@@ -58,6 +59,7 @@ _CAPABILITY_URL_ENV: dict[BackendCapability, str] = {
     BackendCapability.DELIVERY: "AGENTOPS_DELIVERY_URL",
     BackendCapability.QUEUE: "AGENTOPS_QUEUE_BACKEND_URL",
     BackendCapability.SECRET: "AGENTOPS_SECRET_STORE_URL",
+    BackendCapability.CREDENTIAL: "AGENTOPS_CREDENTIAL_RESOLVER_URL",
 }
 _CAPABILITY_CONFIG_KEY: dict[BackendCapability, str] = {
     BackendCapability.MEMORY: "memory_url",
@@ -72,6 +74,7 @@ _CAPABILITY_CONFIG_KEY: dict[BackendCapability, str] = {
     BackendCapability.DELIVERY: "delivery_url",
     BackendCapability.QUEUE: "queue_backend_url",
     BackendCapability.SECRET: "secret_store_url",
+    BackendCapability.CREDENTIAL: "credential_resolver_url",
 }
 
 
@@ -119,6 +122,7 @@ def configure_compose_runtime_backends(
     register_http_delivery_backend(registry, profile)
     register_http_queue_backend(registry, profile)
     register_http_secret_backend(registry, profile)
+    register_http_credential_backend(registry, profile)
 
 
 def _agentops_config(config: Mapping[str, Any] | None) -> Mapping[str, Any]:
@@ -164,18 +168,19 @@ def _validate_base_url(url: str) -> str:
     cleaned = raw_url
     if not cleaned:
         raise ValueError("compose backend wiring requires a control-plane base URL")
-    parsed = urllib.parse.urlparse(cleaned)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc or not parsed.hostname:
+    invalid_url = False
+    try:
+        parsed = urllib.parse.urlparse(cleaned)
+        hostname = parsed.hostname
+        parsed.port
+    except ValueError:
+        invalid_url = True
+        parsed = urllib.parse.urlparse("http://invalid.local")
+        hostname = None
+    if invalid_url or parsed.scheme not in {"http", "https"} or not parsed.netloc or not hostname:
         raise ValueError("compose backend base URL must be an absolute http(s) URL")
     if "@" in parsed.netloc or parsed.username is not None or parsed.password is not None:
         raise ValueError("compose backend base URL must not contain credentials")
-    invalid_port = False
-    try:
-        parsed.port
-    except ValueError:
-        invalid_port = True
-    if invalid_port:
-        raise ValueError("compose backend base URL must be an absolute http(s) URL")
     if "?" in cleaned or "#" in cleaned:
         raise ValueError("compose backend base URL must not contain query or fragment")
     return cleaned.rstrip("/")

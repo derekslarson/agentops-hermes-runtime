@@ -8,6 +8,7 @@ from agent.runtime_artifacts_audit import HttpArtifactBackend, HttpAuditBackend
 from agent.runtime_backends import BackendCapability, LocalWorkerRegistry, RuntimeBackendRegistry
 from agent.runtime_context import RuntimeContext
 from agent.runtime_conversation_router_http import HttpConversationRouter
+from agent.runtime_credential_http import HttpCredentialResolver
 from agent.runtime_cron_http import HttpCronBackend
 from agent.runtime_delivery_http import HttpDeliveryBackend
 from agent.runtime_memory_http import HttpMemoryBackend
@@ -45,6 +46,7 @@ def test_registers_http_backends_for_each_capability():
     assert isinstance(registry.get(BackendCapability.DELIVERY, context), HttpDeliveryBackend)
     assert isinstance(registry.get(BackendCapability.QUEUE, context), HttpQueueBackend)
     assert isinstance(registry.get(BackendCapability.SECRET, context), HttpSecretStoreBackend)
+    assert isinstance(registry.get(BackendCapability.CREDENTIAL, context), HttpCredentialResolver)
 
 
 def test_worker_registry_uses_compose_backend_for_supervisor_none_context():
@@ -252,6 +254,32 @@ def test_agentops_queue_url_infra_dsn_ignored_for_http_adapter():
     assert queue_opts["base_url"] == "https://api.internal"
 
 
+def test_credential_resolver_url_env_overrides_api_url():
+    registry = RuntimeBackendRegistry()
+    configure_compose_runtime_backends(
+        registry,
+        environ={
+            "AGENTOPS_API_URL": "https://api.internal",
+            "AGENTOPS_CREDENTIAL_RESOLVER_URL": "https://credentials.internal",
+        },
+    )
+
+    credential_opts = registry._capability_options(BackendCapability.CREDENTIAL)
+    assert credential_opts["base_url"] == "https://credentials.internal"
+
+
+def test_credential_resolver_config_key_overrides_env():
+    registry = RuntimeBackendRegistry()
+    configure_compose_runtime_backends(
+        registry,
+        config={"agentops": {"credential_resolver_url": "https://config-credentials.internal"}},
+        environ={"AGENTOPS_API_URL": "https://api.internal", "AGENTOPS_CREDENTIAL_RESOLVER_URL": "https://env-credentials.internal"},
+    )
+
+    credential_opts = registry._capability_options(BackendCapability.CREDENTIAL)
+    assert credential_opts["base_url"] == "https://config-credentials.internal"
+
+
 def test_secret_store_url_env_overrides_api_url():
     registry = RuntimeBackendRegistry()
     configure_compose_runtime_backends(
@@ -319,6 +347,19 @@ def test_fails_closed_when_url_contains_invalid_port_without_retaining_raw_url()
         )
 
     assert "secret-port-sentinel" not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
+def test_fails_closed_when_url_contains_malformed_host_without_retaining_raw_url():
+    registry = RuntimeBackendRegistry()
+    with pytest.raises(ValueError) as exc_info:
+        configure_compose_runtime_backends(
+            registry, environ={"AGENTOPS_API_URL": "https://[api-host-sentinel]"}
+        )
+
+    text = str(exc_info.value)
+    assert "api-host-sentinel" not in text
     assert exc_info.value.__cause__ is None
     assert exc_info.value.__context__ is None
 
@@ -460,6 +501,7 @@ def test_app_and_integration_secrets_are_not_passed_into_options():
         BackendCapability.SESSION,
         BackendCapability.DELIVERY,
         BackendCapability.SECRET,
+        BackendCapability.CREDENTIAL,
     ):
         options = registry._capability_options(capability)
         assert set(options) <= {"base_url", "token", "timeout"}
@@ -486,7 +528,7 @@ def test_compose_required_capabilities_equals_required_capabilities_plus_deep_me
     assert BackendCapability.DEEP_MEMORY in COMPOSE_REQUIRED_CAPABILITIES
 
 
-def test_missing_compose_capabilities_reports_three_durable_surfaces_after_partial_wiring():
+def test_missing_compose_capabilities_reports_only_skill_after_partial_wiring():
     from agentops_runtime.compose_backends import missing_compose_capabilities
 
     registry = RuntimeBackendRegistry()
@@ -495,7 +537,8 @@ def test_missing_compose_capabilities_reports_three_durable_surfaces_after_parti
     )
     missing = missing_compose_capabilities(registry)
     missing_values = {cap.value for cap in missing}
-    assert missing_values == {"credential", "skill"}
+    assert missing_values == {"skill"}
+    assert "credential" not in missing_values
     assert "secret" not in missing_values
     assert "delivery" not in missing_values
     assert "session" not in missing_values
