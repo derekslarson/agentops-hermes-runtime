@@ -16,10 +16,12 @@ services:
       - AGENTOPS_ARTIFACT_ENDPOINT=http://minio:9000
       - AGENTOPS_ARTIFACT_BUCKET=${AGENTOPS_ARTIFACT_BUCKET:-agentops-artifacts}
       - AGENTOPS_ARTIFACT_ROOT=/var/lib/agentops/artifacts
+      - AGENTOPS_SESSION_DB_PATH=/var/lib/agentops/sessions/sessions.db
       - AGENTOPS_SECRET_STORE_URL=http://local-secrets:8713
       - AGENTOPS_API_URL=http://api:8710
     volumes:
       - agentops-artifacts:/var/lib/agentops/artifacts
+      - agentops-sessions:/var/lib/agentops/sessions
     depends_on:
       postgres:
         condition: service_healthy
@@ -181,3 +183,4 @@ volumes:
   agentops-redis:
   agentops-minio:
   agentops-artifacts:
+  agentops-sessions:

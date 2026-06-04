@@ -192,3 +192,23 @@ def test_compose_declares_artifact_volume():
     compose = _compose()
     assert "volumes" in compose
     assert "agentops-artifacts" in compose["volumes"]
+
+
+def test_api_service_has_session_db_path_env():
+    services = _compose()["services"]
+    api_env = "\n".join(services["api"]["environment"])
+    assert "AGENTOPS_SESSION_DB_PATH=/var/lib/agentops/sessions/sessions.db" in api_env
+
+
+def test_api_service_mounts_sessions_volume():
+    services = _compose()["services"]
+    api = services["api"]
+    assert "volumes" in api
+    volume_strings = [str(v) for v in api["volumes"]]
+    assert any("/var/lib/agentops/sessions" in v for v in volume_strings)
+
+
+def test_compose_declares_sessions_volume():
+    compose = _compose()
+    assert "volumes" in compose
+    assert "agentops-sessions" in compose["volumes"]

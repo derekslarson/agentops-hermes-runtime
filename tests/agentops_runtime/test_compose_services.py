@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import socket
 import sys
 import threading
 import urllib.error
@@ -1123,3 +1124,320 @@ def test_audit_log_message_redacts_raw_json_query_values():
     assert '"user"' not in rendered
     assert "/audit" in rendered
     assert "<redacted>" in rendered
+
+
+# ---------------------------------------------------------------------------
+# M12B: Sessions endpoint routing and backend
+# ---------------------------------------------------------------------------
+
+
+class _FakeSessionBackend:
+    def create_session(self, context, **kwargs):
+        return "test-session-id"
+
+    def append_message(self, context, message):
+        return 1
+
+    def read_messages(self, context, **kwargs):
+        return []
+
+    def search(self, context, query):
+        return []
+
+    def resolve_resume_session_id(self, session_id):
+        return session_id
+
+    def claim_turn_lock(self, context, **kwargs):
+        return True
+
+    def renew_turn_lock(self, context, **kwargs):
+        return True
+
+    def release_turn_lock(self, context, **kwargs):
+        pass
+
+
+_SESSION_CONTEXT = {
+    "mode": "agentops",
+    "org_id": "org1",
+    "workspace_id": "ws1",
+    "workspace_type": "team",
+    "user_id": "alice",
+    "conversation_id": "conv1",
+    "agent_profile_id": "bot",
+    "project_id": "proj1",
+}
+
+
+@pytest.fixture
+def _api_server_with_session():
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    server.session_backend = _FakeSessionBackend()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        yield base
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_api_service_routes_sessions_create(_api_server_with_session):
+    body = json.dumps({"context": _SESSION_CONTEXT}).encode()
+    status = _http_post(f"{_api_server_with_session}/sessions/create", body)
+    assert status == 200
+
+
+def test_api_service_routes_sessions_messages(_api_server_with_session):
+    body = json.dumps({"context": _SESSION_CONTEXT}).encode()
+    status = _http_post(f"{_api_server_with_session}/sessions/messages", body)
+    assert status == 200
+
+
+def test_api_service_routes_sessions_turn_lock_claim(_api_server_with_session):
+    body = json.dumps({
+        "context": _SESSION_CONTEXT,
+        "owner": "worker-1",
+        "ttl_seconds": 300,
+    }).encode()
+    status = _http_post(f"{_api_server_with_session}/sessions/turn-lock/claim", body)
+    assert status == 200
+
+
+@pytest.mark.parametrize("service_name", ["worker", "scheduler", "local-secrets"])
+def test_non_api_services_return_404_for_sessions_create(service_name):
+    server, thread = _make_non_api_server(service_name)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({"context": _SESSION_CONTEXT}).encode()
+        status = _http_post(f"{base}/sessions/create", body)
+        assert status == 404, f"{service_name} should return 404 for POST /sessions/create"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+@pytest.mark.parametrize("service_name", ["worker", "scheduler", "local-secrets"])
+def test_non_api_services_return_404_for_sessions_messages(service_name):
+    server, thread = _make_non_api_server(service_name)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({"context": _SESSION_CONTEXT}).encode()
+        status = _http_post(f"{base}/sessions/messages", body)
+        assert status == 404, f"{service_name} should return 404 for POST /sessions/messages"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_make_session_backend_fails_closed_when_unconfigured():
+    with pytest.raises(ValueError, match="AGENTOPS_SESSION_DB_PATH"):
+        compose_services._make_session_backend({})
+
+
+def test_make_session_backend_returns_backend_with_valid_path(tmp_path):
+    from agent.runtime_sessions import LocalSQLiteSessionBackend
+    db_path = str(tmp_path / "sessions.db")
+    backend = compose_services._make_session_backend({
+        "AGENTOPS_SESSION_DB_PATH": db_path,
+    })
+    assert isinstance(backend, LocalSQLiteSessionBackend)
+
+
+def test_get_or_create_session_backend_fails_closed_when_unconfigured(monkeypatch):
+    monkeypatch.setattr(compose_services, "_session_backend_instance", None)
+    monkeypatch.setattr(compose_services.os, "environ", {})
+    with pytest.raises(ValueError, match="AGENTOPS_SESSION_DB_PATH"):
+        compose_services._get_or_create_session_backend()
+
+
+def test_session_dispatch_returns_503_on_backend_failure(monkeypatch):
+    def _raise():
+        raise ValueError("LEAKSENTINEL session backend failure password=x")
+
+    monkeypatch.setattr(compose_services, "_get_or_create_session_backend", _raise)
+
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({"context": _SESSION_CONTEXT}).encode()
+        req = urllib.request.Request(f"{base}/sessions/create", data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Content-Length", str(len(body)))
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                status = r.status
+                response_body = r.read()
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            response_body = exc.read()
+        assert status == 503
+        response_text = response_body.decode("utf-8")
+        assert "LEAKSENTINEL" not in response_text
+        assert "password=x" not in response_text
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_session_dispatch_returns_401_before_backend_setup_when_token_missing(monkeypatch):
+    calls = []
+
+    def _raise():
+        calls.append("called")
+        raise ValueError("LEAKSENTINEL session backend failure password=x")
+
+    monkeypatch.setenv("AGENTOPS_RUNTIME_TOKEN", "expected-token")
+    monkeypatch.setattr(compose_services, "_get_or_create_session_backend", _raise)
+
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({"context": _SESSION_CONTEXT}).encode()
+        req = urllib.request.Request(f"{base}/sessions/create", data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Content-Length", str(len(body)))
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                status = r.status
+                response_body = r.read()
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            response_body = exc.read()
+        assert status == 401
+        assert calls == []
+        response_text = response_body.decode("utf-8")
+        assert "LEAKSENTINEL" not in response_text
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_session_dispatch_rejects_oversized_body_before_backend_setup(monkeypatch):
+    calls = []
+
+    def _raise():
+        calls.append("called")
+        raise ValueError("LEAKSENTINEL session backend failure password=x")
+
+    monkeypatch.setattr(compose_services, "_get_or_create_session_backend", _raise)
+
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with socket.create_connection(("127.0.0.1", server.server_port), timeout=5) as sock:
+            request = (
+                "POST /sessions/create HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{server.server_port}\r\n"
+                "Content-Type: application/json\r\n"
+                f"Content-Length: {compose_services._MAX_SESSION_REQUEST_BODY_BYTES + 1}\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+            ).encode("ascii")
+            sock.sendall(request)
+            response_body = sock.recv(4096).decode("utf-8", errors="replace")
+        assert "413" in response_body
+        assert calls == []
+        assert "LEAKSENTINEL" not in response_body
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_session_dispatch_rejects_negative_content_length_before_read(monkeypatch):
+    calls = []
+
+    def _raise():
+        calls.append("called")
+        raise ValueError("LEAKSENTINEL session backend failure password=x")
+
+    monkeypatch.setattr(compose_services, "_get_or_create_session_backend", _raise)
+
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with socket.create_connection(("127.0.0.1", server.server_port), timeout=5) as sock:
+            request = (
+                "POST /sessions/create HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{server.server_port}\r\n"
+                "Content-Type: application/json\r\n"
+                "Content-Length: -1\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+            ).encode("ascii")
+            sock.sendall(request)
+            response_body = sock.recv(4096).decode("utf-8", errors="replace")
+        assert "400" in response_body
+        assert calls == []
+        assert "LEAKSENTINEL" not in response_body
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_sessions_prefix_overmatch_returns_404_without_backend_setup(monkeypatch):
+    calls = []
+
+    def _raise():
+        calls.append("called")
+        raise ValueError("LEAKSENTINEL session backend failure password=x")
+
+    monkeypatch.setattr(compose_services, "_get_or_create_session_backend", _raise)
+
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        status = _http_post(f"{base}/sessionsXYZ", b"{}")
+        assert status == 404
+        assert calls == []
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_sessions_log_message_redacts_session_id_in_resume_target_path():
+    rendered = compose_services._sanitize_log_message(
+        '"POST /sessions/LEAKSENTINEL-session-id/resume-target HTTP/1.1" 200 -'
+    )
+    assert "LEAKSENTINEL-session-id" not in rendered
+    assert "/sessions/" in rendered
+    assert "<redacted>" in rendered
+
+
+def test_sessions_log_message_redacts_query_values():
+    rendered = compose_services._sanitize_log_message(
+        '"POST /sessions/create?debug=LEAKSENTINEL HTTP/1.1" 400 -'
+    )
+    assert "LEAKSENTINEL" not in rendered
+    assert "/sessions/create" in rendered
+    assert "<redacted>" in rendered
+
+
+def test_sessions_log_message_keeps_static_path_segments_unredacted():
+    rendered = compose_services._sanitize_log_message(
+        '"POST /sessions/turn-lock/claim HTTP/1.1" 200 -'
+    )
+    assert "/sessions/turn-lock/claim" in rendered

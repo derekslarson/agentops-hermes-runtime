@@ -26,6 +26,8 @@ from agentops_runtime.compose_backends import (
     validate_compose_backend_registration,
 )
 
+_MAX_SESSION_REQUEST_BODY_BYTES = 1_048_576
+
 _SERVICE_PORTS = {
     "api": 8710,
     "worker": 8711,
@@ -139,6 +141,12 @@ class _Handler(BaseHTTPRequestHandler):
                 self.send_error(404)
                 return
             self._dispatch_audit("POST", parsed)
+            return
+        if parsed.path.startswith("/sessions/"):
+            if self.server.service_name != "api":  # type: ignore[attr-defined]
+                self.send_error(404)
+                return
+            self._dispatch_sessions("POST", parsed)
             return
         self.send_error(404)
 
@@ -279,6 +287,71 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _dispatch_sessions(self, method: str, parsed: urllib.parse.ParseResult) -> None:
+        from agentops_runtime.sessions_api import handle_session_request
+
+        token = os.getenv("AGENTOPS_RUNTIME_TOKEN") or None
+        auth_header = self.headers.get("Authorization")
+        if token and auth_header != f"Bearer {token}":
+            error_body = json.dumps({"error": "unauthorized"}).encode("utf-8")
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(error_body)))
+            self.end_headers()
+            self.wfile.write(error_body)
+            return
+
+        body_bytes = b""
+        if method == "POST":
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+            except ValueError:
+                self._send_json_error(400, "invalid content length")
+                return
+            if length < 0:
+                self._send_json_error(400, "invalid content length")
+                return
+            if length > _MAX_SESSION_REQUEST_BODY_BYTES:
+                self._send_json_error(413, "request body too large")
+                return
+            body_bytes = self.rfile.read(length)
+
+        try:
+            backend = getattr(self.server, "session_backend", None) or _get_or_create_session_backend()
+        except Exception:
+            error_body = json.dumps({"error": "session backend unavailable"}).encode("utf-8")
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(error_body)))
+            self.end_headers()
+            self.wfile.write(error_body)
+            return
+
+        status, response = handle_session_request(
+            method=method,
+            path=parsed.path,
+            query_string=parsed.query,
+            body_bytes=body_bytes,
+            auth_header=auth_header,
+            token=token,
+            backend=backend,
+        )
+
+        body = json.dumps(response).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_json_error(self, status: int, message: str) -> None:
+        body = json.dumps({"error": message}).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - stdlib signature
         rendered = _sanitize_log_message(format % args)
         print(f"{self.server.service_name}: " + rendered, file=sys.stderr)  # type: ignore[attr-defined]
@@ -289,6 +362,7 @@ class _Server(ThreadingHTTPServer):
     memory_backend: Any = None
     artifact_backend: Any = None
     audit_backend: Any = None
+    session_backend: Any = None
 
 
 _memory_backend_lock = threading.Lock()
@@ -300,16 +374,40 @@ _artifact_backend_instance: Any = None
 _audit_backend_lock = threading.Lock()
 _audit_backend_instance: Any = None
 
+_session_backend_lock = threading.Lock()
+_session_backend_instance: Any = None
+
+_SESSION_STATIC_PATH_SEGMENTS = frozenset({
+    "create", "append", "messages", "search", "turn-lock",
+})
+
 
 def _sanitize_log_message(message: str) -> str:
-    """Redact /memory/records query strings and /artifacts refs/query strings from access logs."""
+    """Redact sensitive path segments and query strings from access logs."""
 
     def _redact_artifact_path(match: re.Match[str]) -> str:
         query = "?<redacted>" if match.group(2) else ""
         return f"{match.group(1)}/<redacted>{query}"
 
+    def _redact_session_id_path(match: re.Match[str]) -> str:
+        segment = match.group(2)
+        if segment in _SESSION_STATIC_PATH_SEGMENTS:
+            return match.group(0)
+        rest = match.group(3) or ""
+        query = "?<redacted>" if match.group(4) else ""
+        return f"{match.group(1)}/<redacted>{rest}{query}"
+
     message = re.sub(r"(/artifacts)/[^\s?\"]+(\?[^\s\"]+)?", _redact_artifact_path, message)
-    return re.sub(r"(/(?:memory/records|artifacts|audit)[^\s?\"]*)\?[^\s]+", r"\1?<redacted>", message)
+    message = re.sub(
+        r"(/sessions)/([^/\s?\"]+)(/[^\s?\"]*)?(\?[^\s\"]+)?",
+        _redact_session_id_path,
+        message,
+    )
+    return re.sub(
+        r"(/(?:memory/records|artifacts|audit|sessions)[^\s?\"]*)\?[^\s]+",
+        r"\1?<redacted>",
+        message,
+    )
 
 
 def _make_memory_backend(environ: dict[str, str]) -> Any:
@@ -397,6 +495,26 @@ def _get_or_create_audit_backend() -> Any:
         if _audit_backend_instance is None:
             _audit_backend_instance = _make_audit_backend(dict(os.environ))
         return _audit_backend_instance
+
+
+def _make_session_backend(environ: dict[str, str]) -> Any:
+    db_path = environ.get("AGENTOPS_SESSION_DB_PATH", "").strip()
+    if not db_path:
+        raise ValueError(
+            "compose session backend requires AGENTOPS_SESSION_DB_PATH; "
+            "no local fallback is provided for compose/cloud profiles"
+        )
+    from agent.runtime_sessions import LocalSQLiteSessionBackend
+
+    return LocalSQLiteSessionBackend(db_path=db_path)
+
+
+def _get_or_create_session_backend() -> Any:
+    global _session_backend_instance
+    with _session_backend_lock:
+        if _session_backend_instance is None:
+            _session_backend_instance = _make_session_backend(dict(os.environ))
+        return _session_backend_instance
 
 
 def main(argv: list[str] | None = None) -> int:
