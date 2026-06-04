@@ -1589,3 +1589,184 @@ def test_signal_boost_is_scope_isolated(backend):
     assert r.matched_via == "bm25", (
         f"cross-scope signals must not boost CTX_A results, got matched_via={r.matched_via!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# M5B — Postgres memory_signals schema + best-effort ingest (fifteenth slice)
+# ---------------------------------------------------------------------------
+
+
+def test_postgres_schema_sql_has_memory_signals_table():
+    sql = _schema_sql().lower()
+    assert "create table if not exists memory_signals" in sql
+    for col in _scope_cols():
+        assert col in sql
+    assert "signal_line text not null" in sql
+
+
+def test_postgres_schema_sql_has_memory_signals_scope_record_index():
+    sql = _single_spaced(_schema_sql())
+    scope = ", ".join(_scope_cols())
+    assert f"on memory_signals ({scope}, record_id)" in sql
+
+
+class _FailingSignalInsertCursor:
+    def __init__(self, connection):
+        self.connection = connection
+        self._fetchone_val = None
+        self.description = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc_info):
+        return False
+
+    def execute(self, sql, params=None):
+        self.connection.executed.append((sql, params))
+        lowered = sql.lower().strip()
+        if "insert into memory_signals" in lowered:
+            raise RuntimeError("synthetic signal insert failure")
+        if "on conflict" in lowered and "returning" in lowered:
+            self._fetchone_val = self.connection.upsert_row
+            self.description = [(col,) for col in _PG_ROW_COLUMNS]
+
+    def fetchone(self):
+        return self._fetchone_val
+
+    def fetchall(self):
+        return []
+
+
+class _FailingSignalInsertConnection:
+    def __init__(self, upsert_row):
+        self.executed = []
+        self.commits = 0
+        self.rollbacks = 0
+        self.upsert_row = upsert_row
+
+    def cursor(self):
+        return _FailingSignalInsertCursor(self)
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
+
+
+def test_postgres_upsert_ingests_signals_after_primary_write(monkeypatch):
+    import agentops_runtime.memory_record_store as mod
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    connection = _FakePostgresConnection()
+    _install_fake_psycopg2(monkeypatch, connection)
+    connection.upsert_row = _pg_row(record_id="mem_pg_sig_001")
+    monkeypatch.setattr(mod, "build_extracted_signal_lines",
+                        lambda *_a, **_kw: ["ingest signal"], raising=False)
+
+    backend = RelationalMemoryRecordBackend(
+        "postgresql://user:pass@db.example/deepmem",
+        embed_fn=_make_fake_embed_fn(),
+    )
+    backend.upsert_record(_CTX_A, text="signal ingest test", record_id="mem_pg_sig_001",
+                          source_uri="https://example.com/doc")
+
+    executed_sqls = [sql for sql, _ in connection.executed]
+    upsert_idx = next((i for i, sql in enumerate(executed_sqls) if "ON CONFLICT" in sql), None)
+    delete_idx = next(
+        (i for i, sql in enumerate(executed_sqls)
+         if "memory_signals" in sql.lower() and "delete" in sql.lower()),
+        None,
+    )
+    assert upsert_idx is not None, "Expected primary upsert SQL"
+    assert delete_idx is not None, "Expected DELETE from memory_signals"
+    assert upsert_idx < delete_idx, "Primary upsert must precede signal ingest"
+    signal_sqls = [sql for sql in executed_sqls if "memory_signals" in sql.lower()]
+    assert any("delete" in sql.lower() for sql in signal_sqls)
+    assert any("insert" in sql.lower() for sql in signal_sqls)
+
+
+def test_postgres_signal_ingest_uses_bound_params_not_interpolation(monkeypatch):
+    import agentops_runtime.memory_record_store as mod
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    connection = _FakePostgresConnection()
+    _install_fake_psycopg2(monkeypatch, connection)
+    connection.upsert_row = _pg_row(record_id="mem_pg_sig_params")
+    monkeypatch.setattr(mod, "build_extracted_signal_lines",
+                        lambda *_a, **_kw: ["bound signal"], raising=False)
+
+    backend = RelationalMemoryRecordBackend(
+        "postgresql://user:pass@db.example/deepmem",
+        embed_fn=_make_fake_embed_fn(),
+    )
+    backend.upsert_record(_CTX_A, text="bound params test",
+                          record_id="mem_pg_sig_params",
+                          source_uri="https://example.com/doc")
+
+    delete_calls = [(sql, params) for sql, params in connection.executed
+                    if "memory_signals" in sql.lower() and sql.lower().strip().startswith("delete")]
+    insert_calls = [(sql, params) for sql, params in connection.executed
+                    if "memory_signals" in sql.lower() and sql.lower().strip().startswith("insert")]
+
+    assert delete_calls, "Expected DELETE from memory_signals"
+    _, delete_params = delete_calls[0]
+    assert delete_params is not None
+    assert len(delete_params) == 8  # 7 scope + record_id
+    assert delete_params[:7] == _scope_values_for_test(_CTX_A)
+    assert delete_params[7] == "mem_pg_sig_params"
+
+    assert insert_calls, "Expected INSERT into memory_signals"
+    _, insert_params = insert_calls[0]
+    assert insert_params is not None
+    assert len(insert_params) == 9  # 7 scope + record_id + signal_line
+    assert insert_params[:7] == _scope_values_for_test(_CTX_A)
+    assert insert_params[7] == "mem_pg_sig_params"
+    assert insert_params[8] == "bound signal"
+
+
+def test_postgres_reupsert_replaces_signals_not_appends(monkeypatch):
+    import agentops_runtime.memory_record_store as mod
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    connection = _FakePostgresConnection()
+    _install_fake_psycopg2(monkeypatch, connection)
+    connection.upsert_row = _pg_row(record_id="mem_pg_sig_replace")
+    monkeypatch.setattr(mod, "build_extracted_signal_lines",
+                        lambda *_a, **_kw: ["replace signal"], raising=False)
+
+    backend = RelationalMemoryRecordBackend(
+        "postgresql://user:pass@db.example/deepmem",
+        embed_fn=_make_fake_embed_fn(),
+    )
+    backend.upsert_record(_CTX_A, text="first content", record_id="mem_pg_sig_replace")
+    backend.upsert_record(_CTX_A, text="second content", record_id="mem_pg_sig_replace")
+
+    delete_calls = [sql for sql, _ in connection.executed
+                    if "memory_signals" in sql.lower() and "delete" in sql.lower()]
+    assert len(delete_calls) >= 2, (
+        f"Expected at least 2 DELETE calls (one per upsert), got {len(delete_calls)}"
+    )
+
+
+def test_postgres_sidecar_failure_preserves_primary_record_without_raising(monkeypatch):
+    import agentops_runtime.memory_record_store as mod
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    upsert_row = _pg_row(record_id="mem_pg_sidecar_fail", text="primary content")
+    conn = _FailingSignalInsertConnection(upsert_row)
+    monkeypatch.setitem(sys.modules, "psycopg2", _FakePsycopg2(conn))
+    monkeypatch.setattr(mod, "build_extracted_signal_lines",
+                        lambda *_a, **_kw: ["sidecar signal"], raising=False)
+
+    backend = RelationalMemoryRecordBackend(
+        "postgresql://user:pass@db.example/deepmem",
+        embed_fn=_make_fake_embed_fn(),
+    )
+    record = backend.upsert_record(_CTX_A, text="primary content",
+                                   record_id="mem_pg_sidecar_fail",
+                                   source_uri="https://example.com/doc")
+    assert record is not None
+    assert record.id == "mem_pg_sidecar_fail"
+    assert conn.rollbacks >= 1, "Expected rollback after sidecar INSERT failure"

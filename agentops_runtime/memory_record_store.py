@@ -383,6 +383,36 @@ class RelationalMemoryRecordBackend:
             conn.rollback()
             return
 
+    def _pg_ingest_signals(self, context: RuntimeContext | None, record_id: str, source_uri: str, text: str) -> None:
+        try:
+            lines = build_extracted_signal_lines(source_uri, [record_id], text)
+        except Exception:
+            return
+        scope = _scope_values(context)
+        conn = self._pg_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM memory_signals WHERE "
+                    "scope_mode=%s AND scope_org_id=%s AND scope_workspace_id=%s AND "
+                    "scope_project_id=%s AND scope_agent_profile_id=%s AND "
+                    "scope_conversation_id=%s AND scope_user_id=%s AND record_id=%s",
+                    (*scope, record_id),
+                )
+                for line in lines:
+                    cur.execute(
+                        "INSERT INTO memory_signals ("
+                        "scope_mode, scope_org_id, scope_workspace_id, scope_project_id, "
+                        "scope_agent_profile_id, scope_conversation_id, scope_user_id, "
+                        "record_id, signal_line"
+                        ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                        (*scope, record_id, line),
+                    )
+            conn.commit()
+        except Exception:
+            _safe_rollback(conn)
+            return
+
     def _run_postgres_write(self, sql: str, params: tuple[Any, ...]) -> Mapping[str, Any] | None:
         conn = self._pg_conn()
         try:
@@ -471,6 +501,7 @@ class RelationalMemoryRecordBackend:
                 self._compute_pg_embedding(text),
             ),
         )
+        self._pg_ingest_signals(context, rid, source_uri, text)
         if stored_row:
             return _dict_to_record(stored_row)
         return MemoryRecord(
@@ -790,6 +821,15 @@ CREATE INDEX IF NOT EXISTS memory_records_provenance_gin_idx
 
 CREATE INDEX IF NOT EXISTS memory_records_scope_idx
     ON memory_records ({", ".join(_PG_SCOPE_COLS)});
+
+CREATE TABLE IF NOT EXISTS memory_signals (
+    {scope_col_defs}
+    record_id TEXT NOT NULL,
+    signal_line TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS memory_signals_scope_record_idx
+    ON memory_signals ({", ".join(_PG_SCOPE_COLS)}, record_id);
 """
 
 
