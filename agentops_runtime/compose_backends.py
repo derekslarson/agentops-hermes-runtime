@@ -36,6 +36,7 @@ from agent.runtime_cron_http import register_http_cron_backend
 from agent.runtime_memory_http import register_http_memory_backend
 from agent.runtime_memory_record_http import register_http_memory_record_backend
 from agent.runtime_run_lease_http import register_http_run_lease_backend
+from agent.runtime_session_http import register_http_session_backend
 from agent.runtime_worker_registry_http import register_http_worker_registry_backend
 
 _COMPOSE_PROFILE = "compose-self-hosted"
@@ -50,6 +51,7 @@ _CAPABILITY_URL_ENV: dict[BackendCapability, str] = {
     BackendCapability.CONVERSATION_ROUTER: "AGENTOPS_CONVERSATION_ROUTER_URL",
     BackendCapability.RUN_LEASE: "AGENTOPS_RUN_LEASE_URL",
     BackendCapability.WORKER_REGISTRY: "AGENTOPS_WORKER_REGISTRY_URL",
+    BackendCapability.SESSION: "AGENTOPS_SESSION_URL",
 }
 _CAPABILITY_CONFIG_KEY: dict[BackendCapability, str] = {
     BackendCapability.MEMORY: "memory_url",
@@ -60,6 +62,7 @@ _CAPABILITY_CONFIG_KEY: dict[BackendCapability, str] = {
     BackendCapability.CONVERSATION_ROUTER: "conversation_router_url",
     BackendCapability.RUN_LEASE: "run_lease_url",
     BackendCapability.WORKER_REGISTRY: "worker_registry_url",
+    BackendCapability.SESSION: "session_url",
 }
 
 
@@ -103,6 +106,7 @@ def configure_compose_runtime_backends(
     register_http_conversation_router_backend(registry, profile)
     register_http_run_lease_backend(registry, profile)
     register_http_worker_registry_backend(registry, profile)
+    register_http_session_backend(registry, profile)
 
 
 def _agentops_config(config: Mapping[str, Any] | None) -> Mapping[str, Any]:
@@ -142,11 +146,12 @@ def _resolve_token(agentops_cfg: Mapping[str, Any], env: Mapping[str, str]) -> s
 
 
 def _validate_base_url(url: str) -> str:
-    cleaned = (url or "").strip()
+    raw_url = url or ""
+    if raw_url != raw_url.strip() or any(ord(ch) <= 32 or ord(ch) == 127 for ch in raw_url):
+        raise ValueError("compose backend base URL must be an absolute http(s) URL")
+    cleaned = raw_url
     if not cleaned:
         raise ValueError("compose backend wiring requires a control-plane base URL")
-    if any(ord(ch) <= 32 or ord(ch) == 127 for ch in cleaned):
-        raise ValueError("compose backend base URL must be an absolute http(s) URL")
     parsed = urllib.parse.urlparse(cleaned)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc or not parsed.hostname:
         raise ValueError("compose backend base URL must be an absolute http(s) URL")
@@ -159,7 +164,7 @@ def _validate_base_url(url: str) -> str:
         invalid_port = True
     if invalid_port:
         raise ValueError("compose backend base URL must be an absolute http(s) URL")
-    if parsed.query or parsed.fragment:
+    if "?" in cleaned or "#" in cleaned:
         raise ValueError("compose backend base URL must not contain query or fragment")
     return cleaned.rstrip("/")
 

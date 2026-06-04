@@ -12,6 +12,7 @@ from agent.runtime_cron_http import HttpCronBackend
 from agent.runtime_memory_http import HttpMemoryBackend
 from agent.runtime_memory_record_http import HttpMemoryRecordBackend
 from agent.runtime_run_lease_http import HttpRunLeaseBackend
+from agent.runtime_session_http import HttpSessionBackend
 from agent.runtime_worker_registry_http import HttpWorkerRegistry
 from agentops_runtime.compose_backends import configure_compose_runtime_backends
 
@@ -37,6 +38,7 @@ def test_registers_http_backends_for_each_capability():
     assert isinstance(registry.get(BackendCapability.CONVERSATION_ROUTER, context), HttpConversationRouter)
     assert isinstance(registry.get(BackendCapability.RUN_LEASE, context), HttpRunLeaseBackend)
     assert isinstance(registry.get(BackendCapability.WORKER_REGISTRY, context), HttpWorkerRegistry)
+    assert isinstance(registry.get(BackendCapability.SESSION, context), HttpSessionBackend)
 
 
 def test_worker_registry_uses_compose_backend_for_supervisor_none_context():
@@ -140,6 +142,32 @@ def test_worker_registry_url_env_overrides_api_url():
     assert worker_opts["base_url"] == "https://workers.internal"
 
 
+def test_session_url_env_overrides_api_url():
+    registry = RuntimeBackendRegistry()
+    configure_compose_runtime_backends(
+        registry,
+        environ={
+            "AGENTOPS_API_URL": "https://api.internal",
+            "AGENTOPS_SESSION_URL": "https://sessions.internal",
+        },
+    )
+
+    session_opts = registry._capability_options(BackendCapability.SESSION)
+    assert session_opts["base_url"] == "https://sessions.internal"
+
+
+def test_session_config_key_overrides_env():
+    registry = RuntimeBackendRegistry()
+    configure_compose_runtime_backends(
+        registry,
+        config={"agentops": {"session_url": "https://config-sessions.internal"}},
+        environ={"AGENTOPS_API_URL": "https://api.internal", "AGENTOPS_SESSION_URL": "https://env-sessions.internal"},
+    )
+
+    session_opts = registry._capability_options(BackendCapability.SESSION)
+    assert session_opts["base_url"] == "https://config-sessions.internal"
+
+
 def test_worker_registry_config_key_overrides_env():
     registry = RuntimeBackendRegistry()
     configure_compose_runtime_backends(
@@ -178,6 +206,13 @@ def test_fails_closed_when_url_contains_query_or_fragment():
         )
 
 
+@pytest.mark.parametrize("url", ["https://api.internal?", "https://api.internal#"])
+def test_fails_closed_when_url_contains_empty_query_or_fragment_delimiter(url):
+    registry = RuntimeBackendRegistry()
+    with pytest.raises(ValueError, match="query or fragment"):
+        configure_compose_runtime_backends(registry, environ={"AGENTOPS_API_URL": url})
+
+
 def test_fails_closed_when_url_contains_invalid_port_without_retaining_raw_url():
     registry = RuntimeBackendRegistry()
     with pytest.raises(ValueError) as exc_info:
@@ -210,6 +245,20 @@ def test_fails_closed_when_url_contains_del_control_without_retaining_raw_url():
         )
 
     assert "api\x7finternal" not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "url",
+    [" https://api.internal", "https://api.internal ", "\thttps://api.internal", "https://api.internal\n"],
+)
+def test_fails_closed_when_url_has_leading_or_trailing_whitespace_without_normalizing(url):
+    registry = RuntimeBackendRegistry()
+    with pytest.raises(ValueError) as exc_info:
+        configure_compose_runtime_backends(registry, environ={"AGENTOPS_API_URL": url})
+
+    assert "api.internal" not in str(exc_info.value)
     assert exc_info.value.__cause__ is None
     assert exc_info.value.__context__ is None
 
@@ -310,6 +359,7 @@ def test_app_and_integration_secrets_are_not_passed_into_options():
         BackendCapability.CONVERSATION_ROUTER,
         BackendCapability.RUN_LEASE,
         BackendCapability.WORKER_REGISTRY,
+        BackendCapability.SESSION,
     ):
         options = registry._capability_options(capability)
         assert set(options) <= {"base_url", "token", "timeout"}
@@ -336,7 +386,7 @@ def test_compose_required_capabilities_equals_required_capabilities_plus_deep_me
     assert BackendCapability.DEEP_MEMORY in COMPOSE_REQUIRED_CAPABILITIES
 
 
-def test_missing_compose_capabilities_reports_six_durable_surfaces_after_partial_wiring():
+def test_missing_compose_capabilities_reports_five_durable_surfaces_after_partial_wiring():
     from agentops_runtime.compose_backends import missing_compose_capabilities
 
     registry = RuntimeBackendRegistry()
@@ -347,8 +397,9 @@ def test_missing_compose_capabilities_reports_six_durable_surfaces_after_partial
     missing_values = {cap.value for cap in missing}
     assert missing_values == {
         "credential", "delivery", "queue",
-        "secret", "session", "skill",
+        "secret", "skill",
     }
+    assert "session" not in missing_values
     assert "conversation_router" not in missing_values
     assert "run_lease" not in missing_values
     assert "worker_registry" not in missing_values
@@ -382,7 +433,7 @@ def test_validate_compose_backend_registration_fails_closed_on_partial_registrat
     with pytest.raises(ValueError) as exc_info:
         validate_compose_backend_registration(registry)
     error_msg = str(exc_info.value)
-    assert "session" in error_msg
+    assert "skill" in error_msg
 
 
 def test_validate_compose_backend_registration_error_exposes_only_capability_names():
