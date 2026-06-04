@@ -1822,6 +1822,10 @@ class _FakePostgresCursorWithSignals:
             ]
             self._fetchone_val = None
             self.description = [(col,) for col in _PG_ROW_COLUMNS]
+        elif "ts_vec @@" in lowered and "from ranked" not in lowered and "memory_signals" not in lowered:
+            self._fetchall_val = list(self.connection.keyword_rows)
+            self._fetchone_val = None
+            self.description = [(col,) for col in _PG_ROW_COLUMNS]
         elif "from ranked" in lowered:
             self._fetchall_val = list(self.connection.search_rows)
             self._fetchone_val = None
@@ -1850,6 +1854,7 @@ class _FakePostgresConnectionWithSignals:
         self.rows_by_id = {}
         self.search_rows = []
         self.signal_rows = []
+        self.keyword_rows = []
         self.upsert_row = None
 
     def cursor(self):
@@ -2440,4 +2445,84 @@ def test_postgres_and_sqlite_agree_on_bm25_ordering(tmp_path, monkeypatch):
     assert len(pg_ids) == 2, f"Postgres must return both docs, got {pg_ids}"
     assert pg_ids == sqlite_ids[:2], (
         f"Postgres and SQLite must agree on BM25 order: SQLite={sqlite_ids}, Postgres={pg_ids}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# M5B — Postgres BM25 full-corpus exactness (twentieth slice)
+# ---------------------------------------------------------------------------
+
+
+def test_postgres_keyword_candidate_sql_has_no_limit():
+    """_postgres_keyword_candidates_sql must select keyword candidates without LIMIT.
+
+    The bounded _postgres_search_sql() applies LIMIT before Python BM25 runs.  Exact
+    keyword matches outside that window are truncated and never BM25-ranked.  The
+    new keyword candidates SQL must scan the full scoped corpus (no LIMIT) so exact
+    matches are always available for Python BM25 re-ranking.
+    """
+    from agentops_runtime.memory_record_store import _postgres_keyword_candidates_sql
+    import re as _re
+
+    sql = _postgres_keyword_candidates_sql()
+    lowered = _single_spaced(sql)
+
+    assert not _re.search(r"\blimit\s+%s", lowered), (
+        "keyword candidates SQL must not have a LIMIT %s clause"
+    )
+    for col in _scope_cols():
+        assert f"{col} = %s" in lowered, f"expected scope predicate {col!r} in keyword candidates SQL"
+    assert "ts_vec @@ websearch_to_tsquery('english', %s)" in lowered, (
+        "keyword candidates SQL must use ts_vec @@ websearch_to_tsquery('english', %s)"
+    )
+    assert "%s::jsonb is null" in lowered, "keyword candidates SQL must have nullable metadata filter"
+    assert "jsonb_each(%s::jsonb)" in lowered, "keyword candidates SQL must have jsonb_each metadata filter"
+
+
+def test_postgres_search_includes_keyword_match_truncated_outside_sql_ranked_window(monkeypatch):
+    """Postgres search must include exact keyword matches absent from the bounded SQL window.
+
+    Bug: _postgres_search_sql() applies LIMIT before Python BM25 runs.  When the SQL
+    window is filled with high-cosine-score but non-keyword-matching vector rows, an
+    exact keyword match outside the window is never seen by BM25 and never returned.
+
+    Fix: execute _postgres_keyword_candidates_sql() (unbounded) alongside the bounded
+    SQL and merge rows by record_id before BM25 scoring.
+    """
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+    import re as _re
+
+    conn = _FakePostgresConnectionWithSignals()
+    monkeypatch.setitem(sys.modules, "psycopg2", _FakePsycopg2(conn))
+
+    # Vector rows whose text does not keyword-match the query (BM25 = 0 for "exactkeyword")
+    conn.search_rows = [
+        _pg_row(record_id="mem_vec_unrelated_1", text="unrelated vector document alpha", score=0.95),
+        _pg_row(record_id="mem_vec_unrelated_2", text="unrelated vector document beta", score=0.90),
+    ]
+    # Exact keyword match that would be truncated by the bounded SQL LIMIT
+    conn.keyword_rows = [
+        _pg_row(record_id="mem_exact_keyword_match", text="exactkeyword hit document text", score=0.0),
+    ]
+
+    backend = RelationalMemoryRecordBackend(
+        "postgresql://user:pass@db.example/deepmem",
+        embed_fn=_make_fake_embed_fn(),
+    )
+    results = backend.search(_CTX_A, "exactkeyword", limit=1)
+
+    keyword_calls = [
+        (sql, params) for sql, params in conn.executed
+        if "ts_vec @@" in sql
+        and not _re.search(r"\bLIMIT\s+%s", sql)
+        and "memory_signals" not in sql.lower()
+    ]
+    assert keyword_calls, (
+        "Expected a keyword candidates SQL with ts_vec @@ and no LIMIT %s; "
+        f"executed SQLs: {[sql.strip()[:60] for sql, _ in conn.executed]}"
+    )
+
+    result_ids = [r.id for r in results]
+    assert "mem_exact_keyword_match" in result_ids, (
+        f"Exact keyword match outside bounded SQL window must appear in results, got {result_ids}"
     )

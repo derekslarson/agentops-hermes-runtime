@@ -77,12 +77,13 @@ Key properties (see `agent/local_memory/` and `agent/runtime_backends.py`):
     in-process fallback for AgentOps remote/managed profiles.
 
 **Open work (M5B not yet complete):** Full production vector embedding
-population (injecting a real `embed_fn` at runtime) and full-corpus BM25
-truncation exactness remain open. The Postgres adapter supports vector
-embedding via an injected `embed_fn=` and searches use Okapi BM25 + extracted-
-signal boost, but a production `embed_fn` is not yet wired into the
-compose/cloud startup path. Do not assume full end-to-end vector search parity
-in managed cloud profiles until that wiring lands.
+population remains open because a real `embed_fn` is not yet wired into the
+compose/cloud startup path. The Postgres adapter supports vector embedding via
+an injected `embed_fn=`, searches merge unbounded scoped keyword candidates
+before Okapi BM25 re-ranking to preserve full-corpus keyword exactness, and
+extracted-signal boosts apply after scope and metadata filtering. Do not assume
+full end-to-end vector search parity in managed cloud profiles until production
+`embed_fn` wiring lands.
 - **Imports** (`scripts/local_memory_import.py`) are idempotent and
   source-preserving, and **require an explicit target scope/profile**
   (`--storage-dir` or `--profile`/`--hermes-home`) so bulk history cannot

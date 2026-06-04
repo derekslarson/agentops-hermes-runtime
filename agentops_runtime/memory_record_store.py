@@ -749,6 +749,15 @@ class RelationalMemoryRecordBackend:
                     overfetch_limit,
                 ),
             )
+            keyword_rows = self._fetchall_postgres(
+                _postgres_keyword_candidates_sql(),
+                (*scope, filter_json, filter_json, ts_query),
+            )
+            existing_ids = {str(r["record_id"]) for r in rows}
+            for krow in keyword_rows:
+                if str(krow["record_id"]) not in existing_ids:
+                    rows.append(krow)
+                    existing_ids.add(str(krow["record_id"]))
             okapi_scores = _bm25_scores(query, [str(row["text"]) for row in rows])
             positive_candidate_ids = [
                 str(row["record_id"]) for row, bm25 in zip(rows, okapi_scores) if bm25 > 0
@@ -944,6 +953,40 @@ def _postgres_upsert_sql() -> str:
         f"        {update_set}\n"
         f"RETURNING {returning_cols};"
     )
+
+
+def _postgres_keyword_candidates_sql() -> str:
+    scope_filter = " AND ".join(f"{c} = %s" for c in _PG_SCOPE_COLS)
+    return f"""
+WITH scope_filtered AS (
+    SELECT *
+    FROM memory_records
+    WHERE {scope_filter}
+      AND (
+        %s::jsonb IS NULL
+        OR NOT EXISTS (
+            SELECT 1
+            FROM jsonb_each(%s::jsonb) AS filter(k, v)
+            WHERE NOT (metadata ? filter.k AND metadata -> filter.k = filter.v)
+        )
+      )
+)
+SELECT
+    record_id,
+    text,
+    text_hash,
+    metadata,
+    provenance,
+    source,
+    source_uri,
+    ts,
+    created_at,
+    updated_at,
+    record_kind,
+    parent_id
+FROM scope_filtered
+WHERE ts_vec @@ websearch_to_tsquery('english', %s)
+"""
 
 
 def _postgres_search_sql() -> str:
