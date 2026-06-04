@@ -9,9 +9,12 @@ no scoped path is bound (local single-user keeps its MemoryManager prefetch).
 """
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import tools.memory_record_tools as mrt
+from agent.agent_init import _bind_deep_memory_backend
 from agent.conversation_loop import apply_current_turn_user_injections
 from agent.memory_manager import build_memory_context_block
 from agent.runtime_backends import BackendCapability, RuntimeBackendRegistry
@@ -127,3 +130,104 @@ def test_scoped_hint_flows_into_api_copy_only(tmp_path):
     assert api_copy["content"] != persisted["content"]
     assert persisted["content"] == "Remind me about the rollout."
     mrt.clear_active_deep_memory_registry()
+
+
+# ── M5B: aws-managed prefetch wiring ─────────────────────────────────────────
+
+
+def _aws_ctx_pf(**overrides):
+    base = dict(
+        mode="agentops",
+        org_id="acme",
+        user_id="alice",
+        conversation_id="thread-1",
+        backend_profile="aws-managed",
+    )
+    base.update(overrides)
+    return RuntimeContext(**base)
+
+
+def _aws_agent(ctx):
+    return SimpleNamespace(
+        runtime_context=ctx,
+        tools=[],
+        valid_tool_names=set(),
+        enabled_toolsets=None,
+    )
+
+
+def _without_aws_deep_memory_env():
+    return patch.dict(
+        os.environ,
+        {k: v for k, v in os.environ.items() if k != "AGENTOPS_DEEP_MEMORY_DB_URL"},
+        clear=True,
+    )
+
+
+def test_aws_managed_prefetch_yields_hints_for_ingested_record(tmp_path):
+    """aws-managed binding + ingested record yields prefetch hints for same scope."""
+    from agent.runtime_backends import clear_deep_memory_adapters
+
+    mrt.clear_active_deep_memory_registry()
+    clear_deep_memory_adapters()
+    try:
+        db_url = f"sqlite:///{tmp_path}/aws_pf.db"
+        alice = _aws_ctx_pf(user_id="alice")
+        agent_ns = _aws_agent(alice)
+        with _without_aws_deep_memory_env():
+            _bind_deep_memory_backend(agent_ns, {"agentops": {"deep_memory_db_url": db_url}})
+
+        reg = mrt.get_active_deep_memory_registry()
+        assert reg is not None
+        backend = reg.get(BackendCapability.DEEP_MEMORY, alice)
+        backend.upsert_record(
+            alice,
+            text="Alice magenta turboencabulator aws project discussion.",
+            metadata={"type": "conversation_turn"},
+            source="unit",
+            source_uri="unit://aws-pf-1",
+            record_kind="conversation_turn",
+        )
+
+        with use_runtime_context(alice):
+            hints = deep_memory_prefetch_for_agent(agent_ns, "magenta turboencabulator aws")
+        assert "Deep memory hints" in hints
+        assert "turboencabulator" in hints.lower()
+    finally:
+        clear_deep_memory_adapters()
+        mrt.clear_active_deep_memory_registry()
+
+
+def test_aws_managed_prefetch_empty_for_different_user(tmp_path):
+    """aws-managed binding + ingested record yields empty hints for a different user."""
+    from agent.runtime_backends import clear_deep_memory_adapters
+
+    mrt.clear_active_deep_memory_registry()
+    clear_deep_memory_adapters()
+    try:
+        db_url = f"sqlite:///{tmp_path}/aws_pf2.db"
+        alice = _aws_ctx_pf(user_id="alice")
+        bob = _aws_ctx_pf(user_id="bob", conversation_id="thread-bob")
+        agent_alice = _aws_agent(alice)
+        with _without_aws_deep_memory_env():
+            _bind_deep_memory_backend(agent_alice, {"agentops": {"deep_memory_db_url": db_url}})
+
+        reg = mrt.get_active_deep_memory_registry()
+        assert reg is not None
+        backend = reg.get(BackendCapability.DEEP_MEMORY, alice)
+        backend.upsert_record(
+            alice,
+            text="Alice teal sprocket aws deployment.",
+            metadata={"type": "conversation_turn"},
+            source="unit",
+            source_uri="unit://aws-pf-scope",
+            record_kind="conversation_turn",
+        )
+
+        agent_bob = SimpleNamespace(runtime_context=bob)
+        with use_runtime_context(bob):
+            hints = deep_memory_prefetch_for_agent(agent_bob, "teal sprocket aws deployment")
+        assert hints == "", "bob must not see alice's hints"
+    finally:
+        clear_deep_memory_adapters()
+        mrt.clear_active_deep_memory_registry()

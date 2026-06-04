@@ -620,6 +620,15 @@ Caveats:
 
 **Goal:** Make deep-memory record recall feature-parity for compose/cloud profiles, not just local/local-multi. The cloud runtime must ingest completed turns, prefetch scoped hints, and serve `memory_record_search` / `memory_record_get` / `memory_record_get_many` through a durable remote backend with the same user-visible semantics as Derek's local Hermes.
 
+**In-progress note (2026-06-03, TDD — tenth slice):** aws-managed agent-loop wiring slice has landed. This does NOT complete M5B.
+
+Delivered:
+- `agent/agent_init.py` — New `_register_configured_aws_managed_deep_memory_adapter(deep_registry, ctx, config)` helper mirrors the compose seam: resolves the aws-managed profile from the RuntimeContext's `backend_profile`, skips if not `aws-managed` or if an explicit process-global adapter already occupies the slot (so a pre-registered adapter is never clobbered), resolves a DB URL from config/env via `_resolve_deep_memory_db_url`, and registers a lazy `_DeepMemoryDbUrlSecret`-backed `RelationalMemoryRecordBackend` factory when a URL is present — or leaves DEEP_MEMORY unregistered (fail-closed) when absent. Called from `_bind_deep_memory_backend` after the compose helper and before `deep_registry.get(...)`. All imports are lazy/in-function to avoid module-level import cycles. Local single-user behavior stays MemoryManager/provider path; local-multi stays unchanged; aws-managed with no deep-memory DB URL fails closed with no local/Chroma/dict fallback.
+- `tests/agent/test_deep_memory_binding.py` — 7 new tests: configured aws-managed config-key DB URL binds `RelationalMemoryRecordBackend`; env-var DB URL binds `RelationalMemoryRecordBackend`; binding injects native `memory_record_*` tools; scope isolation across users (alice's record not visible to bob by ID or search); unconfigured aws-managed fails closed with no binding and no tools; explicit process-global adapter is not overwritten by config seam; sentinel password and full raw DB URL do not appear in factory repr/defaults/closure/dict observables.
+- `tests/agent/test_deep_memory_prefetch.py` — 2 new tests: aws-managed binding + ingested record yields prefetch hints for same scope; yields empty hints for a different user.
+
+Test evidence (RED→GREEN): 7 initial aws-managed tests confirmed FAIL before production (`assert None is not None` on registry — correct, no factory registered yet); all 7 pass after adding `_register_configured_aws_managed_deep_memory_adapter` to `agent_init.py`. `./scripts/run_tests.sh tests/agent/test_deep_memory_binding.py tests/agent/test_deep_memory_prefetch.py tests/agent/test_scoped_turn_ingest.py tests/agentops_runtime/test_aws_managed_runtime.py` → 85 passed. `./scripts/run_tests.sh tests/agentops_runtime/test_memory_record_store.py tests/agent/test_deep_memory_backend.py tests/agent/test_runtime_backends.py tests/tools/test_memory_record_tools.py` → 115 passed. `ruff check` and `git diff --check` clean.
+
 **In-progress note (2026-06-03, TDD — ninth slice):** aws-managed profile DEEP_MEMORY registration slice has landed. This does NOT complete M5B.
 
 Delivered:
@@ -630,9 +639,8 @@ Delivered:
 
 Test evidence (RED→GREEN): 7 initial new tests confirmed FAIL before production (TypeError on new kwargs, ImportError for missing helper); 5 review-driven tests/assertions were added afterward for env precedence, raw-DSN factory exposure, and stale configured→unconfigured removal, and the Postgres sanitizer test was tightened to include a real sentinel password in the DSN. After implementation and review fixes: `./scripts/run_tests.sh tests/agentops_runtime/test_aws_managed_runtime.py` → 33 passed. Regression: `./scripts/run_tests.sh tests/agentops_runtime/test_aws_managed_runtime.py tests/agentops_runtime/test_memory_record_store.py tests/agentops_runtime/test_compose_services.py tests/agent/test_deep_memory_backend.py tests/agent/test_deep_memory_binding.py tests/agent/test_runtime_backends.py` → 183 passed. `ruff check` and `git diff --check` clean.
 
-**Remaining before Done (managed-cloud parity, vector/extracted-signal parity are still incomplete):**
+**Remaining before Done (vector/extracted-signal parity is still incomplete):**
 1. Real Postgres vector embedding query parameters and vector/BM25/extracted-signal parity for the live adapter rather than the current `NULL` vector placeholder path.
-2. Full turn ingest and prefetch wiring through the `aws-managed` backend in the agent loop (equivalent to the compose `HttpMemoryRecordBackend` path but using the direct relational backend).
 
 **In-progress note (2026-06-03, TDD — eighth slice):** Continued M5B by hardening the live Postgres adapter and compose wiring after independent review. This does NOT complete M5B.
 

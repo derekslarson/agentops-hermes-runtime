@@ -14,6 +14,7 @@ These prove the M5A "native tool registration + agent-init binding" blocker:
 from __future__ import annotations
 
 import json
+import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -355,3 +356,226 @@ def test_enabled_toolsets_excluding_memory_skips_injection(tmp_path):
     agent.enabled_toolsets = ["files"]  # memory intentionally excluded
     _bind_deep_memory_backend(agent, _config(tmp_path))
     assert "memory_record_search" not in agent.valid_tool_names
+
+
+# ── M5B: aws-managed config/env-driven deep-memory binding ───────────────────
+
+
+def _aws_ctx(**overrides):
+    base = dict(
+        mode="agentops",
+        org_id="acme",
+        user_id="alice",
+        conversation_id="thread-1",
+        backend_profile="aws-managed",
+    )
+    base.update(overrides)
+    return RuntimeContext(**base)
+
+
+def _aws_config(db_url):
+    return {"agentops": {"deep_memory_db_url": db_url}}
+
+
+def _without_aws_deep_memory_env():
+    return patch.dict(
+        os.environ,
+        {k: v for k, v in os.environ.items() if k != "AGENTOPS_DEEP_MEMORY_DB_URL"},
+        clear=True,
+    )
+
+
+def test_aws_managed_config_db_url_binds_relational_backend(tmp_path):
+    """Configured aws-managed DB URL (config key) binds RelationalMemoryRecordBackend."""
+    from agent.runtime_backends import clear_deep_memory_adapters
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    mrt.clear_active_deep_memory_registry()
+    clear_deep_memory_adapters()
+    try:
+        db_url = f"sqlite:///{tmp_path}/aws_test.db"
+        ctx = _aws_ctx()
+        agent = _agent(ctx)
+        with _without_aws_deep_memory_env():
+            _bind_deep_memory_backend(agent, _aws_config(db_url))
+
+        reg = mrt.get_active_deep_memory_registry()
+        assert reg is not None, "registry must be bound for aws-managed with DB URL"
+        backend = reg.get(BackendCapability.DEEP_MEMORY, ctx)
+        assert isinstance(backend, RelationalMemoryRecordBackend)
+    finally:
+        clear_deep_memory_adapters()
+        mrt.clear_active_deep_memory_registry()
+
+
+def test_aws_managed_env_db_url_binds_relational_backend(tmp_path):
+    """Configured aws-managed DB URL (env var) binds RelationalMemoryRecordBackend."""
+    from agent.runtime_backends import clear_deep_memory_adapters
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    mrt.clear_active_deep_memory_registry()
+    clear_deep_memory_adapters()
+    try:
+        db_url = f"sqlite:///{tmp_path}/aws_env_test.db"
+        ctx = _aws_ctx()
+        agent = _agent(ctx)
+        with patch.dict(os.environ, {"AGENTOPS_DEEP_MEMORY_DB_URL": db_url}, clear=True):
+            _bind_deep_memory_backend(agent, {})
+
+        reg = mrt.get_active_deep_memory_registry()
+        assert reg is not None
+        backend = reg.get(BackendCapability.DEEP_MEMORY, ctx)
+        assert isinstance(backend, RelationalMemoryRecordBackend)
+    finally:
+        clear_deep_memory_adapters()
+        mrt.clear_active_deep_memory_registry()
+
+
+def test_aws_managed_binds_native_tools(tmp_path):
+    """Configured aws-managed binding injects memory_record_* tools into the agent surface."""
+    from agent.runtime_backends import clear_deep_memory_adapters
+
+    mrt.clear_active_deep_memory_registry()
+    clear_deep_memory_adapters()
+    try:
+        db_url = f"sqlite:///{tmp_path}/aws_tools.db"
+        ctx = _aws_ctx()
+        agent = _agent(ctx)
+        with _without_aws_deep_memory_env():
+            _bind_deep_memory_backend(agent, _aws_config(db_url))
+
+        for name in MEMORY_RECORD_TOOL_NAMES:
+            assert name in agent.valid_tool_names, f"{name} must be injected for aws-managed"
+    finally:
+        try:
+            reg = mrt.get_active_deep_memory_registry()
+            if reg is not None:
+                reg.get(BackendCapability.DEEP_MEMORY, _aws_ctx()).close()
+        except Exception:
+            pass
+        clear_deep_memory_adapters()
+        mrt.clear_active_deep_memory_registry()
+
+
+def test_aws_managed_scoped_isolation_across_users(tmp_path):
+    """Records ingested under one user/conversation are not visible to another."""
+    from agent.runtime_backends import clear_deep_memory_adapters
+
+    mrt.clear_active_deep_memory_registry()
+    clear_deep_memory_adapters()
+    try:
+        db_url = f"sqlite:///{tmp_path}/aws_scope.db"
+        alice_ctx = _aws_ctx(user_id="alice", conversation_id="thread-alice")
+        agent = _agent(alice_ctx)
+        with _without_aws_deep_memory_env():
+            _bind_deep_memory_backend(agent, _aws_config(db_url))
+
+        reg = mrt.get_active_deep_memory_registry()
+        assert reg is not None
+        backend = reg.get(BackendCapability.DEEP_MEMORY, alice_ctx)
+        rec = backend.upsert_record(
+            alice_ctx,
+            text="Alice azure sequoia private aws record.",
+            metadata={"type": "conversation_turn"},
+            source="unit",
+            source_uri="unit://aws-scope-1",
+            record_kind="conversation_turn",
+        )
+
+        bob_ctx = _aws_ctx(user_id="bob", conversation_id="thread-bob")
+        assert backend.get_record(bob_ctx, rec.id) is None, "bob must not see alice's record"
+        assert backend.search(bob_ctx, "azure sequoia private aws") == [], "bob must not search alice's record"
+    finally:
+        clear_deep_memory_adapters()
+        mrt.clear_active_deep_memory_registry()
+
+
+def test_aws_managed_unconfigured_fails_closed_no_tools(tmp_path):
+    """aws-managed profile with NO DB URL must fail closed: no binding, no native tools."""
+    from agent.runtime_backends import clear_deep_memory_adapters
+
+    mrt.clear_active_deep_memory_registry()
+    clear_deep_memory_adapters()
+    try:
+        ctx = _aws_ctx()
+        agent = _agent(ctx)
+        env_without_url = {k: v for k, v in os.environ.items() if k != "AGENTOPS_DEEP_MEMORY_DB_URL"}
+        with patch.dict(os.environ, env_without_url, clear=True):
+            _bind_deep_memory_backend(agent, {})
+
+        assert mrt.get_active_deep_memory_registry() is None
+        for name in MEMORY_RECORD_TOOL_NAMES:
+            assert name not in agent.valid_tool_names
+    finally:
+        clear_deep_memory_adapters()
+        mrt.clear_active_deep_memory_registry()
+
+
+def test_aws_managed_explicit_process_global_adapter_not_overwritten(tmp_path):
+    """An explicit process-global aws-managed adapter must NOT be overwritten by the config seam."""
+    from agent.runtime_backends import (
+        clear_deep_memory_adapters,
+        register_deep_memory_adapter,
+    )
+
+    mrt.clear_active_deep_memory_registry()
+    clear_deep_memory_adapters()
+    try:
+        sentinel = object()
+
+        def _sentinel_factory(options):
+            return sentinel
+
+        register_deep_memory_adapter("aws-managed", _sentinel_factory)
+
+        db_url = f"sqlite:///{tmp_path}/aws_nowrote.db"
+        ctx = _aws_ctx()
+        agent = _agent(ctx)
+        with _without_aws_deep_memory_env():
+            _bind_deep_memory_backend(agent, _aws_config(db_url))
+
+        reg = mrt.get_active_deep_memory_registry()
+        assert reg is not None
+        backend = reg.get(BackendCapability.DEEP_MEMORY, ctx)
+        assert backend is sentinel, "explicit process-global adapter must not be overwritten"
+    finally:
+        clear_deep_memory_adapters()
+        mrt.clear_active_deep_memory_registry()
+
+
+def test_aws_managed_secret_safety_dsn_not_in_factory_repr(tmp_path):
+    """The raw DSN/password must not appear in the factory repr/defaults/closure."""
+    from agent.runtime_backends import clear_deep_memory_adapters
+
+    mrt.clear_active_deep_memory_registry()
+    clear_deep_memory_adapters()
+    try:
+        sentinel_password = "SENTINEL_SECRET_PASS_12345"
+        db_url = f"sqlite:///{tmp_path}/sec.db?dummy={sentinel_password}"
+        ctx = _aws_ctx()
+        agent = _agent(ctx)
+        with _without_aws_deep_memory_env():
+            _bind_deep_memory_backend(agent, {"agentops": {"deep_memory_db_url": db_url}})
+
+        reg = mrt.get_active_deep_memory_registry()
+        assert reg is not None
+        cap_factories = getattr(reg, "_factories", {})
+        dm_factories = cap_factories.get(BackendCapability.DEEP_MEMORY, {})
+        factory = dm_factories.get("aws-managed")
+        assert factory is not None, "factory must be registered"
+
+        exposed = "\n".join(
+            repr(value)
+            for value in (
+                factory,
+                getattr(factory, "__defaults__", None),
+                getattr(factory, "__kwdefaults__", None),
+                getattr(factory, "__closure__", None),
+                getattr(factory, "__dict__", None),
+            )
+        )
+        assert sentinel_password not in exposed
+        assert db_url not in exposed
+    finally:
+        clear_deep_memory_adapters()
+        mrt.clear_active_deep_memory_registry()

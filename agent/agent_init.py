@@ -206,6 +206,7 @@ def _bind_deep_memory_backend(agent: Any, config: Dict[str, Any]) -> None:
     # of failing closed. Profiles without a registered adapter stay fail-closed.
     apply_deep_memory_adapters(deep_registry)
     _register_configured_compose_deep_memory_adapter(deep_registry, ctx)
+    _register_configured_aws_managed_deep_memory_adapter(deep_registry, ctx, config)
     try:
         deep_registry.get(BackendCapability.DEEP_MEMORY, ctx)
     except (BackendSelectionError, ValueError) as exc:
@@ -255,6 +256,49 @@ def _register_configured_compose_deep_memory_adapter(deep_registry: Any, ctx: An
         # the HTTP options are intentionally absent in that scenario.
         return
     register_http_memory_record_backend(deep_registry, profile=profile)
+
+
+def _register_configured_aws_managed_deep_memory_adapter(
+    deep_registry: Any, ctx: Any, config: Any
+) -> None:
+    """Wire DEEP_MEMORY for aws-managed profile when config/env has a DB URL.
+
+    Mirrors the compose seam: only registers when the profile resolves to
+    aws-managed and no explicit factory is already present (so a process-global
+    aws-managed adapter registered before agent-init is never clobbered). Leaves
+    DEEP_MEMORY unregistered (fail-closed) when no DB URL is configured.
+    """
+    from agent.runtime_backends import BackendCapability, BackendSelectionError
+
+    try:
+        profile = deep_registry.resolve_profile(BackendCapability.DEEP_MEMORY, ctx)
+    except BackendSelectionError:
+        return
+
+    from agentops_runtime.aws_managed import AWS_MANAGED_PROFILE
+
+    if profile != AWS_MANAGED_PROFILE:
+        return
+    cap_factories = getattr(deep_registry, "_factories", {}).get(
+        BackendCapability.DEEP_MEMORY, {}
+    )
+    if profile in cap_factories:
+        return
+
+    from agentops_runtime.aws_managed import _DeepMemoryDbUrlSecret, _resolve_deep_memory_db_url
+
+    db_url = _resolve_deep_memory_db_url(config, None)
+    if not db_url:
+        return
+
+    db_url_secret = _DeepMemoryDbUrlSecret.from_url(db_url)
+
+    def _deep_memory_factory(options, _secret=db_url_secret):
+        from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+        return RelationalMemoryRecordBackend(_secret.reveal())
+
+    deep_registry.register(BackendCapability.DEEP_MEMORY, _deep_memory_factory, profile=profile)
 
 
 class _UnavailableCronBackend:
