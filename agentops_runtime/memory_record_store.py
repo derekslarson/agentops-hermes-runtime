@@ -749,12 +749,17 @@ class RelationalMemoryRecordBackend:
                     overfetch_limit,
                 ),
             )
-            candidate_ids = [str(row["record_id"]) for row in rows]
-            signal_boosts = self._pg_signal_boosts(context, query, candidate_ids)
+            okapi_scores = _bm25_scores(query, [str(row["text"]) for row in rows])
+            positive_candidate_ids = [
+                str(row["record_id"]) for row, bm25 in zip(rows, okapi_scores) if bm25 > 0
+            ]
+            signal_boosts = self._pg_signal_boosts(context, query, positive_candidate_ids)
             scored: list[tuple[float, float, str, Any]] = []
-            for row in rows:
+            for i, row in enumerate(rows):
+                bm25 = okapi_scores[i]
+                if bm25 <= 0:
+                    continue
                 rid = str(row["record_id"])
-                bm25 = float(row.get("score") or 0.0)
                 boost = signal_boosts.get(rid, 0.0)
                 effective_score = bm25 + boost
                 scored.append((effective_score, bm25, rid, row))

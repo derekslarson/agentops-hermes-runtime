@@ -1916,12 +1916,14 @@ class _FailingSignalSelectConnection:
 
 def test_postgres_search_applies_signal_boost_marks_matched_via_record_plus_signal(monkeypatch):
     """Postgres search result with a matching signal row gets matched_via='record+signal',
-    score > bm25_score, and raw SQL score preserved in bm25_score."""
+    score > bm25_score, and Okapi BM25 value stored in bm25_score."""
     from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+    from agent.local_memory.store import _bm25_scores
 
     conn = _FakePostgresConnectionWithSignals()
     monkeypatch.setitem(sys.modules, "psycopg2", _FakePsycopg2(conn))
-    conn.search_rows = [_pg_row(record_id="mem_pg_sig_boost", text="kafka pipeline notes", score=0.5)]
+    text = "kafka pipeline notes"
+    conn.search_rows = [_pg_row(record_id="mem_pg_sig_boost", text=text, score=0.5)]
     conn.signal_rows = [
         {"record_id": "mem_pg_sig_boost", "signal_line": "kafka pipeline entity"},
         {"record_id": "mem_pg_sig_boost", "signal_line": "kafka streaming term"},
@@ -1939,8 +1941,9 @@ def test_postgres_search_applies_signal_boost_marks_matched_via_record_plus_sign
     assert r.matched_via == "record+signal", (
         f"expected 'record+signal', got {r.matched_via!r}"
     )
-    assert r.bm25_score == pytest.approx(0.5), (
-        f"bm25_score must equal raw SQL score 0.5, got {r.bm25_score}"
+    expected_okapi = _bm25_scores("kafka", [text])[0]
+    assert r.bm25_score == pytest.approx(expected_okapi, abs=1e-9), (
+        f"bm25_score must equal Okapi BM25 {expected_okapi}, got {r.bm25_score}"
     )
     assert r.score > r.bm25_score, (
         f"score {r.score} must exceed bm25_score {r.bm25_score} when signal boost applies"
@@ -1984,7 +1987,7 @@ def test_postgres_search_signal_boost_uses_bound_scope_params(monkeypatch):
 
     conn = _FakePostgresConnectionWithSignals()
     monkeypatch.setitem(sys.modules, "psycopg2", _FakePsycopg2(conn))
-    conn.search_rows = [_pg_row(record_id="mem_pg_scope_check", score=0.5)]
+    conn.search_rows = [_pg_row(record_id="mem_pg_scope_check", text="kafka scope check", score=0.5)]
 
     backend = RelationalMemoryRecordBackend(
         "postgresql://user:pass@db.example/deepmem",
@@ -2022,10 +2025,12 @@ def test_postgres_search_signal_boost_uses_bound_scope_params(monkeypatch):
 def test_postgres_search_signal_read_failure_degrades_to_plain_bm25(monkeypatch):
     """When signal SELECT raises, search rolls back and returns plain BM25 results."""
     from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+    from agent.local_memory.store import _bm25_scores
 
     conn = _FailingSignalSelectConnection()
     monkeypatch.setitem(sys.modules, "psycopg2", _FakePsycopg2(conn))
-    conn.search_rows = [_pg_row(record_id="mem_pg_degrade", text="kafka notes", score=0.5)]
+    text = "kafka notes"
+    conn.search_rows = [_pg_row(record_id="mem_pg_degrade", text=text, score=0.5)]
 
     backend = RelationalMemoryRecordBackend(
         "postgresql://user:pass@db.example/deepmem",
@@ -2039,7 +2044,8 @@ def test_postgres_search_signal_read_failure_degrades_to_plain_bm25(monkeypatch)
     assert r.matched_via == "bm25", (
         f"signal read failure must degrade to 'bm25', got {r.matched_via!r}"
     )
-    assert r.bm25_score == pytest.approx(0.5)
+    expected_okapi = _bm25_scores("kafka", [text])[0]
+    assert r.bm25_score == pytest.approx(expected_okapi, abs=1e-9)
     assert r.score == pytest.approx(r.bm25_score), (
         f"score {r.score} must equal bm25_score {r.bm25_score} when no boost applied"
     )
@@ -2230,3 +2236,157 @@ def test_postgres_search_overfetch_excludes_signal_only_record(monkeypatch):
         assert "mem_pg_signal_only" not in candidate_ids, (
             f"Signal-only ID must not be in candidate array sent to signal query, got {candidate_ids}"
         )
+
+
+# ---------------------------------------------------------------------------
+# M5B — Postgres candidate-window Okapi BM25 parity (eighteenth slice)
+# ---------------------------------------------------------------------------
+
+
+def test_postgres_search_excludes_zero_okapi_vector_only_signal_candidates(monkeypatch):
+    """Postgres must not return or signal-boost vector-only rows with zero Okapi BM25.
+
+    SQL can return vector-only candidates whose text does not keyword-match the
+    query.  SQLite only signal-boosts and returns BM25-positive candidates; the
+    Postgres candidate-window rerank path must preserve that invariant instead
+    of allowing a matching signal to pull a zero-Okapi row into results.
+    """
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    conn = _FakePostgresConnectionWithSignals()
+    monkeypatch.setitem(sys.modules, "psycopg2", _FakePsycopg2(conn))
+    conn.search_rows = [
+        _pg_row(record_id="mem_pg_vector_only", text="unrelated vector document", score=0.9),
+    ]
+    conn.signal_rows = [
+        {"record_id": "mem_pg_vector_only", "signal_line": "kafka signal entity"},
+    ]
+
+    backend = RelationalMemoryRecordBackend(
+        "postgresql://user:***@db.example/deepmem",
+        embed_fn=_make_fake_embed_fn(),
+    )
+    results = backend.search(_CTX_A, "kafka", limit=1)
+
+    assert results == []
+    signal_query_calls = [
+        params
+        for sql, params in conn.executed
+        if "memory_signals" in sql.lower() and "record_id = any" in sql.lower()
+    ]
+    if signal_query_calls:
+        assert list(signal_query_calls[0][-1]) == []
+
+
+def test_postgres_search_ranks_by_okapi_bm25_not_sql_score(monkeypatch):
+    """Postgres search must rank by Okapi BM25, not by the SQL candidate score.
+
+    The SQL score (vector+FTS blend) favours the long padded doc (score=0.9)
+    over the short doc (score=0.1).  Okapi BM25 length-normalises and favours
+    the short doc.  If the production code still uses the raw SQL score as the
+    sort key, the long doc ranks first and this test is RED.
+    """
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    conn = _FakePostgresConnectionWithSignals()
+    monkeypatch.setitem(sys.modules, "psycopg2", _FakePsycopg2(conn))
+    long_text = "satellite " + "padding " * 60
+    short_text = "satellite orbit"
+    # SQL score deliberately favours the long doc — Okapi BM25 must override
+    conn.search_rows = [
+        _pg_row(record_id="mem_pg_bm25_long", text=long_text, score=0.9),
+        _pg_row(record_id="mem_pg_bm25_short", text=short_text, score=0.1),
+    ]
+
+    backend = RelationalMemoryRecordBackend(
+        "postgresql://user:pass@db.example/deepmem",
+        embed_fn=_make_fake_embed_fn(),
+    )
+    results = backend.search(_CTX_A, "satellite", limit=2)
+
+    assert len(results) == 2
+    ids = [r.id for r in results]
+    assert ids.index("mem_pg_bm25_short") < ids.index("mem_pg_bm25_long"), (
+        f"Okapi BM25 must rank short doc before long doc, got order {ids}"
+    )
+
+
+def test_postgres_bm25_score_field_is_okapi_value_not_sql_score(monkeypatch):
+    """SearchResult.bm25_score must equal the raw Okapi BM25 value, not the SQL score.
+
+    The SQL score is set to 0.77 (a distinctive sentinel value).  Okapi BM25
+    for the same text produces approximately 0.288.  If production code stores
+    the SQL score in bm25_score, the assertion against the Okapi value fails
+    and this test is RED.
+    """
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+    from agent.local_memory.store import _bm25_scores
+
+    conn = _FakePostgresConnectionWithSignals()
+    monkeypatch.setitem(sys.modules, "psycopg2", _FakePsycopg2(conn))
+    text = "cluster nodes processing"
+    sql_score = 0.77
+    conn.search_rows = [
+        _pg_row(record_id="mem_pg_okapi_field", text=text, score=sql_score),
+    ]
+
+    backend = RelationalMemoryRecordBackend(
+        "postgresql://user:pass@db.example/deepmem",
+        embed_fn=_make_fake_embed_fn(),
+    )
+    results = backend.search(_CTX_A, "cluster", limit=1)
+
+    assert len(results) == 1
+    r = results[0]
+    expected_okapi = _bm25_scores("cluster", [text])[0]
+    assert r.bm25_score != pytest.approx(sql_score, abs=1e-3), (
+        f"bm25_score must not equal SQL score {sql_score} — must be Okapi BM25"
+    )
+    assert r.bm25_score == pytest.approx(expected_okapi, abs=1e-9), (
+        f"bm25_score {r.bm25_score} must equal Okapi BM25 {expected_okapi}"
+    )
+
+
+def test_postgres_and_sqlite_agree_on_bm25_ordering(tmp_path, monkeypatch):
+    """Postgres and SQLite must agree on BM25 ranking order for the same candidate corpus.
+
+    SQLite computes Okapi BM25 natively; Postgres must compute the same scores
+    over the candidate window rows.  When the fake Postgres candidate window
+    contains the same two docs as the SQLite store, both backends must rank the
+    short doc above the long padded doc.  SQL scores are set to the opposite
+    order to confirm Postgres is not using the DB score as its sort key.
+    """
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    long_text = "pipeline " + "noise " * 50
+    short_text = "pipeline orchestration"
+
+    sqlite_backend = RelationalMemoryRecordBackend(f"sqlite:///{tmp_path}/agree.db")
+    sqlite_backend.upsert_record(_CTX_A, text=long_text, record_id="mem_agree_long")
+    sqlite_backend.upsert_record(_CTX_A, text=short_text, record_id="mem_agree_short")
+    sqlite_results = sqlite_backend.search(_CTX_A, "pipeline", limit=2)
+    sqlite_ids = [r.id for r in sqlite_results]
+    assert len(sqlite_ids) >= 2, "SQLite must return both docs"
+    assert sqlite_ids[0] == "mem_agree_short", (
+        f"SQLite must rank short doc first, got {sqlite_ids}"
+    )
+
+    conn = _FakePostgresConnectionWithSignals()
+    monkeypatch.setitem(sys.modules, "psycopg2", _FakePsycopg2(conn))
+    # SQL scores reversed: long=0.9 would rank first if Postgres uses SQL score
+    conn.search_rows = [
+        _pg_row(record_id="mem_agree_long", text=long_text, score=0.9),
+        _pg_row(record_id="mem_agree_short", text=short_text, score=0.1),
+    ]
+
+    pg_backend = RelationalMemoryRecordBackend(
+        "postgresql://user:pass@db.example/deepmem",
+        embed_fn=_make_fake_embed_fn(),
+    )
+    pg_results = pg_backend.search(_CTX_A, "pipeline", limit=2)
+    pg_ids = [r.id for r in pg_results]
+
+    assert len(pg_ids) == 2, f"Postgres must return both docs, got {pg_ids}"
+    assert pg_ids == sqlite_ids[:2], (
+        f"Postgres and SQLite must agree on BM25 order: SQLite={sqlite_ids}, Postgres={pg_ids}"
+    )
