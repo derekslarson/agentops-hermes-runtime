@@ -14,6 +14,7 @@ from agent.runtime_memory_http import HttpMemoryBackend
 from agent.runtime_memory_record_http import HttpMemoryRecordBackend
 from agent.runtime_run_lease_http import HttpRunLeaseBackend
 from agent.runtime_queue_http import HttpQueueBackend
+from agent.runtime_secret_http import HttpSecretStoreBackend
 from agent.runtime_session_http import HttpSessionBackend
 from agent.runtime_worker_registry_http import HttpWorkerRegistry
 from agentops_runtime.compose_backends import configure_compose_runtime_backends
@@ -43,6 +44,7 @@ def test_registers_http_backends_for_each_capability():
     assert isinstance(registry.get(BackendCapability.SESSION, context), HttpSessionBackend)
     assert isinstance(registry.get(BackendCapability.DELIVERY, context), HttpDeliveryBackend)
     assert isinstance(registry.get(BackendCapability.QUEUE, context), HttpQueueBackend)
+    assert isinstance(registry.get(BackendCapability.SECRET, context), HttpSecretStoreBackend)
 
 
 def test_worker_registry_uses_compose_backend_for_supervisor_none_context():
@@ -250,6 +252,32 @@ def test_agentops_queue_url_infra_dsn_ignored_for_http_adapter():
     assert queue_opts["base_url"] == "https://api.internal"
 
 
+def test_secret_store_url_env_overrides_api_url():
+    registry = RuntimeBackendRegistry()
+    configure_compose_runtime_backends(
+        registry,
+        environ={
+            "AGENTOPS_API_URL": "https://api.internal",
+            "AGENTOPS_SECRET_STORE_URL": "https://secrets.internal",
+        },
+    )
+
+    secret_opts = registry._capability_options(BackendCapability.SECRET)
+    assert secret_opts["base_url"] == "https://secrets.internal"
+
+
+def test_secret_store_config_key_overrides_env():
+    registry = RuntimeBackendRegistry()
+    configure_compose_runtime_backends(
+        registry,
+        config={"agentops": {"secret_store_url": "https://config-secrets.internal"}},
+        environ={"AGENTOPS_API_URL": "https://api.internal", "AGENTOPS_SECRET_STORE_URL": "https://env-secrets.internal"},
+    )
+
+    secret_opts = registry._capability_options(BackendCapability.SECRET)
+    assert secret_opts["base_url"] == "https://config-secrets.internal"
+
+
 def test_fails_closed_when_api_url_missing():
     registry = RuntimeBackendRegistry()
     with pytest.raises(ValueError):
@@ -431,6 +459,7 @@ def test_app_and_integration_secrets_are_not_passed_into_options():
         BackendCapability.WORKER_REGISTRY,
         BackendCapability.SESSION,
         BackendCapability.DELIVERY,
+        BackendCapability.SECRET,
     ):
         options = registry._capability_options(capability)
         assert set(options) <= {"base_url", "token", "timeout"}
@@ -466,7 +495,8 @@ def test_missing_compose_capabilities_reports_three_durable_surfaces_after_parti
     )
     missing = missing_compose_capabilities(registry)
     missing_values = {cap.value for cap in missing}
-    assert missing_values == {"credential", "secret", "skill"}
+    assert missing_values == {"credential", "skill"}
+    assert "secret" not in missing_values
     assert "delivery" not in missing_values
     assert "session" not in missing_values
     assert "conversation_router" not in missing_values
