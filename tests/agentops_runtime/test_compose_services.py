@@ -457,3 +457,103 @@ def test_memory_records_request_returns_503_when_backend_unavailable(monkeypatch
         server.shutdown()
         thread.join(timeout=5)
         server.server_close()
+
+
+# ---------------------------------------------------------------------------
+# M5B: embed_fn injection via make_relational_memory_backend seam
+# ---------------------------------------------------------------------------
+
+
+def _make_fake_psycopg2():
+    class _FakeCursor:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def execute(self, sql, params=None):
+            self._conn.executed.append(sql)
+
+    class _FakeConn:
+        def __init__(self):
+            self.executed = []
+
+        def cursor(self):
+            return _FakeCursor(self)
+
+        def commit(self):
+            pass
+
+    class _FakePsycopg2:
+        def __init__(self):
+            self.connection = _FakeConn()
+
+        def connect(self, _url):
+            return self.connection
+
+    return _FakePsycopg2()
+
+
+def test_make_memory_backend_postgres_injects_resolved_embed_fn(monkeypatch):
+    """postgres _make_memory_backend must inject the resolved default embed_fn."""
+    import agentops_runtime.memory_record_store as mrs
+
+    _SENTINEL_EMBED = object()
+
+    def _fake_load(device="auto"):
+        return _SENTINEL_EMBED
+
+    monkeypatch.setattr(mrs, "_load_default_embed_fn", _fake_load)
+    monkeypatch.setitem(sys.modules, "psycopg2", _make_fake_psycopg2())
+
+    backend = compose_services._make_memory_backend({
+        "AGENTOPS_DEEP_MEMORY_DB_URL": "postgresql://user:***@postgres:5432/deepmem",
+    })
+
+    assert backend._embed_fn is _SENTINEL_EMBED
+
+
+def test_make_memory_backend_postgres_embedder_failure_raises_sanitized_error(monkeypatch):
+    """postgres embedder load failure must raise sanitized RuntimeError with no chained cause."""
+    import agentops_runtime.memory_record_store as mrs
+
+    _LEAK_TEXT = "LEAKSENTINEL_EMBED password=secret"
+    _LEAK_DSN = f"postgresql://user:{_LEAK_TEXT}@postgres:5432/deepmem"
+
+    def _fake_load_fail(device="auto"):
+        raise ImportError(f"chromadb missing: {_LEAK_TEXT}")
+
+    monkeypatch.setattr(mrs, "_load_default_embed_fn", _fake_load_fail)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        compose_services._make_memory_backend({"AGENTOPS_DEEP_MEMORY_DB_URL": _LEAK_DSN})
+
+    error_msg = str(exc_info.value)
+    assert _LEAK_TEXT not in error_msg
+    assert _LEAK_DSN not in error_msg
+    assert exc_info.value.__cause__ is None
+
+
+def test_make_memory_backend_sqlite_does_not_load_embedder(monkeypatch, tmp_path):
+    """sqlite _make_memory_backend must not call _load_default_embed_fn; _embed_fn stays None."""
+    import agentops_runtime.memory_record_store as mrs
+
+    embed_calls = []
+
+    def _fake_load(device="auto"):
+        embed_calls.append(device)
+        raise RuntimeError("must not be called for sqlite")
+
+    monkeypatch.setattr(mrs, "_load_default_embed_fn", _fake_load)
+
+    db_path = str(tmp_path / "no_embed_test.db")
+    backend = compose_services._make_memory_backend({
+        "AGENTOPS_DEEP_MEMORY_DB_URL": f"sqlite:///{db_path}",
+    })
+
+    assert embed_calls == [], "sqlite must not invoke _load_default_embed_fn"
+    assert backend._embed_fn is None

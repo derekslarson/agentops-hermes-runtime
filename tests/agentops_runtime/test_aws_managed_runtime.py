@@ -537,3 +537,82 @@ def test_register_aws_managed_deep_memory_adapter_binds_through_apply(tmp_path):
         assert isinstance(backend, RelationalMemoryRecordBackend)
     finally:
         clear_deep_memory_adapters()
+
+
+# --- M5B: postgres DEEP_MEMORY factory injects resolved embed_fn ---------------
+
+
+def _make_aws_fake_psycopg2():
+    class _FakeCursor:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def execute(self, sql, params=None):
+            self._conn.executed.append(sql)
+
+    class _FakeConn:
+        def __init__(self):
+            self.executed = []
+
+        def cursor(self):
+            return _FakeCursor(self)
+
+        def commit(self):
+            pass
+
+    class _FakePsycopg2:
+        def __init__(self):
+            self.connection = _FakeConn()
+
+        def connect(self, _url):
+            return self.connection
+
+    return _FakePsycopg2()
+
+
+def test_aws_managed_postgres_deep_memory_factory_injects_embed_fn(monkeypatch):
+    """Configured aws-managed postgres DEEP_MEMORY factory must inject the resolved embed_fn."""
+    import agentops_runtime.memory_record_store as mrs
+
+    _SENTINEL_EMBED = object()
+
+    def _fake_load(device="auto"):
+        return _SENTINEL_EMBED
+
+    sentinel_password = "POSTGRES_SENTINEL_EMBED_SECRET_8765"
+    db_url = f"postgresql://user:{sentinel_password}@rds-host.example.com:5432/deepmem"
+    assert sentinel_password in db_url
+
+    monkeypatch.setattr(mrs, "_load_default_embed_fn", _fake_load)
+    monkeypatch.setitem(sys.modules, "psycopg2", _make_aws_fake_psycopg2())
+
+    registry = RuntimeBackendRegistry()
+    configure_aws_managed_runtime_backends(
+        registry,
+        config={"agentops": {"deep_memory_db_url": db_url}},
+        environ={},
+    )
+
+    context = _aws_managed_dm_context("run-embed-inject")
+    backend = registry.get(BackendCapability.DEEP_MEMORY, context)
+    assert backend._embed_fn is _SENTINEL_EMBED, "factory must inject the resolved embed_fn"
+
+    factory = registry._factories[BackendCapability.DEEP_MEMORY][AWS_MANAGED_PROFILE]
+    exposed = "\n".join(
+        repr(v)
+        for v in (
+            factory,
+            getattr(factory, "__defaults__", None),
+            getattr(factory, "__kwdefaults__", None),
+            getattr(factory, "__closure__", None),
+            getattr(factory, "__dict__", None),
+        )
+    )
+    assert sentinel_password not in exposed, "factory observables must not expose the raw password"
+    assert db_url not in exposed, "factory observables must not expose the raw DSN"

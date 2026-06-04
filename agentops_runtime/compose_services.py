@@ -186,9 +186,9 @@ def _make_memory_backend(environ: dict[str, str]) -> Any:
     if store_type == "sqlite" and parsed.scheme != "sqlite":
         raise ValueError("sqlite deep-memory store requires a sqlite:/// URL")
 
-    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+    from agentops_runtime.memory_record_store import make_relational_memory_backend
 
-    return RelationalMemoryRecordBackend(db_url)
+    return make_relational_memory_backend(db_url)
 
 
 def _get_or_create_memory_backend() -> Any:

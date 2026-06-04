@@ -221,8 +221,8 @@ def configure_aws_managed_runtime_backends(
     db_url_secret = _DeepMemoryDbUrlSecret.from_url(db_url)
 
     def _deep_memory_factory(options, _secret=db_url_secret):
-        from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
-        return RelationalMemoryRecordBackend(_secret.reveal())
+        from agentops_runtime.memory_record_store import make_relational_memory_backend
+        return make_relational_memory_backend(_secret.reveal())
 
     registry.register(BackendCapability.DEEP_MEMORY, _deep_memory_factory, profile=profile)
 
@@ -248,8 +248,8 @@ def register_aws_managed_deep_memory_adapter(
     db_url_secret = _DeepMemoryDbUrlSecret.from_url(db_url)
 
     def _factory(options, _secret=db_url_secret):
-        from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
-        return RelationalMemoryRecordBackend(_secret.reveal())
+        from agentops_runtime.memory_record_store import make_relational_memory_backend
+        return make_relational_memory_backend(_secret.reveal())
 
     register_deep_memory_adapter(AWS_MANAGED_PROFILE, _factory)
 

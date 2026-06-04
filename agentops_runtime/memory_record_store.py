@@ -133,6 +133,27 @@ def _load_default_embed_fn(device: str = "auto"):
         ) from None
 
 
+def make_relational_memory_backend(db_url: str, *, embed_fn=None) -> "RelationalMemoryRecordBackend":
+    """Construct a RelationalMemoryRecordBackend, eagerly resolving the default embedder for Postgres.
+
+    For postgres:// / postgresql:// URLs, loads _load_default_embed_fn() eagerly so embedding
+    failures surface at construction time.  Failures are sanitized — no raw DSN, no raw embedder
+    exception text, no chained cause.
+
+    For sqlite:// URLs, embed_fn is passed through as-is (default: None).
+    """
+    parsed = urlparse(db_url)
+    if parsed.scheme in {"postgresql", "postgres"} and embed_fn is None:
+        try:
+            embed_fn = _load_default_embed_fn()
+        except Exception:
+            raise RuntimeError(
+                "Postgres deep-memory requires the embedder; "
+                "install 'hermes-agent[deep-memory]' or supply embed_fn= at construction time"
+            ) from None
+    return RelationalMemoryRecordBackend(db_url, embed_fn=embed_fn)
+
+
 def _pgvector_literal(vec) -> str:
     try:
         raw = list(vec)

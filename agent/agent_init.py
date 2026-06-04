@@ -209,10 +209,11 @@ def _bind_deep_memory_backend(agent: Any, config: Dict[str, Any]) -> None:
     _register_configured_aws_managed_deep_memory_adapter(deep_registry, ctx, config)
     try:
         deep_registry.get(BackendCapability.DEEP_MEMORY, ctx)
-    except (BackendSelectionError, ValueError) as exc:
-        # No scoped adapter for this profile, or its config is invalid (e.g. a
-        # compose adapter selected without a base_url) — fail closed, do not open
-        # a store.
+    except (BackendSelectionError, ValueError, RuntimeError) as exc:
+        # No scoped adapter for this profile, its config is invalid (e.g. a
+        # compose adapter selected without a base_url), or a required remote
+        # dependency such as the Postgres embedder failed to initialize — fail
+        # closed, do not open a stale store.
         logger.warning(
             "Deep memory unavailable for this profile; failing closed (no native record tools): %s",
             exc,
@@ -294,9 +295,9 @@ def _register_configured_aws_managed_deep_memory_adapter(
     db_url_secret = _DeepMemoryDbUrlSecret.from_url(db_url)
 
     def _deep_memory_factory(options, _secret=db_url_secret):
-        from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+        from agentops_runtime.memory_record_store import make_relational_memory_backend
 
-        return RelationalMemoryRecordBackend(_secret.reveal())
+        return make_relational_memory_backend(_secret.reveal())
 
     deep_registry.register(BackendCapability.DEEP_MEMORY, _deep_memory_factory, profile=profile)
 

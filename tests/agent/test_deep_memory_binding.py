@@ -579,3 +579,109 @@ def test_aws_managed_secret_safety_dsn_not_in_factory_repr(tmp_path):
     finally:
         clear_deep_memory_adapters()
         mrt.clear_active_deep_memory_registry()
+
+
+# ── M5B: postgres binding injects embed_fn via make_relational_memory_backend ─
+
+
+def _make_binding_fake_psycopg2():
+    class _FakeCursor:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def execute(self, sql, params=None):
+            self._conn.executed.append(sql)
+
+    class _FakeConn:
+        def __init__(self):
+            self.executed = []
+
+        def cursor(self):
+            return _FakeCursor(self)
+
+        def commit(self):
+            pass
+
+    class _FakePsycopg2:
+        def __init__(self):
+            self.connection = _FakeConn()
+
+        def connect(self, _url):
+            return self.connection
+
+    return _FakePsycopg2()
+
+
+def test_aws_managed_postgres_embedder_failure_fails_closed_and_scrubs_stale_tools(monkeypatch):
+    """Postgres embedder load failures fail closed and cannot leave stale record tools bound."""
+    import agentops_runtime.memory_record_store as mrs
+    from agent.runtime_backends import clear_deep_memory_adapters
+
+    def _fake_load_fail(device="auto"):
+        raise ImportError("LEAKSENTINEL_EMBEDDER_FAILURE password=secret")
+
+    monkeypatch.setattr(mrs, "_load_default_embed_fn", _fake_load_fail)
+
+    mrt.clear_active_deep_memory_registry()
+    clear_deep_memory_adapters()
+    try:
+        # Simulate stale state from a prior scoped binding in the same process.
+        mrt.set_active_deep_memory_registry(RuntimeBackendRegistry({}))
+        ctx = _aws_ctx()
+        agent = _agent(ctx)
+        agent.tools = _tool_defs(*MEMORY_RECORD_TOOL_NAMES)
+        agent.valid_tool_names = set(MEMORY_RECORD_TOOL_NAMES)
+        db_url = "postgresql://user:***@rds-host.example.com:5432/deepmem"
+
+        with _without_aws_deep_memory_env():
+            _bind_deep_memory_backend(agent, {"agentops": {"deep_memory_db_url": db_url}})
+
+        assert mrt.get_active_deep_memory_registry() is None
+        assert getattr(agent, "_scoped_deep_memory_registry", "sentinel") is None
+        for name in MEMORY_RECORD_TOOL_NAMES:
+            assert name not in agent.valid_tool_names
+        assert agent.tools == []
+    finally:
+        clear_deep_memory_adapters()
+        mrt.clear_active_deep_memory_registry()
+
+
+def test_aws_managed_postgres_binding_injects_embed_fn_and_tools_remain_bound(monkeypatch):
+    """agent_init aws-managed postgres binding injects the resolved embed_fn; tools remain bound."""
+    import sys
+    import agentops_runtime.memory_record_store as mrs
+    from agent.runtime_backends import clear_deep_memory_adapters
+
+    _SENTINEL_EMBED = object()
+
+    def _fake_load(device="auto"):
+        return _SENTINEL_EMBED
+
+    monkeypatch.setattr(mrs, "_load_default_embed_fn", _fake_load)
+    monkeypatch.setitem(sys.modules, "psycopg2", _make_binding_fake_psycopg2())
+
+    mrt.clear_active_deep_memory_registry()
+    clear_deep_memory_adapters()
+    try:
+        db_url = "postgresql://user:secret@rds-host.example.com:5432/deepmem"
+        ctx = _aws_ctx()
+        agent = _agent(ctx)
+        with _without_aws_deep_memory_env():
+            _bind_deep_memory_backend(agent, {"agentops": {"deep_memory_db_url": db_url}})
+
+        reg = mrt.get_active_deep_memory_registry()
+        assert reg is not None, "aws-managed postgres binding must activate a registry"
+        backend = reg.get(BackendCapability.DEEP_MEMORY, ctx)
+        assert backend._embed_fn is _SENTINEL_EMBED, "backend must carry the resolved embed_fn"
+
+        for name in MEMORY_RECORD_TOOL_NAMES:
+            assert name in agent.valid_tool_names, f"{name} must be bound after postgres embed injection"
+    finally:
+        clear_deep_memory_adapters()
+        mrt.clear_active_deep_memory_registry()
