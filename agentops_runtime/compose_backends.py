@@ -41,6 +41,7 @@ from agent.runtime_queue_http import register_http_queue_backend
 from agent.runtime_run_lease_http import register_http_run_lease_backend
 from agent.runtime_secret_http import register_http_secret_backend
 from agent.runtime_session_http import register_http_session_backend
+from agent.runtime_skill_http import register_http_skill_backend
 from agent.runtime_worker_registry_http import register_http_worker_registry_backend
 
 _COMPOSE_PROFILE = "compose-self-hosted"
@@ -60,6 +61,7 @@ _CAPABILITY_URL_ENV: dict[BackendCapability, str] = {
     BackendCapability.QUEUE: "AGENTOPS_QUEUE_BACKEND_URL",
     BackendCapability.SECRET: "AGENTOPS_SECRET_STORE_URL",
     BackendCapability.CREDENTIAL: "AGENTOPS_CREDENTIAL_RESOLVER_URL",
+    BackendCapability.SKILL: "AGENTOPS_SKILL_URL",
 }
 _CAPABILITY_CONFIG_KEY: dict[BackendCapability, str] = {
     BackendCapability.MEMORY: "memory_url",
@@ -75,6 +77,7 @@ _CAPABILITY_CONFIG_KEY: dict[BackendCapability, str] = {
     BackendCapability.QUEUE: "queue_backend_url",
     BackendCapability.SECRET: "secret_store_url",
     BackendCapability.CREDENTIAL: "credential_resolver_url",
+    BackendCapability.SKILL: "skill_url",
 }
 
 
@@ -123,6 +126,7 @@ def configure_compose_runtime_backends(
     register_http_queue_backend(registry, profile)
     register_http_secret_backend(registry, profile)
     register_http_credential_backend(registry, profile)
+    register_http_skill_backend(registry, profile)
 
 
 def _agentops_config(config: Mapping[str, Any] | None) -> Mapping[str, Any]:

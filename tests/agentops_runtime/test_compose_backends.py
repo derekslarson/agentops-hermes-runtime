@@ -17,6 +17,7 @@ from agent.runtime_run_lease_http import HttpRunLeaseBackend
 from agent.runtime_queue_http import HttpQueueBackend
 from agent.runtime_secret_http import HttpSecretStoreBackend
 from agent.runtime_session_http import HttpSessionBackend
+from agent.runtime_skill_http import HttpSkillBackend
 from agent.runtime_worker_registry_http import HttpWorkerRegistry
 from agentops_runtime.compose_backends import configure_compose_runtime_backends
 
@@ -47,6 +48,7 @@ def test_registers_http_backends_for_each_capability():
     assert isinstance(registry.get(BackendCapability.QUEUE, context), HttpQueueBackend)
     assert isinstance(registry.get(BackendCapability.SECRET, context), HttpSecretStoreBackend)
     assert isinstance(registry.get(BackendCapability.CREDENTIAL, context), HttpCredentialResolver)
+    assert isinstance(registry.get(BackendCapability.SKILL, context), HttpSkillBackend)
 
 
 def test_worker_registry_uses_compose_backend_for_supervisor_none_context():
@@ -502,6 +504,7 @@ def test_app_and_integration_secrets_are_not_passed_into_options():
         BackendCapability.DELIVERY,
         BackendCapability.SECRET,
         BackendCapability.CREDENTIAL,
+        BackendCapability.SKILL,
     ):
         options = registry._capability_options(capability)
         assert set(options) <= {"base_url", "token", "timeout"}
@@ -528,7 +531,7 @@ def test_compose_required_capabilities_equals_required_capabilities_plus_deep_me
     assert BackendCapability.DEEP_MEMORY in COMPOSE_REQUIRED_CAPABILITIES
 
 
-def test_missing_compose_capabilities_reports_only_skill_after_partial_wiring():
+def test_missing_compose_capabilities_is_empty_after_full_wiring():
     from agentops_runtime.compose_backends import missing_compose_capabilities
 
     registry = RuntimeBackendRegistry()
@@ -537,7 +540,8 @@ def test_missing_compose_capabilities_reports_only_skill_after_partial_wiring():
     )
     missing = missing_compose_capabilities(registry)
     missing_values = {cap.value for cap in missing}
-    assert missing_values == {"skill"}
+    assert missing_values == set()
+    assert "skill" not in missing_values
     assert "credential" not in missing_values
     assert "secret" not in missing_values
     assert "delivery" not in missing_values
@@ -546,7 +550,6 @@ def test_missing_compose_capabilities_reports_only_skill_after_partial_wiring():
     assert "run_lease" not in missing_values
     assert "worker_registry" not in missing_values
     assert "queue" not in missing_values
-    assert [cap.value for cap in missing] == sorted(missing_values)
 
 
 def test_missing_compose_capabilities_result_contains_no_secrets_or_urls():
@@ -569,10 +572,8 @@ def test_missing_compose_capabilities_result_contains_no_secrets_or_urls():
 def test_validate_compose_backend_registration_fails_closed_on_partial_registration():
     from agentops_runtime.compose_backends import validate_compose_backend_registration
 
+    # Deliberately use an empty registry — no factories registered at all
     registry = RuntimeBackendRegistry()
-    configure_compose_runtime_backends(
-        registry, environ={"AGENTOPS_API_URL": "https://api.internal:8710"}
-    )
     with pytest.raises(ValueError) as exc_info:
         validate_compose_backend_registration(registry)
     error_msg = str(exc_info.value)
@@ -582,21 +583,12 @@ def test_validate_compose_backend_registration_fails_closed_on_partial_registrat
 def test_validate_compose_backend_registration_error_exposes_only_capability_names():
     from agentops_runtime.compose_backends import validate_compose_backend_registration
 
+    # Deliberately use an empty registry to trigger the error
     registry = RuntimeBackendRegistry()
-    configure_compose_runtime_backends(
-        registry,
-        environ={
-            "AGENTOPS_API_URL": "https://api.internal:8710",
-            "AGENTOPS_RUNTIME_TOKEN": "cp-secret-sentinel",
-        },
-    )
     with pytest.raises(ValueError) as exc_info:
         validate_compose_backend_registration(registry)
     error_msg = str(exc_info.value)
     for sensitive in (
-        "cp-secret-sentinel",
-        "api.internal",
-        "8710",
         "postgresql://",
         "/Users/",
         "compose-self-hosted",
@@ -618,3 +610,29 @@ def test_validate_compose_backend_registration_passes_after_full_registration():
     for cap in missing_compose_capabilities(registry):
         registry.register(cap, lambda opts: object(), profile=_PROFILE)
     validate_compose_backend_registration(registry)
+
+
+def test_skill_url_env_overrides_api_url():
+    registry = RuntimeBackendRegistry()
+    configure_compose_runtime_backends(
+        registry,
+        environ={
+            "AGENTOPS_API_URL": "https://api.internal",
+            "AGENTOPS_SKILL_URL": "https://skills.internal",
+        },
+    )
+
+    skill_opts = registry._capability_options(BackendCapability.SKILL)
+    assert skill_opts["base_url"] == "https://skills.internal"
+
+
+def test_skill_config_key_overrides_env():
+    registry = RuntimeBackendRegistry()
+    configure_compose_runtime_backends(
+        registry,
+        config={"agentops": {"skill_url": "https://config-skills.internal"}},
+        environ={"AGENTOPS_API_URL": "https://api.internal", "AGENTOPS_SKILL_URL": "https://env-skills.internal"},
+    )
+
+    skill_opts = registry._capability_options(BackendCapability.SKILL)
+    assert skill_opts["base_url"] == "https://config-skills.internal"

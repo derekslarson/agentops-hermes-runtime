@@ -51,25 +51,45 @@ def _bind_agentops_credential_broker(agent: Any, config: Dict[str, Any]) -> None
 def _bind_agentops_skill_backend(agent: Any, config: Dict[str, Any]) -> None:
     """Bind a configured AgentOps skill backend, failing closed for mutations.
 
-    If AgentOps selected a non-local skill backend but resolution fails, do not
-    install LocalSkillBackend as the active backend. Native reads can still fall
-    back to the local filesystem when no active backend is bound, but native
-    skill_manage must not silently mutate local files because a remote backend is
-    missing or misconfigured.
+    For non-local profiles, registers the HTTP skill adapter before resolving so
+    a missing or misconfigured remote backend fails closed rather than silently
+    falling back to the local filesystem. When resolution fails, native skill
+    tools are bound to a fail-closed backend that returns sanitized errors for
+    reads and mutations.
     """
     skill_runtime_context = getattr(agent, "runtime_context", None)
     if getattr(skill_runtime_context, "mode", None) != "agentops":
         return
 
     from agent.runtime_backends import BackendCapability, RuntimeBackendRegistry
-    from agent.runtime_skills import set_active_skill_backend
+    from agent.runtime_skills import FailClosedSkillBackend, set_active_skill_backend
 
     skill_registry = RuntimeBackendRegistry(config)
+    skill_profile = skill_registry.resolve_profile(BackendCapability.SKILL, skill_runtime_context)
+    backends_config = config.get("backends") if isinstance(config, dict) else None
+    capabilities = backends_config.get("capabilities") if isinstance(backends_config, dict) else None
+    capability_defaults = (
+        backends_config.get("capability_default_profiles") if isinstance(backends_config, dict) else None
+    )
+    explicit_skill_profile = (
+        getattr(skill_runtime_context, "backend_profile", None)
+        or (capabilities.get("skill") if isinstance(capabilities, dict) else None)
+        or (capability_defaults.get("skill") if isinstance(capability_defaults, dict) else None)
+        or (backends_config.get("default_profile") if isinstance(backends_config, dict) else None)
+    )
     try:
-        skill_backend = skill_registry.get(BackendCapability.SKILL, skill_runtime_context)
+        if skill_profile in {"local", "local-multi"}:
+            if explicit_skill_profile is None:
+                raise RuntimeError("AgentOps skill backend unavailable; local filesystem fallback is disabled")
+            from agent.runtime_backends import LocalSkillBackend
+            skill_backend: Any = LocalSkillBackend()
+        else:
+            from agent.runtime_skill_http import register_http_skill_backend
+            register_http_skill_backend(skill_registry, profile=skill_profile)
+            skill_backend = skill_registry.get(BackendCapability.SKILL, skill_runtime_context)
     except Exception as exc:
-        logger.warning("Failed to resolve AgentOps skill backend; leaving no active backend: %s", exc)
-        set_active_skill_backend(None, context=skill_runtime_context)
+        logger.warning("Failed to resolve AgentOps skill backend; binding fail-closed skill backend: %s", exc)
+        set_active_skill_backend(FailClosedSkillBackend(), context=skill_runtime_context)
         return
 
     set_active_skill_backend(skill_backend, context=skill_runtime_context)
@@ -1493,11 +1513,10 @@ def init_agent(
                 logger.warning("Failed to initialize AgentOps memory backend: %s", _memory_init_err)
             # Memory is optional in local compatibility mode -- don't break agent init
 
-    # Skills backend selection (M7). In AgentOps mode the native skill surfaces
-    # route through a scoped backend only when the configured backend resolves.
-    # If resolution fails, leave no active backend bound: reads may use the local
-    # filesystem fallback, but skill_manage must not mutate local files because a
-    # remote/configured backend failed open.
+    # Skills backend selection (M7/M12B). In AgentOps mode the native skill
+    # surfaces route through a scoped backend. Misconfigured remote/compose
+    # selection binds a fail-closed sentinel rather than clearing the backend and
+    # letting reads or mutations fall through to the local filesystem path.
     try:
         _bind_agentops_skill_backend(agent, _agent_cfg)
     except Exception as _skill_init_err:

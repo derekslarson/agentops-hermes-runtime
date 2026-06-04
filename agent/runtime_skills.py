@@ -42,6 +42,46 @@ class SkillMutationNotAllowed(PermissionError):
     """Raised (when configured) if a shared-scope mutation lacks approval."""
 
 
+class FailClosedSkillBackend:
+    """SkillBackend sentinel used when AgentOps skill routing is unavailable.
+
+    Binding this backend is intentionally different from clearing the active
+    backend: native skill tools will route through it and return a sanitized
+    failure instead of falling back to the local filesystem in an AgentOps
+    context whose remote skill backend failed to initialize.
+    """
+
+    _ERROR = "AgentOps skill backend unavailable; local filesystem fallback is disabled"
+
+    def list_skills(
+        self,
+        context: "RuntimeContext | None",
+        *,
+        category: str | None = None,
+    ) -> list[Mapping[str, Any]]:
+        raise RuntimeError(self._ERROR)
+
+    def load_skill(
+        self,
+        context: "RuntimeContext | None",
+        name: str,
+        *,
+        file_path: str | None = None,
+        preprocess: bool = True,
+    ) -> Mapping[str, Any] | None:
+        raise RuntimeError(self._ERROR)
+
+    def manage_skill(
+        self,
+        context: "RuntimeContext | None",
+        *,
+        action: str,
+        name: str,
+        **fields: Any,
+    ) -> Mapping[str, Any]:
+        raise RuntimeError(self._ERROR)
+
+
 def _precedence_index(scope: str) -> int:
     try:
         return SCOPE_PRECEDENCE.index(scope)

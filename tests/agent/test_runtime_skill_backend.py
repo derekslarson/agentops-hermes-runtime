@@ -28,7 +28,7 @@ from agent.runtime_backends import (
     RuntimeBackendRegistry,
     SkillBackend,
 )
-from agent.runtime_context import RuntimeContext
+from agent.runtime_context import RuntimeContext, use_runtime_context
 from agent.runtime_skills import (
     SCOPE_PRECEDENCE,
     ScopedSkillBackend,
@@ -68,7 +68,7 @@ def test_local_skill_backend_is_registry_default_and_protocol():
     assert isinstance(backend, SkillBackend)
 
 
-def test_agentops_skill_backend_resolution_failure_leaves_no_active_backend():
+def test_agentops_skill_backend_resolution_failure_binds_fail_closed_backend():
     from agent.agent_init import _bind_agentops_skill_backend
 
     clear_active_skill_backend()
@@ -80,7 +80,92 @@ def test_agentops_skill_backend_resolution_failure_leaves_no_active_backend():
 
     _bind_agentops_skill_backend(agent, config)
 
-    assert get_active_skill_backend(ctx) is None
+    backend = get_active_skill_backend(ctx)
+    assert backend is not None
+    with pytest.raises(RuntimeError, match="skill backend unavailable"):
+        backend.list_skills(ctx)
+
+
+def test_compose_profile_binds_http_skill_backend():
+    from agent.agent_init import _bind_agentops_skill_backend
+    from agent.runtime_skill_http import HttpSkillBackend
+
+    clear_active_skill_backend()
+    ctx = _ctx(user_id="derek", org_id="acme")
+    agent = SimpleNamespace(runtime_context=ctx)
+    config = {
+        "backends": {
+            "options": {"skill": {"base_url": "https://skills.internal"}},
+        }
+    }
+
+    _bind_agentops_skill_backend(agent, config)
+
+    backend = get_active_skill_backend(ctx)
+    assert isinstance(backend, HttpSkillBackend)
+    clear_active_skill_backend()
+
+
+def test_missing_remote_skill_backend_fails_closed_not_local_filesystem(tmp_path):
+    from agent.agent_init import _bind_agentops_skill_backend
+    from agent.runtime_backends import LocalSkillBackend
+    from tools.skills_tool import skills_list
+
+    clear_active_skill_backend()
+    ctx = _ctx(user_id="derek", org_id="acme")
+    agent = SimpleNamespace(runtime_context=ctx)
+    # compose profile but no base_url configured — should fail-closed, not fall back to local
+    config = {"backends": {"capabilities": {"skill": "compose-self-hosted"}}}
+
+    _bind_agentops_skill_backend(agent, config)
+
+    backend = get_active_skill_backend(ctx)
+    assert not isinstance(backend, LocalSkillBackend)
+    assert backend is not None
+
+    with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+        fs_skill = tmp_path / "fs-skill"
+        fs_skill.mkdir(parents=True)
+        (fs_skill / "SKILL.md").write_text(
+            "---\nname: fs-skill\ndescription: d.\n---\n\n# fs-skill\n\nBody.\n"
+        )
+        with use_runtime_context(ctx):
+            result = json.loads(skills_list())
+
+    assert result["success"] is False
+    assert "fs-skill" not in json.dumps(result)
+    assert "skill backend unavailable" in result["error"]
+    clear_active_skill_backend()
+
+
+def test_agentops_without_explicit_skill_profile_fails_closed_not_local_filesystem(tmp_path):
+    from agent.agent_init import _bind_agentops_skill_backend
+    from agent.runtime_backends import LocalSkillBackend
+    from tools.skills_tool import skill_view
+
+    clear_active_skill_backend()
+    ctx = RuntimeContext(mode="agentops", user_id="derek", org_id="acme")
+    agent = SimpleNamespace(runtime_context=ctx)
+
+    _bind_agentops_skill_backend(agent, {})
+
+    backend = get_active_skill_backend(ctx)
+    assert backend is not None
+    assert not isinstance(backend, LocalSkillBackend)
+
+    with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+        fs_skill = tmp_path / "fs-skill"
+        fs_skill.mkdir(parents=True)
+        (fs_skill / "SKILL.md").write_text(
+            "---\nname: fs-skill\ndescription: d.\n---\n\n# fs-skill\n\nBody.\n"
+        )
+        with use_runtime_context(ctx):
+            result = json.loads(skill_view("fs-skill"))
+
+    assert result["success"] is False
+    assert "Body." not in json.dumps(result)
+    assert "skill backend unavailable" in result["error"]
+    clear_active_skill_backend()
 
 
 def test_scope_precedence_is_deterministic_and_documented():
