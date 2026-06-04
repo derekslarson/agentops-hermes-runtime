@@ -27,6 +27,7 @@ from agentops_runtime.compose_backends import (
 )
 
 _MAX_SESSION_REQUEST_BODY_BYTES = 1_048_576
+_MAX_CREDENTIAL_REQUEST_BODY_BYTES = 1_048_576
 
 _SERVICE_PORTS = {
     "api": 8710,
@@ -147,6 +148,12 @@ class _Handler(BaseHTTPRequestHandler):
                 self.send_error(404)
                 return
             self._dispatch_sessions("POST", parsed)
+            return
+        if parsed.path == "/credentials/resolve":
+            if self.server.service_name != "api":  # type: ignore[attr-defined]
+                self.send_error(404)
+                return
+            self._dispatch_credentials("POST", parsed)
             return
         self.send_error(404)
 
@@ -344,6 +351,63 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _dispatch_credentials(self, method: str, parsed: urllib.parse.ParseResult) -> None:
+        from agentops_runtime.credentials_api import handle_credential_request
+
+        token = os.getenv("AGENTOPS_RUNTIME_TOKEN") or None
+        auth_header = self.headers.get("Authorization")
+        if token and auth_header != f"Bearer {token}":
+            error_body = json.dumps({"error": "unauthorized"}).encode("utf-8")
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(error_body)))
+            self.end_headers()
+            self.wfile.write(error_body)
+            return
+
+        body_bytes = b""
+        if method == "POST":
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+            except ValueError:
+                self._send_json_error(400, "invalid content length")
+                return
+            if length < 0:
+                self._send_json_error(400, "invalid content length")
+                return
+            if length > _MAX_CREDENTIAL_REQUEST_BODY_BYTES:
+                self._send_json_error(413, "request body too large")
+                return
+            body_bytes = self.rfile.read(length)
+
+        try:
+            backend = getattr(self.server, "credential_backend", None) or _get_or_create_credential_resolver()
+        except Exception:
+            error_body = json.dumps({"error": "credential resolver unavailable"}).encode("utf-8")
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(error_body)))
+            self.end_headers()
+            self.wfile.write(error_body)
+            return
+
+        status, response = handle_credential_request(
+            method=method,
+            path=parsed.path,
+            query_string=parsed.query,
+            body_bytes=body_bytes,
+            auth_header=auth_header,
+            token=token,
+            backend=backend,
+        )
+
+        body = json.dumps(response).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _send_json_error(self, status: int, message: str) -> None:
         body = json.dumps({"error": message}).encode("utf-8")
         self.send_response(status)
@@ -363,6 +427,7 @@ class _Server(ThreadingHTTPServer):
     artifact_backend: Any = None
     audit_backend: Any = None
     session_backend: Any = None
+    credential_backend: Any = None
 
 
 _memory_backend_lock = threading.Lock()
@@ -376,6 +441,9 @@ _audit_backend_instance: Any = None
 
 _session_backend_lock = threading.Lock()
 _session_backend_instance: Any = None
+
+_credential_resolver_lock = threading.Lock()
+_credential_resolver_instance: Any = None
 
 _SESSION_STATIC_PATH_SEGMENTS = frozenset({
     "create", "append", "messages", "search", "turn-lock",
@@ -404,7 +472,7 @@ def _sanitize_log_message(message: str) -> str:
         message,
     )
     return re.sub(
-        r"(/(?:memory/records|artifacts|audit|sessions)[^\s?\"]*)\?[^\s]+",
+        r"(/(?:memory/records|artifacts|audit|sessions|credentials)[^\s?\"]*)\?[^\s]+",
         r"\1?<redacted>",
         message,
     )
@@ -515,6 +583,55 @@ def _get_or_create_session_backend() -> Any:
         if _session_backend_instance is None:
             _session_backend_instance = _make_session_backend(dict(os.environ))
         return _session_backend_instance
+
+
+def _make_credential_resolver(environ: dict[str, str]) -> Any:
+    """Create a compose-safe deterministic credential resolver.
+
+    Does not read local env vars, profiles, or secret files. Returns a stable
+    opaque secret-ref derived from credential-scope + logical ref. A later
+    bootstrap/secret-store slice will seed the actual secret values behind
+    these refs.
+    """
+    return _DeterministicCredentialResolver()
+
+
+def _get_or_create_credential_resolver() -> Any:
+    global _credential_resolver_instance
+    with _credential_resolver_lock:
+        if _credential_resolver_instance is None:
+            _credential_resolver_instance = _make_credential_resolver(dict(os.environ))
+        return _credential_resolver_instance
+
+
+class _DeterministicCredentialResolver:
+    """Compose-safe credential resolver that maps scope+ref to a stable opaque ref.
+
+    No local env/profile reads. Returns None for null context (missing scope).
+    Stable non-secret refs are seeds for a later bootstrap/secret-store slice.
+    """
+
+    def resolve(self, context: Any, ref: str) -> str | None:
+        import hashlib
+
+        if context is None:
+            return None
+        canonical = json.dumps(
+            [
+                context.org_id or "",
+                context.workspace_id or "",
+                context.workspace_type or "",
+                context.user_id or "",
+                context.project_id or "",
+                context.agent_profile_id or "",
+                context.permissions_ref or "",
+                context.backend_profile or "",
+                ref,
+            ],
+            separators=(",", ":"),
+        )
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        return f"cred-{digest[:32]}"
 
 
 def main(argv: list[str] | None = None) -> int:
