@@ -1,7 +1,8 @@
 """Compose self-hosted runtime backend wiring (M12).
 
 Registers the existing provider-neutral HTTP adapters (memory, cron, artifact,
-audit) for the ``compose-self-hosted`` deployment profile, deriving connection
+audit, conversation router) for the ``compose-self-hosted`` deployment profile,
+deriving connection
 settings from AgentOps compose env/config. The wiring is intentionally narrow:
 
 * It reuses the adapters' own ``register_http_*`` helpers, so the registry keeps
@@ -29,6 +30,7 @@ from agent.runtime_artifacts_audit import (
     register_http_audit_backend,
 )
 from agent.runtime_backends import BackendCapability, REQUIRED_CAPABILITIES, RuntimeBackendRegistry
+from agent.runtime_conversation_router_http import register_http_conversation_router_backend
 from agent.runtime_cron_http import register_http_cron_backend
 from agent.runtime_memory_http import register_http_memory_backend
 from agent.runtime_memory_record_http import register_http_memory_record_backend
@@ -42,6 +44,7 @@ _CAPABILITY_URL_ENV: dict[BackendCapability, str] = {
     BackendCapability.CRON: "AGENTOPS_CRON_URL",
     BackendCapability.ARTIFACT: "AGENTOPS_ARTIFACT_URL",
     BackendCapability.AUDIT: "AGENTOPS_AUDIT_URL",
+    BackendCapability.CONVERSATION_ROUTER: "AGENTOPS_CONVERSATION_ROUTER_URL",
 }
 _CAPABILITY_CONFIG_KEY: dict[BackendCapability, str] = {
     BackendCapability.MEMORY: "memory_url",
@@ -49,6 +52,7 @@ _CAPABILITY_CONFIG_KEY: dict[BackendCapability, str] = {
     BackendCapability.CRON: "cron_url",
     BackendCapability.ARTIFACT: "artifact_url",
     BackendCapability.AUDIT: "audit_url",
+    BackendCapability.CONVERSATION_ROUTER: "conversation_router_url",
 }
 
 
@@ -88,6 +92,7 @@ def configure_compose_runtime_backends(
     register_http_cron_backend(registry, profile)
     register_http_artifact_backend(registry, profile=profile)
     register_http_audit_backend(registry, profile=profile)
+    register_http_conversation_router_backend(registry, profile)
 
 
 def _agentops_config(config: Mapping[str, Any] | None) -> Mapping[str, Any]:
