@@ -142,3 +142,33 @@ def test_compose_runtime_image_installs_postgres_driver_extra():
 
     assert any(dep.startswith("psycopg2-binary==") for dep in postgres_extra)
     assert "--extra postgres" in dockerfile
+
+
+def test_deep_memory_extra_exists_in_pyproject_with_lazy_deps_pins():
+    import sys
+    sys.path.insert(0, str(REPO_ROOT))
+    from tools.lazy_deps import LAZY_DEPS
+
+    pyproject = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    optional_deps = pyproject["project"]["optional-dependencies"]
+
+    assert "deep-memory" in optional_deps, (
+        "pyproject.toml must declare [project.optional-dependencies.deep-memory]"
+    )
+    deep_memory_pins = set(optional_deps["deep-memory"])
+    lazy_pins = set(LAZY_DEPS["memory.local"])
+
+    assert "chromadb==1.5.9" in deep_memory_pins
+    assert "onnxruntime==1.26.0" in deep_memory_pins
+    assert deep_memory_pins == lazy_pins, (
+        f"deep-memory extra pins {deep_memory_pins} must exactly match "
+        f"LAZY_DEPS['memory.local'] {lazy_pins}"
+    )
+
+
+def test_compose_runtime_image_installs_deep_memory_extra():
+    dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    assert "--extra deep-memory" in dockerfile, (
+        "Dockerfile uv sync line must include --extra deep-memory for the runtime image"
+    )

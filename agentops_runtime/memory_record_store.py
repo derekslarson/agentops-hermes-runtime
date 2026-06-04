@@ -128,8 +128,8 @@ def _load_default_embed_fn(device: str = "auto"):
         return _get_chroma_embedding_function(device)
     except Exception:
         raise RuntimeError(
-            "Postgres deep-memory embedding requires chromadb+onnxruntime extras; "
-            "pip install 'agentops[deep-memory]' or supply embed_fn= at construction time"
+            "Postgres deep-memory embedding requires chromadb+onnxruntime; "
+            "install 'hermes-agent[deep-memory]' or supply embed_fn= at construction time"
         ) from None
 
 
@@ -190,7 +190,7 @@ class RelationalMemoryRecordBackend:
             except Exception:
                 raise RuntimeError(
                     "Postgres deep-memory embedding unavailable; "
-                    "install optional extras or supply embed_fn= at construction time"
+                    "install 'hermes-agent[deep-memory]' or supply embed_fn= at construction time"
                 ) from None
         try:
             vectors = embed_fn([text])

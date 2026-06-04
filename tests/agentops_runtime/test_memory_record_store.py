@@ -2347,6 +2347,57 @@ def test_postgres_bm25_score_field_is_okapi_value_not_sql_score(monkeypatch):
     )
 
 
+# ---------------------------------------------------------------------------
+# M5B — embedder packaging / install hint (nineteenth slice)
+# ---------------------------------------------------------------------------
+
+
+def test_load_default_embed_fn_failure_mentions_hermes_agent_deep_memory(monkeypatch):
+    """When _get_chroma_embedding_function raises, the RuntimeError must mention
+    hermes-agent[deep-memory] and must NOT mention agentops[deep-memory].
+    """
+    import agentops_runtime.memory_record_store as mod
+
+    monkeypatch.setattr(
+        mod,
+        "_get_chroma_embedding_function",
+        lambda *_a, **_kw: (_ for _ in ()).throw(ImportError("chromadb not installed")),
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        mod._load_default_embed_fn()
+
+    error_msg = str(exc_info.value)
+    assert "hermes-agent[deep-memory]" in error_msg, (
+        f"Error must mention 'hermes-agent[deep-memory]', got: {error_msg!r}"
+    )
+    assert "agentops[deep-memory]" not in error_msg, (
+        f"Error must NOT mention 'agentops[deep-memory]', got: {error_msg!r}"
+    )
+
+
+def test_compute_pg_embedding_failure_mentions_hermes_agent_deep_memory(monkeypatch):
+    """The real Postgres embedding path must preserve the install-extra hint."""
+    import agentops_runtime.memory_record_store as mod
+
+    monkeypatch.setattr(
+        mod,
+        "_load_default_embed_fn",
+        lambda: (_ for _ in ()).throw(RuntimeError("install 'hermes-agent[deep-memory]'")),
+    )
+    backend = object.__new__(mod.RelationalMemoryRecordBackend)
+    backend._embed_fn = None
+
+    with pytest.raises(RuntimeError) as exc_info:
+        backend._compute_pg_embedding("hello")
+
+    error_msg = str(exc_info.value)
+    assert "hermes-agent[deep-memory]" in error_msg
+    assert "embed_fn=" in error_msg
+    assert "agentops[deep-memory]" not in error_msg
+
+
 def test_postgres_and_sqlite_agree_on_bm25_ordering(tmp_path, monkeypatch):
     """Postgres and SQLite must agree on BM25 ranking order for the same candidate corpus.
 

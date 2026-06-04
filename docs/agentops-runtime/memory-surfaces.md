@@ -76,12 +76,13 @@ Key properties (see `agent/local_memory/` and `agent/runtime_backends.py`):
     tenant's records. There is no `$HERMES_HOME/deep-memory`, Chroma, or
     in-process fallback for AgentOps remote/managed profiles.
 
-**Open work (M5B not yet complete):** Vector embedding population for the
-Postgres/pgvector path and extracted-signal boost parity with the local
-deep-memory provider remain unfinished. The current Postgres adapter stores
-`embedding` as `NULL` and searches use full-text/BM25 only. Do not assume full
-vector search or extracted-signal rank parity in managed cloud profiles until
-these items land.
+**Open work (M5B not yet complete):** Full production vector embedding
+population (injecting a real `embed_fn` at runtime) and full-corpus BM25
+truncation exactness remain open. The Postgres adapter supports vector
+embedding via an injected `embed_fn=` and searches use Okapi BM25 + extracted-
+signal boost, but a production `embed_fn` is not yet wired into the
+compose/cloud startup path. Do not assume full end-to-end vector search parity
+in managed cloud profiles until that wiring lands.
 - **Imports** (`scripts/local_memory_import.py`) are idempotent and
   source-preserving, and **require an explicit target scope/profile**
   (`--storage-dir` or `--profile`/`--hermes-home`) so bulk history cannot

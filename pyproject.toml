@@ -215,6 +215,10 @@ all = [
 postgres = [
     "psycopg2-binary==2.9.11",
 ]
+deep-memory = [
+    "chromadb==1.5.9",
+    "onnxruntime==1.26.0",
+]
 
 [project.scripts]
 hermes = "hermes_cli.main:main"
