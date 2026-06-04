@@ -1023,3 +1023,271 @@ def test_postgres_search_sql_has_exact_placeholder_count_and_limit_placeholder()
     # 7 scope + 2 metadata + vector rank + text rank + vector candidate + FTS candidate + limit.
     assert sql.count("%s") == 14
     assert re.search(r"LIMIT\s+%s\s*;", sql)
+
+
+# ---------------------------------------------------------------------------
+# Vector embedding population (M5B vector-binding slice)
+# ---------------------------------------------------------------------------
+
+
+def _make_fake_embed_fn(dim: int = 384):
+    """Deterministic fake embed_fn returning dim-dimensional unit vectors."""
+    def embed_fn(texts):
+        return [[float(i % 10) / 10.0 for i in range(dim)] for _ in texts]
+    return embed_fn
+
+
+def test_pgvector_literal_formats_384_dim_vector():
+    from agentops_runtime.memory_record_store import _pgvector_literal
+
+    vec = [float(i) / 384.0 for i in range(384)]
+    result = _pgvector_literal(vec)
+    assert result.startswith("[")
+    assert result.endswith("]")
+    assert result.count(",") == 383
+
+
+def test_pgvector_literal_rejects_wrong_dimension():
+    from agentops_runtime.memory_record_store import _pgvector_literal
+
+    with pytest.raises(ValueError):
+        _pgvector_literal([0.1, 0.2, 0.3])
+
+
+def test_pgvector_literal_rejects_empty():
+    from agentops_runtime.memory_record_store import _pgvector_literal
+
+    with pytest.raises(ValueError):
+        _pgvector_literal([])
+
+
+def test_pgvector_literal_coerces_to_float():
+    from agentops_runtime.memory_record_store import _pgvector_literal
+
+    vec = [str(i) for i in range(384)]
+    result = _pgvector_literal(vec)
+    assert result.startswith("[")
+    assert result.endswith("]")
+    assert "." in result
+
+
+def test_postgres_upsert_with_embed_fn_binds_non_null_vector(monkeypatch):
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    connection = _FakePostgresConnection()
+    _install_fake_psycopg2(monkeypatch, connection)
+    connection.upsert_row = _pg_row(record_id="mem_vec_upsert")
+    backend = RelationalMemoryRecordBackend(
+        "postgresql://user:pass@db.example/deepmem",
+        embed_fn=_make_fake_embed_fn(),
+    )
+    backend.upsert_record(_CTX_A, text="test vector binding", record_id="mem_vec_upsert")
+    upsert_params = next(params for sql, params in connection.executed if "ON CONFLICT" in sql)
+    embedding_param = upsert_params[-1]
+    assert embedding_param is not None
+    assert isinstance(embedding_param, str)
+    assert embedding_param.startswith("[")
+    assert embedding_param.endswith("]")
+    assert embedding_param.count(",") == 383
+
+
+def test_postgres_search_with_embed_fn_binds_vector_to_both_vector_slots(monkeypatch):
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    connection = _FakePostgresConnection()
+    _install_fake_psycopg2(monkeypatch, connection)
+    connection.search_rows = [_pg_row(record_id="mem_vec_search", score=0.9)]
+    backend = RelationalMemoryRecordBackend(
+        "postgresql://user:pass@db.example/deepmem",
+        embed_fn=_make_fake_embed_fn(),
+    )
+    backend.search(_CTX_A, "neural network", limit=1)
+    search_params = next(params for sql, params in connection.executed if "FROM ranked" in sql)
+    # position 9 = vector rank param, position 11 = vector IS NOT NULL candidate filter
+    vector_rank_param = search_params[9]
+    vector_cand_param = search_params[11]
+    assert vector_rank_param is not None
+    assert isinstance(vector_rank_param, str)
+    assert vector_rank_param.startswith("[")
+    assert vector_rank_param == vector_cand_param
+
+
+def test_postgres_injected_embed_fn_takes_precedence_over_default(monkeypatch):
+    import agentops_runtime.memory_record_store as mod
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    connection = _FakePostgresConnection()
+    _install_fake_psycopg2(monkeypatch, connection)
+    connection.upsert_row = _pg_row(record_id="mem_inject")
+
+    calls = []
+
+    def tracking_embed_fn(texts):
+        calls.extend(texts)
+        return [[0.0] * 384 for _ in texts]
+
+    monkeypatch.setattr(mod, "_load_default_embed_fn", lambda *_a, **_kw: (_ for _ in ()).throw(
+        RuntimeError("default embedder must not be called when embed_fn is injected")
+    ), raising=False)
+
+    backend = RelationalMemoryRecordBackend(
+        "postgresql://user:pass@db.example/deepmem",
+        embed_fn=tracking_embed_fn,
+    )
+    backend.upsert_record(_CTX_A, text="injection test", record_id="mem_inject")
+    assert "injection test" in calls
+
+
+def test_postgres_default_embedder_failure_is_sanitized(monkeypatch):
+    import agentops_runtime.memory_record_store as mod
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    connection = _FakePostgresConnection()
+    _install_fake_psycopg2(monkeypatch, connection)
+    connection.upsert_row = _pg_row()
+
+    sentinel_msg = "LEAKSENTINEL_EMBED_FAIL chromadb unavailable password=secret_dsn_val"
+    monkeypatch.setattr(
+        mod,
+        "_load_default_embed_fn",
+        lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError(sentinel_msg)),
+        raising=False,
+    )
+
+    backend = RelationalMemoryRecordBackend("postgresql://user:password@db.example/deepmem")
+    with pytest.raises(RuntimeError) as exc_info:
+        backend.upsert_record(_CTX_A, text="test sanitized", record_id="mem_sanitized")
+    assert "LEAKSENTINEL_EMBED_FAIL" not in str(exc_info.value)
+    assert "secret_dsn_val" not in str(exc_info.value)
+    assert "LEAKSENTINEL_EMBED_FAIL" not in "".join(traceback.format_exception(exc_info.value))
+
+
+def test_postgres_embedder_valueerror_does_not_leak_sentinel(monkeypatch):
+    """Embedder-raised ValueError must be sanitized — not re-raised with raw message.
+
+    When _load_default_embed_fn succeeds but the returned embed_fn raises a
+    ValueError containing a sentinel/password string, that raw message must not
+    appear in the raised exception or its formatted traceback.
+    """
+    import agentops_runtime.memory_record_store as mod
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    connection = _FakePostgresConnection()
+    _install_fake_psycopg2(monkeypatch, connection)
+
+    def leaking_embed_fn(texts):
+        raise ValueError("LEAKSENTINEL_DEFAULT_EMBED password=secret")
+
+    monkeypatch.setattr(
+        mod,
+        "_load_default_embed_fn",
+        lambda *_a, **_kw: leaking_embed_fn,
+        raising=False,
+    )
+
+    backend = RelationalMemoryRecordBackend("postgresql://user:***@db.example/deepmem")
+    with pytest.raises(Exception) as exc_info:
+        backend.upsert_record(_CTX_A, text="leak test", record_id="mem_leak_test")
+
+    assert not isinstance(exc_info.value, ValueError), (
+        "raw ValueError from embedder must not escape — must be wrapped as RuntimeError"
+    )
+    error_msg = str(exc_info.value)
+    assert "LEAKSENTINEL_DEFAULT_EMBED" not in error_msg
+    assert "password=secret" not in error_msg
+    formatted = "".join(traceback.format_exception(exc_info.value))
+    assert "LEAKSENTINEL_DEFAULT_EMBED" not in formatted
+    assert "password=secret" not in formatted
+
+
+def test_pgvector_literal_non_float_value_does_not_leak_sentinel(monkeypatch):
+    """float() coercion failure in _pgvector_literal must not leak raw vector values."""
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    connection = _FakePostgresConnection()
+    _install_fake_psycopg2(monkeypatch, connection)
+
+    sentinel = "LEAKSENTINEL_VECTOR password=secret"
+
+    def leaking_vector_embed_fn(texts):
+        return [[sentinel] + [0.1] * 383]
+
+    backend = RelationalMemoryRecordBackend(
+        "postgresql://user:***@db.example/deepmem",
+        embed_fn=leaking_vector_embed_fn,
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        backend.upsert_record(_CTX_A, text="sentinel leak test", record_id="mem_vector_leak")
+
+    error_msg = str(exc_info.value)
+    assert "LEAKSENTINEL_VECTOR" not in error_msg
+    assert "password=secret" not in error_msg
+    formatted = "".join(traceback.format_exception(exc_info.value))
+    assert "LEAKSENTINEL_VECTOR" not in formatted
+    assert "password=secret" not in formatted
+
+
+def test_postgres_invalid_embedding_dimension_fails_before_db_write(monkeypatch):
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    connection = _FakePostgresConnection()
+    _install_fake_psycopg2(monkeypatch, connection)
+
+    wrong_dim_embed_fn = _make_fake_embed_fn(dim=3)
+
+    backend = RelationalMemoryRecordBackend(
+        "postgresql://user:pass@db.example/deepmem",
+        embed_fn=wrong_dim_embed_fn,
+    )
+    upserts_before = sum(1 for sql, _ in connection.executed if "ON CONFLICT" in sql)
+    with pytest.raises((ValueError, RuntimeError)):
+        backend.upsert_record(_CTX_A, text="dim fail test", record_id="mem_dim_fail")
+    upserts_after = sum(1 for sql, _ in connection.executed if "ON CONFLICT" in sql)
+    assert upserts_after == upserts_before, "DB write must not occur for invalid vector dims"
+
+
+def test_pgvector_literal_custom_float_runtime_error_does_not_leak_sentinel():
+    """__float__ raising RuntimeError must be sanitized — sentinel must not appear."""
+    from agentops_runtime.memory_record_store import _pgvector_literal
+
+    sentinel = "LEAKSENTINEL_FLOAT password=secret"
+
+    class _BadFloat:
+        def __float__(self):
+            raise RuntimeError(sentinel)
+
+    vec = [_BadFloat()] + [0.1] * 383
+
+    with pytest.raises(Exception) as exc_info:
+        _pgvector_literal(vec)
+
+    error_msg = str(exc_info.value)
+    assert sentinel not in error_msg
+    assert "password=secret" not in error_msg
+    formatted = "".join(traceback.format_exception(exc_info.value))
+    assert sentinel not in formatted
+    assert "password=secret" not in formatted
+
+
+def test_compute_pg_embedding_empty_embedder_return_fails_safely(monkeypatch):
+    """embed_fn returning [] must raise a sanitized RuntimeError with no raw internal text."""
+    from agentops_runtime.memory_record_store import RelationalMemoryRecordBackend
+
+    connection = _FakePostgresConnection()
+    _install_fake_psycopg2(monkeypatch, connection)
+
+    def empty_embed_fn(texts):
+        return []
+
+    backend = RelationalMemoryRecordBackend(
+        "postgresql://user:***@db.example/deepmem",
+        embed_fn=empty_embed_fn,
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        backend.upsert_record(_CTX_A, text="empty embed test", record_id="mem_empty_embed")
+
+    assert exc_info.value.__cause__ is None
+    assert "list index out of range" not in str(exc_info.value)
+    assert "IndexError" not in str(exc_info.value)

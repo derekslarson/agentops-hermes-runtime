@@ -620,6 +620,25 @@ Caveats:
 
 **Goal:** Make deep-memory record recall feature-parity for compose/cloud profiles, not just local/local-multi. The cloud runtime must ingest completed turns, prefetch scoped hints, and serve `memory_record_search` / `memory_record_get` / `memory_record_get_many` through a durable remote backend with the same user-visible semantics as Derek's local Hermes.
 
+**In-progress note (2026-06-03, TDD — eleventh slice, quality fix):** Sanitizer hardening for vector conversion paths. This does NOT complete M5B.
+
+Delivered (quality fix on top of eleventh slice):
+- `agentops_runtime/memory_record_store.py` — Hardened `_pgvector_literal`: wrapped `list(vec)` in a blanket `except Exception … from None` so un-iterable or sentinel-carrying iterators can't leak; broadened the float-coercion catch from `(ValueError, TypeError)` to `Exception` so custom `__float__` raising `RuntimeError` or any other type is sanitized. Hardened `_compute_pg_embedding`: split the `_pgvector_literal(vectors[0])` call into two guarded steps — `vectors[0]` access is now wrapped in `except Exception → RuntimeError from None` (catches `IndexError` from an empty embedder return), and any non-`ValueError` from `_pgvector_literal` is caught and re-raised as sanitized `RuntimeError from None`. Dimension-mismatch `ValueError` (non-secret) still propagates unchanged.
+- `tests/agentops_runtime/test_memory_record_store.py` — 2 new regression tests: `test_pgvector_literal_custom_float_runtime_error_does_not_leak_sentinel` (object with `__float__` raising `RuntimeError("LEAKSENTINEL_FLOAT password=secret")` must not appear in exception or formatted traceback); `test_compute_pg_embedding_empty_embedder_return_fails_safely` (embed_fn returning `[]` must raise sanitized `RuntimeError` with no raw `IndexError` text and `__cause__ is None`).
+
+**In-progress note (2026-06-03, TDD — eleventh slice, original):** Postgres vector embedding population (vector-binding) slice has landed. This does NOT complete M5B.
+
+Delivered:
+- `agentops_runtime/memory_record_store.py` — Added `_load_default_embed_fn(device)` (wraps `get_embedding_function` from `agent.local_memory.store`, fails closed with sanitized `RuntimeError` if unavailable). Added `_pgvector_literal(vec)` (validates exactly 384 floats, returns `[v0,v1,...]` bound-parameter string). Added `embed_fn=None` keyword-only seam to `RelationalMemoryRecordBackend.__init__`. Added `_compute_pg_embedding(text)` method: uses injected `embed_fn` if present, otherwise calls `_load_default_embed_fn()`; sanitizes all exception causes to prevent DSN/sentinel leakage; validates dimensions via `_pgvector_literal` before any DB write. `_pg_upsert_record` now binds `_compute_pg_embedding(text)` instead of `None` for the embedding column. `search()` Postgres path now computes `vec_literal = _compute_pg_embedding(query)` once and binds it to both `%s::vector` placeholders (rank component and IS-NOT-NULL candidate filter).
+- `tests/agentops_runtime/test_memory_record_store.py` — 13 vector-binding tests total (9 original RED→GREEN + 2 sentinel/leak regressions from quality fix + 2 pre-existing from embedder ValueError hardening). Full suite: `./scripts/run_tests.sh tests/agentops_runtime/test_memory_record_store.py` → 83 passed (was 70 before this slice). `ruff check` and `git diff --check` clean.
+
+Test evidence (RED→GREEN): All 9 original tests confirmed FAIL before production changes (4× `ImportError: cannot import name '_pgvector_literal'`, 4× `TypeError: unexpected keyword argument 'embed_fn'`, 1× `Failed: DID NOT RAISE`). 2 quality-fix regression tests confirmed FAIL before sanitizer hardening (`RuntimeError("LEAKSENTINEL_FLOAT password=secret")` escaped; `IndexError` propagated instead of `RuntimeError`). All 13 pass after implementation + hardening.
+
+Remaining open M5B criteria (still Started):
+- Extracted-signal boost parity: `RelationalMemoryRecordBackend` does not yet ingest extracted-signal records or apply the `extracted_signal_boost` weight from the ranker config; Postgres `score` formula weights vector 0.6 + BM25 0.4 but does not separately surface BM25 vs vector components in `SearchResult.matched_via` for remote results.
+- BM25 exactness on Postgres: Postgres uses `ts_rank` (PostgreSQL FTS) rather than Okapi BM25; local SQLite uses the Python `_bm25_scores` implementation. These produce different rank orderings for the same corpus — not yet unified.
+- Cloud embedder packaging: `_load_default_embed_fn` relies on the same `chromadb` + ONNX MiniLM model used by the local store. A cloud/compose deployment without the local extras installed will fail closed. An explicit `embed_fn` injection path exists for production wiring but no compose/aws-managed wiring yet passes it.
+
 **In-progress note (2026-06-03, TDD — tenth slice):** aws-managed agent-loop wiring slice has landed. This does NOT complete M5B.
 
 Delivered:

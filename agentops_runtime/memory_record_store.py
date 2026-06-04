@@ -24,7 +24,7 @@ import time
 from typing import Any, Iterable, Mapping
 from urllib.parse import urlparse, urlunparse
 
-from agent.local_memory.store import MemoryRecord, SearchResult, _bm25_scores
+from agent.local_memory.store import MemoryRecord, SearchResult, _bm25_scores, get_embedding_function as _get_chroma_embedding_function
 from agent.runtime_context import RuntimeContext
 
 _SCOPE_FIELDS = (
@@ -123,6 +123,32 @@ def _postgres_search_query(query: str) -> str:
     return " OR ".join(tokens) if tokens else query
 
 
+def _load_default_embed_fn(device: str = "auto"):
+    try:
+        return _get_chroma_embedding_function(device)
+    except Exception:
+        raise RuntimeError(
+            "Postgres deep-memory embedding requires chromadb+onnxruntime extras; "
+            "pip install 'agentops[deep-memory]' or supply embed_fn= at construction time"
+        ) from None
+
+
+def _pgvector_literal(vec) -> str:
+    try:
+        raw = list(vec)
+    except Exception:
+        raise ValueError("deep-memory embedding must be a sequence of numeric values") from None
+    if len(raw) != EMBEDDING_DIM:
+        raise ValueError(
+            f"deep-memory embedding must be exactly {EMBEDDING_DIM} dimensions, got {len(raw)}"
+        )
+    try:
+        values = [float(v) for v in raw]
+    except Exception:
+        raise ValueError("deep-memory embedding values must be numeric") from None
+    return "[" + ",".join(str(v) for v in values) + "]"
+
+
 _SCOPE_PRED = (
     "scope_mode=? AND scope_org_id=? AND scope_workspace_id=? AND "
     "scope_project_id=? AND scope_agent_profile_id=? AND "
@@ -139,13 +165,39 @@ class RelationalMemoryRecordBackend:
              closed instead of falling back to local storage.
     """
 
-    def __init__(self, db_url: str) -> None:
+    def __init__(self, db_url: str, *, embed_fn=None) -> None:
+        self._embed_fn = embed_fn
         self._driver, self._db_url_or_path = self._resolve_database(db_url)
         self._local = threading.local()
         if self._driver == "postgres":
             self._init_postgres()
         else:
             self._init_db()
+
+    def _compute_pg_embedding(self, text: str) -> str | None:
+        embed_fn = self._embed_fn
+        if embed_fn is None:
+            try:
+                embed_fn = _load_default_embed_fn()
+            except Exception:
+                raise RuntimeError(
+                    "Postgres deep-memory embedding unavailable; "
+                    "install optional extras or supply embed_fn= at construction time"
+                ) from None
+        try:
+            vectors = embed_fn([text])
+        except Exception:
+            raise RuntimeError("deep-memory embedding computation failed") from None
+        try:
+            vec = vectors[0]
+        except Exception:
+            raise RuntimeError("deep-memory embedding computation failed") from None
+        try:
+            return _pgvector_literal(vec)
+        except ValueError:
+            raise
+        except Exception:
+            raise RuntimeError("deep-memory embedding computation failed") from None
 
     def _resolve_database(self, db_url: str) -> tuple[str, str]:
         if not db_url:
@@ -320,7 +372,7 @@ class RelationalMemoryRecordBackend:
                 now,
                 record_kind,
                 parent_id,
-                None,
+                self._compute_pg_embedding(text),
             ),
         )
         if stored_row:
@@ -493,15 +545,16 @@ class RelationalMemoryRecordBackend:
         if self._driver == "postgres":
             filter_json = json.dumps(dict(filters)) if filters else None
             ts_query = _postgres_search_query(query)
+            vec_literal = self._compute_pg_embedding(query)
             rows = self._fetchall_postgres(
                 _postgres_search_sql(),
                 (
                     *scope,
                     filter_json,
                     filter_json,
-                    None,
+                    vec_literal,
                     ts_query,
-                    None,
+                    vec_literal,
                     ts_query,
                     safe_limit,
                 ),
