@@ -15,8 +15,11 @@ services:
       - AGENTOPS_QUEUE_URL=redis://redis:6379/0
       - AGENTOPS_ARTIFACT_ENDPOINT=http://minio:9000
       - AGENTOPS_ARTIFACT_BUCKET=${AGENTOPS_ARTIFACT_BUCKET:-agentops-artifacts}
+      - AGENTOPS_ARTIFACT_ROOT=/var/lib/agentops/artifacts
       - AGENTOPS_SECRET_STORE_URL=http://local-secrets:8713
       - AGENTOPS_API_URL=http://api:8710
+    volumes:
+      - agentops-artifacts:/var/lib/agentops/artifacts
     depends_on:
       postgres:
         condition: service_healthy
@@ -177,3 +180,4 @@ volumes:
   agentops-postgres:
   agentops-redis:
   agentops-minio:
+  agentops-artifacts:

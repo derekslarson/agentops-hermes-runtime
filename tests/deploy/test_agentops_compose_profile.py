@@ -172,3 +172,23 @@ def test_compose_runtime_image_installs_deep_memory_extra():
     assert "--extra deep-memory" in dockerfile, (
         "Dockerfile uv sync line must include --extra deep-memory for the runtime image"
     )
+
+
+def test_api_service_has_artifact_root_env():
+    services = _compose()["services"]
+    api_env = "\n".join(services["api"]["environment"])
+    assert "AGENTOPS_ARTIFACT_ROOT=/var/lib/agentops/artifacts" in api_env
+
+
+def test_api_service_mounts_named_artifact_volume():
+    services = _compose()["services"]
+    api = services["api"]
+    assert "volumes" in api
+    volume_strings = [str(v) for v in api["volumes"]]
+    assert any("/var/lib/agentops/artifacts" in v for v in volume_strings)
+
+
+def test_compose_declares_artifact_volume():
+    compose = _compose()
+    assert "volumes" in compose
+    assert "agentops-artifacts" in compose["volumes"]

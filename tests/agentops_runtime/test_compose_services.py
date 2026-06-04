@@ -696,3 +696,235 @@ def test_readiness_payload_omits_env_derived_runtime_values(monkeypatch):
     assert "backend_profile" not in payload
     assert "compose-self-hosted" not in encoded
     assert "agentops" not in encoded
+
+
+# ---------------------------------------------------------------------------
+# M12B: Artifact endpoint routing and backend
+# ---------------------------------------------------------------------------
+
+
+import base64 as _base64
+
+
+class _FakeArtifactBackend:
+    def __init__(self):
+        self._store: dict = {}
+
+    def _key(self, context, ref):
+        if context is None:
+            return (None, ref)
+        d = context.to_dict()
+        return (tuple(sorted((k, d.get(k)) for k in d if k != "metadata")), ref)
+
+    def put(self, context, ref, data):
+        self._store[self._key(context, ref)] = bytes(data)
+        return ref
+
+    def get(self, context, ref):
+        return self._store.get(self._key(context, ref))
+
+    def list_artifacts(self, context):
+        scope = self._key(context, None)[0]
+        return sorted(k[1] for k in self._store if k[0] == scope)
+
+
+_ARTIFACT_SCOPE = {
+    "mode": "agentops",
+    "org_id": "org1",
+    "workspace_id": "ws1",
+    "workspace_type": "team",
+    "user_id": "alice",
+    "conversation_id": "conv1",
+    "external_channel_id": None,
+    "external_thread_id": None,
+    "agent_profile_id": "bot",
+    "project_id": "proj1",
+    "run_id": "run1",
+    "run_type": "conversation",
+    "job_id": None,
+    "parent_session_id": None,
+    "backend_profile": "compose-self-hosted",
+}
+
+
+@pytest.fixture
+def _api_server_with_artifact():
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    server.artifact_backend = _FakeArtifactBackend()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        yield base
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_api_service_routes_artifacts_post(_api_server_with_artifact):
+    import urllib.parse
+    scope_json = json.dumps(_ARTIFACT_SCOPE)
+    body = json.dumps({
+        "scope": _ARTIFACT_SCOPE,
+        "ref": "routing-test.txt",
+        "data_b64": _base64.b64encode(b"hello routing").decode(),
+    }).encode()
+    status = _http_post(f"{_api_server_with_artifact}/artifacts", body)
+    assert status == 200
+
+
+def test_api_service_routes_artifacts_get(_api_server_with_artifact):
+    import urllib.parse
+    qs = urllib.parse.urlencode({"scope": json.dumps(_ARTIFACT_SCOPE)})
+    status = _http_get(f"{_api_server_with_artifact}/artifacts?{qs}")
+    assert status == 200
+
+
+def test_api_service_routes_artifact_ref_get(_api_server_with_artifact):
+    import urllib.parse
+    qs = urllib.parse.urlencode({"scope": json.dumps(_ARTIFACT_SCOPE)})
+    status = _http_get(f"{_api_server_with_artifact}/artifacts/nonexistent.txt?{qs}")
+    assert status == 404
+
+
+@pytest.mark.parametrize("service_name", ["worker", "scheduler", "local-secrets"])
+def test_non_api_services_return_404_for_artifacts_post(service_name):
+    server, thread = _make_non_api_server(service_name)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({
+            "scope": _ARTIFACT_SCOPE,
+            "ref": "x.txt",
+            "data_b64": _base64.b64encode(b"x").decode(),
+        }).encode()
+        status = _http_post(f"{base}/artifacts", body)
+        assert status == 404, f"{service_name} should return 404 for POST /artifacts"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+@pytest.mark.parametrize("service_name", ["worker", "scheduler", "local-secrets"])
+def test_non_api_services_return_404_for_artifacts_get(service_name):
+    server, thread = _make_non_api_server(service_name)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        import urllib.parse
+        qs = urllib.parse.urlencode({"scope": json.dumps(_ARTIFACT_SCOPE)})
+        status = _http_get(f"{base}/artifacts?{qs}")
+        assert status == 404, f"{service_name} should return 404 for GET /artifacts"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_artifacts_log_message_redacts_query_values():
+    rendered = compose_services._sanitize_log_message(
+        '"GET /artifacts?scope=sentinel-secret-scope HTTP/1.1" 200 -'
+    )
+    assert "sentinel-secret-scope" not in rendered
+    assert "/artifacts" in rendered
+    assert "<redacted>" in rendered
+
+
+def test_artifacts_log_message_redacts_ref_path_and_query_values():
+    rendered = compose_services._sanitize_log_message(
+        '"GET /artifacts/LEAKSENTINEL-ref.txt?scope=sentinel-secret-scope HTTP/1.1" 404 -'
+    )
+    assert "LEAKSENTINEL-ref.txt" not in rendered
+    assert "sentinel-secret-scope" not in rendered
+    assert "/artifacts/<redacted>" in rendered
+
+
+def test_make_artifact_backend_fails_closed_when_unconfigured():
+    with pytest.raises(ValueError, match="AGENTOPS_ARTIFACT_ROOT"):
+        compose_services._make_artifact_backend({})
+
+
+def test_make_artifact_backend_configured_returns_backend(tmp_path):
+    from agent.runtime_artifacts_audit import LocalFileArtifactBackend
+    backend = compose_services._make_artifact_backend({"AGENTOPS_ARTIFACT_ROOT": str(tmp_path)})
+    assert isinstance(backend, LocalFileArtifactBackend)
+
+
+def test_artifact_dispatch_returns_401_before_backend_setup_when_token_missing(monkeypatch):
+    calls = []
+
+    def _raise():
+        calls.append("called")
+        raise ValueError("LEAKSENTINEL artifact backend failure password=x")
+
+    monkeypatch.setenv("AGENTOPS_RUNTIME_TOKEN", "expected-token")
+    monkeypatch.setattr(compose_services, "_get_or_create_artifact_backend", _raise)
+
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({
+            "scope": _ARTIFACT_SCOPE,
+            "ref": "x.txt",
+            "data_b64": _base64.b64encode(b"x").decode(),
+        }).encode()
+        req = urllib.request.Request(f"{base}/artifacts", data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Content-Length", str(len(body)))
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                status = r.status
+                response_body = r.read()
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            response_body = exc.read()
+        assert status == 401
+        assert calls == []
+        response_text = response_body.decode("utf-8")
+        assert "LEAKSENTINEL" not in response_text
+        assert "password=x" not in response_text
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_artifact_dispatch_returns_503_on_backend_failure(monkeypatch):
+    def _raise():
+        raise ValueError("LEAKSENTINEL artifact backend failure password=x")
+
+    monkeypatch.setattr(compose_services, "_get_or_create_artifact_backend", _raise)
+
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({
+            "scope": _ARTIFACT_SCOPE,
+            "ref": "x.txt",
+            "data_b64": _base64.b64encode(b"x").decode(),
+        }).encode()
+        req = urllib.request.Request(f"{base}/artifacts", data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Content-Length", str(len(body)))
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                status = r.status
+                response_body = r.read()
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            response_body = exc.read()
+        assert status == 503
+        response_text = response_body.decode("utf-8")
+        assert "LEAKSENTINEL" not in response_text
+        assert "password=x" not in response_text
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
