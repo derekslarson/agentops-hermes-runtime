@@ -928,3 +928,198 @@ def test_artifact_dispatch_returns_503_on_backend_failure(monkeypatch):
         server.shutdown()
         thread.join(timeout=5)
         server.server_close()
+
+
+# ---------------------------------------------------------------------------
+# M12B: Audit endpoint routing and backend
+# ---------------------------------------------------------------------------
+
+
+class _FakeAuditBackend:
+    def __init__(self):
+        self._events: list = []
+
+    def record(self, context, event):
+        self._events.append(dict(event))
+
+    def list_events(self, context, *, limit=None):
+        events = list(self._events)
+        return events if limit is None else events[:limit]
+
+
+_AUDIT_SCOPE = {
+    "mode": "agentops",
+    "org_id": "org1",
+    "workspace_id": "ws1",
+    "workspace_type": "team",
+    "user_id": "alice",
+    "conversation_id": "conv1",
+    "external_channel_id": None,
+    "external_thread_id": None,
+    "agent_profile_id": "bot",
+    "project_id": "proj1",
+    "run_id": "run1",
+    "run_type": "conversation",
+    "job_id": None,
+    "parent_session_id": None,
+    "backend_profile": "compose-self-hosted",
+}
+
+
+@pytest.fixture
+def _api_server_with_audit():
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    server.audit_backend = _FakeAuditBackend()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        yield base
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_api_service_routes_audit_post(_api_server_with_audit):
+    body = json.dumps({"scope": _AUDIT_SCOPE, "event": {"event_type": "routing_test"}}).encode()
+    status = _http_post(f"{_api_server_with_audit}/audit", body)
+    assert status == 200
+
+
+def test_api_service_routes_audit_get(_api_server_with_audit):
+    import urllib.parse
+    qs = urllib.parse.urlencode({"scope": json.dumps(_AUDIT_SCOPE)})
+    status = _http_get(f"{_api_server_with_audit}/audit?{qs}")
+    assert status == 200
+
+
+@pytest.mark.parametrize("service_name", ["worker", "scheduler", "local-secrets"])
+def test_non_api_services_return_404_for_audit_post(service_name):
+    server, thread = _make_non_api_server(service_name)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({"scope": _AUDIT_SCOPE, "event": {"event_type": "x"}}).encode()
+        status = _http_post(f"{base}/audit", body)
+        assert status == 404, f"{service_name} should return 404 for POST /audit"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+@pytest.mark.parametrize("service_name", ["worker", "scheduler", "local-secrets"])
+def test_non_api_services_return_404_for_audit_get(service_name):
+    import urllib.parse
+    server, thread = _make_non_api_server(service_name)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        qs = urllib.parse.urlencode({"scope": json.dumps(_AUDIT_SCOPE)})
+        status = _http_get(f"{base}/audit?{qs}")
+        assert status == 404, f"{service_name} should return 404 for GET /audit"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_make_audit_backend_fails_closed_when_unconfigured():
+    with pytest.raises(ValueError, match="AGENTOPS_ARTIFACT_ROOT"):
+        compose_services._make_audit_backend({})
+
+
+def test_make_audit_backend_configured_returns_backend(tmp_path):
+    from agent.runtime_artifacts_audit import LocalFileAuditBackend
+    backend = compose_services._make_audit_backend({"AGENTOPS_ARTIFACT_ROOT": str(tmp_path)})
+    assert isinstance(backend, LocalFileAuditBackend)
+
+
+def test_audit_dispatch_returns_401_before_backend_setup_when_token_missing(monkeypatch):
+    calls = []
+
+    def _raise():
+        calls.append("called")
+        raise ValueError("LEAKSENTINEL audit backend failure password=x")
+
+    monkeypatch.setenv("AGENTOPS_RUNTIME_TOKEN", "expected-token")
+    monkeypatch.setattr(compose_services, "_get_or_create_audit_backend", _raise)
+
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({"scope": _AUDIT_SCOPE, "event": {"event_type": "x"}}).encode()
+        req = urllib.request.Request(f"{base}/audit", data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Content-Length", str(len(body)))
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                status = r.status
+                response_body = r.read()
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            response_body = exc.read()
+        assert status == 401
+        assert calls == []
+        response_text = response_body.decode("utf-8")
+        assert "LEAKSENTINEL" not in response_text
+        assert "password=x" not in response_text
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_audit_dispatch_returns_503_on_backend_failure(monkeypatch):
+    def _raise():
+        raise ValueError("LEAKSENTINEL audit backend failure password=x")
+
+    monkeypatch.setattr(compose_services, "_get_or_create_audit_backend", _raise)
+
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({"scope": _AUDIT_SCOPE, "event": {"event_type": "x"}}).encode()
+        req = urllib.request.Request(f"{base}/audit", data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Content-Length", str(len(body)))
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                status = r.status
+                response_body = r.read()
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            response_body = exc.read()
+        assert status == 503
+        response_text = response_body.decode("utf-8")
+        assert "LEAKSENTINEL" not in response_text
+        assert "password=x" not in response_text
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_audit_log_message_redacts_query_values():
+    rendered = compose_services._sanitize_log_message(
+        '"GET /audit?scope=sentinel-secret-scope HTTP/1.1" 200 -'
+    )
+    assert "sentinel-secret-scope" not in rendered
+    assert "/audit" in rendered
+    assert "<redacted>" in rendered
+
+
+def test_audit_log_message_redacts_raw_json_query_values():
+    rendered = compose_services._sanitize_log_message(
+        '"GET /audit?scope={"user":"LEAKSENTINEL"} HTTP/1.1" 400 -'
+    )
+    assert "LEAKSENTINEL" not in rendered
+    assert '"user"' not in rendered
+    assert "/audit" in rendered
+    assert "<redacted>" in rendered

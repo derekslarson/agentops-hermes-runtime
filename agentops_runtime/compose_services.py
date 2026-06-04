@@ -103,6 +103,12 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             self._dispatch_artifacts("GET", parsed)
             return
+        if parsed.path == "/audit":
+            if self.server.service_name != "api":  # type: ignore[attr-defined]
+                self.send_error(404)
+                return
+            self._dispatch_audit("GET", parsed)
+            return
         if self.path not in {"/healthz", "/readyz"}:
             self.send_error(404)
             return
@@ -127,6 +133,12 @@ class _Handler(BaseHTTPRequestHandler):
                 self.send_error(404)
                 return
             self._dispatch_artifacts("POST", parsed)
+            return
+        if parsed.path == "/audit":
+            if self.server.service_name != "api":  # type: ignore[attr-defined]
+                self.send_error(404)
+                return
+            self._dispatch_audit("POST", parsed)
             return
         self.send_error(404)
 
@@ -221,6 +233,52 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
 
+    def _dispatch_audit(self, method: str, parsed: urllib.parse.ParseResult) -> None:
+        from agentops_runtime.audit_api import handle_audit_request
+
+        body_bytes = b""
+        if method == "POST":
+            length = int(self.headers.get("Content-Length") or "0")
+            body_bytes = self.rfile.read(length)
+
+        token = os.getenv("AGENTOPS_RUNTIME_TOKEN") or None
+        auth_header = self.headers.get("Authorization")
+        if token and auth_header != f"Bearer {token}":
+            error_body = json.dumps({"error": "unauthorized"}).encode("utf-8")
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(error_body)))
+            self.end_headers()
+            self.wfile.write(error_body)
+            return
+        try:
+            backend = getattr(self.server, "audit_backend", None) or _get_or_create_audit_backend()
+        except Exception:
+            error_body = json.dumps({"error": "audit backend unavailable"}).encode("utf-8")
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(error_body)))
+            self.end_headers()
+            self.wfile.write(error_body)
+            return
+
+        status, response = handle_audit_request(
+            method=method,
+            path=parsed.path,
+            query_string=parsed.query,
+            body_bytes=body_bytes,
+            auth_header=auth_header,
+            token=token,
+            backend=backend,
+        )
+
+        body = json.dumps(response).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - stdlib signature
         rendered = _sanitize_log_message(format % args)
         print(f"{self.server.service_name}: " + rendered, file=sys.stderr)  # type: ignore[attr-defined]
@@ -230,6 +288,7 @@ class _Server(ThreadingHTTPServer):
     service_name: str
     memory_backend: Any = None
     artifact_backend: Any = None
+    audit_backend: Any = None
 
 
 _memory_backend_lock = threading.Lock()
@@ -237,6 +296,9 @@ _memory_backend_instance: Any = None
 
 _artifact_backend_lock = threading.Lock()
 _artifact_backend_instance: Any = None
+
+_audit_backend_lock = threading.Lock()
+_audit_backend_instance: Any = None
 
 
 def _sanitize_log_message(message: str) -> str:
@@ -247,7 +309,7 @@ def _sanitize_log_message(message: str) -> str:
         return f"{match.group(1)}/<redacted>{query}"
 
     message = re.sub(r"(/artifacts)/[^\s?\"]+(\?[^\s\"]+)?", _redact_artifact_path, message)
-    return re.sub(r"(/(?:memory/records|artifacts)[^\s?\"]*)\?[^\s\"]+", r"\1?<redacted>", message)
+    return re.sub(r"(/(?:memory/records|artifacts|audit)[^\s?\"]*)\?[^\s]+", r"\1?<redacted>", message)
 
 
 def _make_memory_backend(environ: dict[str, str]) -> Any:
@@ -315,6 +377,26 @@ def _get_or_create_artifact_backend() -> Any:
         if _artifact_backend_instance is None:
             _artifact_backend_instance = _make_artifact_backend(dict(os.environ))
         return _artifact_backend_instance
+
+
+def _make_audit_backend(environ: dict[str, str]) -> Any:
+    root = environ.get("AGENTOPS_ARTIFACT_ROOT", "").strip()
+    if not root:
+        raise ValueError(
+            "compose audit backend requires AGENTOPS_ARTIFACT_ROOT; "
+            "no local fallback is provided for compose/cloud profiles"
+        )
+    from agent.runtime_artifacts_audit import LocalFileAuditBackend
+
+    return LocalFileAuditBackend(root=root)
+
+
+def _get_or_create_audit_backend() -> Any:
+    global _audit_backend_instance
+    with _audit_backend_lock:
+        if _audit_backend_instance is None:
+            _audit_backend_instance = _make_audit_backend(dict(os.environ))
+        return _audit_backend_instance
 
 
 def main(argv: list[str] | None = None) -> int:

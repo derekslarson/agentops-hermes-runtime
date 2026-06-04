@@ -223,11 +223,21 @@ class LocalFileAuditBackend:
             with path.open("a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
 
-    def list_events(self, context: RuntimeContext | None) -> list[dict[str, Any]]:
+    def list_events(self, context: RuntimeContext | None, *, limit: int | None = None) -> list[dict[str, Any]]:
         path = self._log_path(context)
         if not path.exists():
             return []
-        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+        if limit is not None and limit <= 0:
+            return []
+        events: list[dict[str, Any]] = []
+        with path.open(encoding="utf-8") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                events.append(json.loads(line))
+                if limit is not None and len(events) >= limit:
+                    break
+        return events
 
 
 RequestFn = Callable[[str, str], tuple[int, Mapping[str, str], bytes]]
