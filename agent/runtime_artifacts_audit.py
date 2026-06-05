@@ -380,6 +380,28 @@ class HttpAuditBackend:
             timeout=self._timeout,
         )
 
+    def count_events(self, context: RuntimeContext | None) -> int:
+        query = urllib.parse.urlencode({"scope": json.dumps(_scope(context), sort_keys=True)})
+        _, _, body = _json_request(
+            self._request,
+            "GET",
+            f"{self._base_url}/audit?{query}",
+            token=self._token,
+            timeout=self._timeout,
+        )
+        response: Any = None
+        malformed_response = False
+        try:
+            response = json.loads(body.decode() or "{}")
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+            malformed_response = True
+        if malformed_response or not isinstance(response, Mapping):
+            raise RuntimeError("runtime audit backend returned a malformed count") from None
+        count = response.get("count")
+        if not isinstance(count, int) or isinstance(count, bool):
+            raise RuntimeError("runtime audit backend returned a malformed count") from None
+        return count
+
 
 def register_http_artifact_backend(
     registry: RuntimeBackendRegistry,

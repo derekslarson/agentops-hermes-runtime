@@ -65,10 +65,12 @@ def _close_backend_resources(server: compose_services._Server) -> None:
 @pytest.fixture
 def _two_servers(tmp_path):
     from agentops_runtime.compose_services import (
+        _make_audit_backend,
         _make_artifact_backend,
         _make_conversation_router_backend,
         _make_cron_backend,
         _make_curated_memory_backend,
+        _make_delivery_backend,
         _make_memory_backend,
         _make_queue_backend,
         _make_secret_backend,
@@ -85,8 +87,11 @@ def _two_servers(tmp_path):
     session_db = str(tmp_path / "sessions.db")
     deep_mem_db = str(tmp_path / "deep_memory.db")
     artifact_root = str(tmp_path / "artifacts")
+    audit_root = str(tmp_path / "audit")
     skill_db = str(tmp_path / "skills.db")
     cron_db = str(tmp_path / "cron.db")
+    delivery_db = str(tmp_path / "delivery.db")
+    delivery_backend = _make_delivery_backend({"AGENTOPS_DELIVERY_DB_PATH": delivery_db})
 
     api_server, api_thread, api_base = _start_server(
         "api",
@@ -97,8 +102,10 @@ def _two_servers(tmp_path):
         session_backend=_make_session_backend({"AGENTOPS_SESSION_DB_PATH": session_db}),
         memory_backend=_make_memory_backend({"AGENTOPS_DEEP_MEMORY_DB_URL": "sqlite:///" + deep_mem_db}),
         artifact_backend=_make_artifact_backend({"AGENTOPS_ARTIFACT_ROOT": artifact_root}),
+        audit_backend=_make_audit_backend({"AGENTOPS_ARTIFACT_ROOT": audit_root}),
         skill_backend=_make_skill_backend({"AGENTOPS_SKILL_DB_PATH": skill_db}),
         cron_backend=_make_cron_backend({"AGENTOPS_CRON_DB_PATH": cron_db}),
+        delivery_backend=delivery_backend,
     )
     secret_server, secret_thread, secret_base = _start_server(
         "local-secrets",
@@ -108,6 +115,7 @@ def _two_servers(tmp_path):
     environ = {
         "AGENTOPS_API_URL": api_base,
         "AGENTOPS_SECRET_STORE_URL": secret_base,
+        "__DELIVERY_BACKEND": delivery_backend,
     }
     try:
         yield environ
@@ -342,6 +350,8 @@ def test_run_durable_smoke_none_environ_threads_process_env_to_scale_step(monkey
         "_step_secret_roundtrip",
         "_step_native_state_continuity",
         "_step_artifact_roundtrip",
+        "_step_audit_roundtrip",
+        "_step_delivery_dispatch",
         "_step_skill_roundtrip",
         "_step_scheduler_claim_once",
     ):
@@ -906,6 +916,193 @@ def test_artifact_roundtrip_fails_when_tenant_b_can_get_or_list():
     step = _step_artifact_roundtrip(FakeRegistry())
     assert step["ok"] is False
     assert step["tenant_b_isolated"] is False
+
+
+# ---------------------------------------------------------------------------
+# audit_roundtrip and delivery_dispatch steps
+# ---------------------------------------------------------------------------
+
+
+def test_audit_roundtrip_step_in_steps_list(_two_servers):
+    result = run_durable_smoke(environ=_two_servers)
+    names = {s["step"] for s in result["steps"]}
+    assert "audit_roundtrip" in names
+
+
+def test_audit_roundtrip_step_passes(_two_servers):
+    result = run_durable_smoke(environ=_two_servers)
+    step = next(s for s in result["steps"] if s["step"] == "audit_roundtrip")
+    assert step["ok"] is True
+
+
+def test_audit_roundtrip_reports_counts_and_isolation(_two_servers):
+    result = run_durable_smoke(environ=_two_servers)
+    step = next(s for s in result["steps"] if s["step"] == "audit_roundtrip")
+    assert step.get("record_ok") is True
+    assert step.get("counted") == 2
+    assert step.get("tenant_b_isolated") is True
+
+
+def test_audit_roundtrip_report_contains_no_audit_sentinels(_two_servers):
+    result = run_durable_smoke(environ=_two_servers)
+    text = json.dumps(result)
+    for sentinel in (
+        "smoke-conv-audit",
+        "smoke-audit-event-sentinel",
+    ):
+        assert sentinel not in text, f"audit sentinel {sentinel!r} leaked into report"
+
+
+def test_audit_roundtrip_fails_when_record_raises():
+    from agentops_runtime.compose_durable_smoke import _step_audit_roundtrip
+
+    class FakeAudit:
+        def record(self, ctx, event):
+            raise RuntimeError("unavailable")
+
+        def count_events(self, ctx):
+            return 0
+
+    class FakeRegistry:
+        def get(self, cap, ctx):
+            return FakeAudit()
+
+    step = _step_audit_roundtrip(FakeRegistry())
+    assert step["ok"] is False
+    assert step["record_ok"] is False
+
+
+def test_audit_roundtrip_fails_when_count_below_recorded():
+    from agentops_runtime.compose_durable_smoke import _step_audit_roundtrip
+
+    class FakeAudit:
+        def record(self, ctx, event):
+            pass
+
+        def count_events(self, ctx):
+            return 1
+
+    class FakeRegistry:
+        def get(self, cap, ctx):
+            return FakeAudit()
+
+    step = _step_audit_roundtrip(FakeRegistry())
+    assert step["ok"] is False
+    assert step["counted"] == 1
+
+
+def test_audit_roundtrip_fails_when_tenant_b_count_nonzero():
+    from agentops_runtime.compose_durable_smoke import _step_audit_roundtrip
+
+    class FakeAudit:
+        def record(self, ctx, event):
+            pass
+
+        def count_events(self, ctx):
+            return 2
+
+    class FakeRegistry:
+        def get(self, cap, ctx):
+            return FakeAudit()
+
+    step = _step_audit_roundtrip(FakeRegistry())
+    assert step["ok"] is False
+    assert step["tenant_b_isolated"] is False
+
+
+def test_audit_roundtrip_requires_current_records_to_increase_count():
+    from agentops_runtime.compose_durable_smoke import _step_audit_roundtrip
+
+    class FakeAudit:
+        def __init__(self, tenant_b: bool):
+            self._tenant_b = tenant_b
+
+        def record(self, ctx, event):
+            pass
+
+        def count_events(self, ctx):
+            return 0 if self._tenant_b else 2
+
+    class FakeRegistry:
+        def get(self, cap, ctx):
+            return FakeAudit("smoke-tenant-b" in (getattr(ctx, "org_id", "") or ""))
+
+    step = _step_audit_roundtrip(FakeRegistry())
+    assert step["ok"] is False
+    assert step["counted"] == 2
+    assert step["record_ok"] is False
+
+
+def test_audit_roundtrip_fails_on_overbroad_same_tenant_counting():
+    from agentops_runtime.compose_durable_smoke import _step_audit_roundtrip
+
+    class FakeAudit:
+        def __init__(self, tenant_b: bool):
+            self._tenant_b = tenant_b
+            self._count = 0 if tenant_b else 5
+
+        def record(self, ctx, event):
+            self._count += 1
+
+        def count_events(self, ctx):
+            return self._count
+
+    class FakeRegistry:
+        def get(self, cap, ctx):
+            return FakeAudit("smoke-tenant-b" in (getattr(ctx, "org_id", "") or ""))
+
+    step = _step_audit_roundtrip(FakeRegistry())
+    assert step["ok"] is False
+    assert step["counted"] == 7
+    assert step["record_ok"] is False
+
+
+def test_delivery_dispatch_step_in_steps_list(_two_servers):
+    result = run_durable_smoke(environ=_two_servers)
+    names = {s["step"] for s in result["steps"]}
+    assert "delivery_dispatch" in names
+
+
+def test_delivery_dispatch_step_passes(_two_servers):
+    result = run_durable_smoke(environ=_two_servers)
+    step = next(s for s in result["steps"] if s["step"] == "delivery_dispatch")
+    assert step["ok"] is True
+    assert step.get("dispatched") == 2
+    assert step.get("read_isolation_applicable") is False
+
+
+def test_delivery_dispatch_persists_rows_via_injected_backend(_two_servers):
+    result = run_durable_smoke(environ=_two_servers)
+    step = next(s for s in result["steps"] if s["step"] == "delivery_dispatch")
+    assert step["ok"] is True
+    assert _two_servers["__DELIVERY_BACKEND"].count() == 2
+
+
+def test_delivery_dispatch_report_contains_no_delivery_sentinels(_two_servers):
+    result = run_durable_smoke(environ=_two_servers)
+    text = json.dumps(result)
+    for sentinel in (
+        "smoke-conv-delivery",
+        "smoke-delivery-message-sentinel",
+        "thread://smoke",
+    ):
+        assert sentinel not in text, f"delivery sentinel {sentinel!r} leaked into report"
+
+
+def test_delivery_dispatch_fails_when_deliver_raises():
+    from agentops_runtime.compose_durable_smoke import _step_delivery_dispatch
+
+    class FakeDelivery:
+        def deliver(self, ctx, message):
+            raise RuntimeError("unavailable")
+
+    class FakeRegistry:
+        def get(self, cap, ctx):
+            return FakeDelivery()
+
+    step = _step_delivery_dispatch(FakeRegistry())
+    assert step["ok"] is False
+    assert step["dispatched"] == 0
 
 
 # ---------------------------------------------------------------------------

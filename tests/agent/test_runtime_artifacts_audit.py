@@ -4,6 +4,7 @@ import json
 import os
 
 from agent.runtime_artifacts_audit import (
+    HttpAuditBackend,
     LocalFileArtifactBackend,
     LocalFileAuditBackend,
     SanitizedAuditEvent,
@@ -601,3 +602,117 @@ def test_handle_function_call_records_runtime_tool_call_audit(monkeypatch):
     assert tool_events[-1]["tool_name"] == "runtime_audit_dummy"
     assert "secret-token" not in repr(tool_events)
     assert "/Users/derek" not in repr(tool_events)
+
+
+def test_http_audit_backend_count_events_returns_integer_count():
+    """count_events sends GET /audit with scope param; returns the integer count."""
+    seen: list[tuple[str, str, dict]] = []
+
+    def fake_request(method: str, url: str, *, headers=None, body=None, timeout=None):
+        seen.append((method, url, headers or {}))
+        return 200, {"content-type": "application/json"}, json.dumps({"count": 3}).encode()
+
+    backend = HttpAuditBackend(base_url="https://control.example", request=fake_request)
+    result = backend.count_events(_context("derek"))
+
+    assert result == 3
+    assert isinstance(result, int) and not isinstance(result, bool)
+    assert len(seen) == 1
+    method, url, _ = seen[0]
+    assert method == "GET"
+    assert "/audit" in url
+    assert "scope" in url
+
+
+def test_http_audit_backend_count_events_token_in_header_not_url():
+    """Bearer token must appear only in the Authorization header, not in the query URL."""
+    seen_calls: list[tuple[str, dict]] = []
+
+    def fake_request(method: str, url: str, *, headers=None, body=None, timeout=None):
+        seen_calls.append((url, dict(headers or {})))
+        return 200, {"content-type": "application/json"}, json.dumps({"count": 0}).encode()
+
+    backend = HttpAuditBackend(
+        base_url="https://control.example",
+        token="secret-bearer-token",
+        request=fake_request,
+    )
+    backend.count_events(_context("derek"))
+
+    url, hdrs = seen_calls[0]
+    assert "secret-bearer-token" not in url
+    auth = hdrs.get("authorization") or hdrs.get("Authorization") or ""
+    assert "secret-bearer-token" in auth
+
+
+def test_http_audit_backend_count_events_fails_closed_on_bool_count():
+    """count_events must raise for a JSON boolean — True/False are not valid integers."""
+    def fake_request(method: str, url: str, *, headers=None, body=None, timeout=None):
+        return 200, {"content-type": "application/json"}, json.dumps({"count": True}).encode()
+
+    backend = HttpAuditBackend(base_url="https://control.example", request=fake_request)
+    try:
+        backend.count_events(_context("derek"))
+    except (ValueError, TypeError, RuntimeError):
+        return
+    raise AssertionError("expected count_events to raise for a boolean count")
+
+
+def test_http_audit_backend_count_events_fails_closed_on_string_count():
+    """count_events must raise when server returns a string, not silently cast it."""
+    def fake_request(method: str, url: str, *, headers=None, body=None, timeout=None):
+        return 200, {"content-type": "application/json"}, json.dumps({"count": "3"}).encode()
+
+    backend = HttpAuditBackend(base_url="https://control.example", request=fake_request)
+    try:
+        backend.count_events(_context("derek"))
+    except (ValueError, TypeError, RuntimeError):
+        return
+    raise AssertionError("expected count_events to raise for a string count")
+
+
+def test_http_audit_backend_count_events_fails_closed_on_malformed_json():
+    """count_events must raise when the server body is not valid JSON."""
+    def fake_request(method: str, url: str, *, headers=None, body=None, timeout=None):
+        return 200, {"content-type": "application/json"}, b"not-json!!!"
+
+    backend = HttpAuditBackend(base_url="https://control.example", request=fake_request)
+    try:
+        backend.count_events(_context("derek"))
+    except Exception:
+        return
+    raise AssertionError("expected count_events to raise for malformed JSON")
+
+
+def test_http_audit_backend_count_events_malformed_body_error_is_sanitized():
+    """Malformed count responses must not retain body, URL, or token material in exceptions."""
+    raw_body = b'{"audit_payload":"secret-audit-sentinel",'
+
+    def fake_request(method: str, url: str, *, headers=None, body=None, timeout=None):
+        return 200, {"content-type": "application/json"}, raw_body
+
+    backend = HttpAuditBackend(
+        base_url="https://control.example/private-audit-path",
+        token="secret-audit-token",
+        request=fake_request,
+    )
+    try:
+        backend.count_events(_context("derek"))
+    except Exception as exc:
+        observed = " ".join(
+            part
+            for part in (
+                str(exc),
+                repr(exc),
+                repr(getattr(exc, "__cause__", None)),
+                repr(getattr(exc, "__context__", None)),
+                repr(getattr(getattr(exc, "__context__", None), "doc", None)),
+                repr(getattr(exc, "doc", None)),
+            )
+            if part
+        )
+        assert "secret-audit-sentinel" not in observed
+        assert "secret-audit-token" not in observed
+        assert "private-audit-path" not in observed
+        return
+    raise AssertionError("expected count_events to raise for malformed JSON")

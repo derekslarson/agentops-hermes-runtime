@@ -1,4 +1,4 @@
-"""M12B compose durable smoke — exercises WORKER_REGISTRY, QUEUE, CONVERSATION_ROUTER, SECRET, MEMORY, SESSION, DEEP_MEMORY, ARTIFACT, SKILL, and CRON via HTTP adapters.
+"""M12B compose durable smoke — exercises WORKER_REGISTRY, QUEUE, CONVERSATION_ROUTER, SECRET, MEMORY, SESSION, DEEP_MEMORY, ARTIFACT, AUDIT, DELIVERY, SKILL, and CRON via HTTP adapters.
 
 Run against a live Compose stack (or a test harness with in-process SQLite servers)::
 
@@ -13,6 +13,10 @@ The module probes durable-backend slices:
                                upsert/get — all three surfaces isolated between tenant A and B
 - ``artifact_roundtrip``     put/get/list a durable artifact via HttpArtifactBackend + API server
                                + LocalFileArtifactBackend; tenant B cannot get or list tenant A's ref
+- ``audit_roundtrip``        record two audit events, count them back through the sanitized
+                               audit readback, and prove tenant B count isolation
+- ``delivery_dispatch``      dispatch two outbound messages through the native delivery adapter;
+                               persistence is asserted by tests through the injected backend
 - ``skill_roundtrip``        project-scope skill create (approval gate), peer visibility, and
                                tenant B isolation via HttpSkillBackend + SQLiteScopedSkillStore
 - ``scheduler_claim_once``   cron claim-once, watchdog fairness, run history, and tenant isolation
@@ -22,8 +26,8 @@ The module probes durable-backend slices:
 
 Only sanitized, JSON-safe data is reported: step names, booleans, and integer counts.
 No raw IDs, tenant IDs, secret values, URLs, local paths, artifact refs, artifact bytes,
-skill names, skill content, skill descriptions, skill categories, policy strings,
-or backend error text is emitted.
+audit event payloads, delivery refs, delivery message contents, skill names, skill content,
+skill descriptions, skill categories, policy strings, or backend error text is emitted.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import uuid
 from typing import Any
 
 from agent.runtime_backends import BackendCapability, RuntimeBackendRegistry
@@ -51,6 +56,12 @@ _DEEP_MEM_SENTINEL = "smoke-deep-mem-sentinel"
 # Artifact roundtrip scope labels — never leaked to the report.
 _ARTIFACT_REF = "smoke/roundtrip/sentinel.bin"
 _ARTIFACT_DATA = b"durable-smoke-artifact-sentinel"
+
+# Audit/delivery roundtrip scope labels — never leaked to the report.
+_AUDIT_CONVERSATION_ID = "smoke-conv-audit"
+_AUDIT_EVENT_SENTINEL = "smoke-audit-event-sentinel"
+_DELIVERY_CONVERSATION_ID = "smoke-conv-delivery"
+_DELIVERY_MESSAGE_SENTINEL = "smoke-delivery-message-sentinel"
 
 # Skill roundtrip scope labels — never leaked to the report.
 _SKILL_NAME = "smoke-skill-roundtrip"
@@ -403,6 +414,126 @@ def _step_artifact_roundtrip(registry: RuntimeBackendRegistry) -> dict[str, Any]
     }
 
 
+def _audit_ctx(scope: str, run_suffix: str) -> RuntimeContext:
+    base = _ctx(scope)
+    return RuntimeContext(
+        mode=base.mode,
+        org_id=base.org_id,
+        workspace_id=base.workspace_id,
+        workspace_type=base.workspace_type,
+        user_id=base.user_id,
+        conversation_id=f"{_AUDIT_CONVERSATION_ID}-{run_suffix}",
+        agent_profile_id=base.agent_profile_id,
+        project_id=base.project_id,
+        permissions_ref=base.permissions_ref,
+        run_id=f"{base.run_id}-{run_suffix}",
+        run_type=base.run_type,
+        backend_profile=base.backend_profile,
+        delivery_ref=base.delivery_ref,
+    )
+
+
+def _delivery_ctx(scope: str) -> RuntimeContext:
+    base = _ctx(scope)
+    return RuntimeContext(
+        mode=base.mode,
+        org_id=base.org_id,
+        workspace_id=base.workspace_id,
+        workspace_type=base.workspace_type,
+        user_id=base.user_id,
+        conversation_id=_DELIVERY_CONVERSATION_ID,
+        agent_profile_id=base.agent_profile_id,
+        project_id=base.project_id,
+        permissions_ref=base.permissions_ref,
+        run_id=base.run_id,
+        run_type=base.run_type,
+        backend_profile=base.backend_profile,
+        delivery_ref=base.delivery_ref,
+    )
+
+
+def _step_audit_roundtrip(registry: RuntimeBackendRegistry) -> dict[str, Any]:
+    """Record and count tenant-scoped audit events without exposing event payloads."""
+    run_suffix = uuid.uuid4().hex
+    ctx_a = _audit_ctx(_SCOPE_A, run_suffix)
+    ctx_b = _audit_ctx(_SCOPE_B, run_suffix)
+    backend_a = registry.get(BackendCapability.AUDIT, ctx_a)
+    backend_b = registry.get(BackendCapability.AUDIT, ctx_b)
+
+    try:
+        before_a = int(backend_a.count_events(ctx_a))
+        before_b = int(backend_b.count_events(ctx_b))
+    except Exception:
+        return {
+            "step": "audit_roundtrip",
+            "ok": False,
+            "record_ok": False,
+            "counted": 0,
+            "tenant_b_isolated": False,
+        }
+
+    try:
+        backend_a.record(ctx_a, {"event": _AUDIT_EVENT_SENTINEL, "ordinal": 1})
+        backend_a.record(ctx_a, {"event": _AUDIT_EVENT_SENTINEL, "ordinal": 2})
+    except Exception:
+        return {
+            "step": "audit_roundtrip",
+            "ok": False,
+            "record_ok": False,
+            "counted": before_a,
+            "tenant_b_isolated": False,
+        }
+
+    try:
+        count_a = int(backend_a.count_events(ctx_a))
+        count_b = int(backend_b.count_events(ctx_b))
+    except Exception:
+        return {
+            "step": "audit_roundtrip",
+            "ok": False,
+            "record_ok": False,
+            "counted": 0,
+            "tenant_b_isolated": False,
+        }
+
+    record_ok = before_a == 0 and count_a == 2
+    tenant_b_isolated = before_b == 0 and count_b == 0
+    ok = record_ok and tenant_b_isolated
+    return {
+        "step": "audit_roundtrip",
+        "ok": ok,
+        "record_ok": record_ok,
+        "counted": count_a,
+        "tenant_b_isolated": tenant_b_isolated,
+    }
+
+
+def _step_delivery_dispatch(registry: RuntimeBackendRegistry) -> dict[str, Any]:
+    """Dispatch outbound delivery payloads through the native delivery adapter."""
+    ctx_a = _delivery_ctx(_SCOPE_A)
+    backend = registry.get(BackendCapability.DELIVERY, ctx_a)
+    dispatched = 0
+    try:
+        backend.deliver(ctx_a, {"kind": "smoke", "body": _DELIVERY_MESSAGE_SENTINEL, "ordinal": 1})
+        dispatched += 1
+        backend.deliver(ctx_a, {"kind": "smoke", "body": _DELIVERY_MESSAGE_SENTINEL, "ordinal": 2})
+        dispatched += 1
+    except Exception:
+        return {
+            "step": "delivery_dispatch",
+            "ok": False,
+            "dispatched": dispatched,
+            "read_isolation_applicable": False,
+        }
+
+    return {
+        "step": "delivery_dispatch",
+        "ok": dispatched == 2,
+        "dispatched": dispatched,
+        "read_isolation_applicable": False,
+    }
+
+
 def _step_skill_roundtrip(registry: RuntimeBackendRegistry) -> dict[str, Any]:
     """Prove project-scope skill approval gate, peer visibility, and tenant B isolation."""
     ctx_author = _ctx(_SCOPE_A)
@@ -656,6 +787,8 @@ def run_durable_smoke(*, environ: dict[str, str] | None = None) -> dict[str, Any
         _step_secret_roundtrip,
         _step_native_state_continuity,
         _step_artifact_roundtrip,
+        _step_audit_roundtrip,
+        _step_delivery_dispatch,
         _step_skill_roundtrip,
         _step_scheduler_claim_once,
         _scale_step,
