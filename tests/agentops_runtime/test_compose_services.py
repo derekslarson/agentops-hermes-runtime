@@ -3049,3 +3049,213 @@ def test_cron_log_message_redacts_unknown_and_extra_action_tails(raw_request):
     rendered = compose_services._sanitize_log_message(raw_request)
     assert "LEAKSENTINEL" not in rendered
     assert "/cron/jobs/<redacted>" in rendered
+
+
+# ---------------------------------------------------------------------------
+# M12B: Conversation-router backend factory and routing
+# ---------------------------------------------------------------------------
+
+
+def test_make_conversation_router_backend_fails_closed_when_blank(tmp_path):
+    with pytest.raises(ValueError, match="AGENTOPS_CONVERSATION_ROUTER_DB_PATH"):
+        compose_services._make_conversation_router_backend({})
+
+
+def test_make_conversation_router_backend_fails_closed_on_memory(tmp_path):
+    with pytest.raises(ValueError, match=":memory:"):
+        compose_services._make_conversation_router_backend({
+            "AGENTOPS_CONVERSATION_ROUTER_DB_PATH": ":memory:",
+        })
+
+
+def test_make_conversation_router_backend_fails_closed_on_relative_path(tmp_path):
+    with pytest.raises(ValueError, match="absolute"):
+        compose_services._make_conversation_router_backend({
+            "AGENTOPS_CONVERSATION_ROUTER_DB_PATH": "relative/path.db",
+        })
+
+
+def test_make_conversation_router_backend_accepts_absolute_path(tmp_path):
+    from agentops_runtime.conversations_api import SQLiteConversationRouterBackend
+
+    db_path = str(tmp_path / "conv.db")
+    backend = compose_services._make_conversation_router_backend({
+        "AGENTOPS_CONVERSATION_ROUTER_DB_PATH": db_path,
+    })
+    assert isinstance(backend, SQLiteConversationRouterBackend)
+
+
+def test_conversations_log_message_redacts_conversation_id():
+    rendered = compose_services._sanitize_log_message(
+        '"POST /conversations/LEAKSENTINEL-conv-id/route HTTP/1.1" 200 -'
+    )
+    assert "LEAKSENTINEL-conv-id" not in rendered
+    assert "/conversations" in rendered
+    assert "<redacted>" in rendered
+
+
+def test_conversations_log_message_redacts_query_string():
+    rendered = compose_services._sanitize_log_message(
+        '"POST /conversations/resolve?LEAKSENTINEL=val HTTP/1.1" 200 -'
+    )
+    assert "LEAKSENTINEL" not in rendered
+    assert "/conversations/resolve" in rendered
+    assert "<redacted>" in rendered
+
+
+def test_conversations_log_message_redacts_encoded_slash():
+    rendered = compose_services._sanitize_log_message(
+        '"POST /conversations/org%2FLEAKSENTINEL-channel/route HTTP/1.1" 200 -'
+    )
+    assert "LEAKSENTINEL" not in rendered
+    assert "<redacted>" in rendered
+
+
+def test_conversations_log_message_redacts_semicolon_lookalike():
+    rendered = compose_services._sanitize_log_message(
+        '"POST /conversations/conv-id;LEAKSENTINEL HTTP/1.1" 200 -'
+    )
+    assert "LEAKSENTINEL" not in rendered
+    assert "<redacted>" in rendered
+
+
+class _RecordingConversationRouterBackend:
+    def __init__(self):
+        self.routed_turn = None
+
+    def resolve_conversation(self, context, event):
+        assert context["org_id"] == _CONTEXT["org_id"]
+        assert event == {"conversation_id": "event-conv"}
+        return "event-conv"
+
+    def get_active_run(self, context, conversation_id):
+        assert context["org_id"] == _CONTEXT["org_id"]
+        assert conversation_id == "conv-test"
+        return "active-run-1"
+
+    def route_turn(self, context, conversation_id, turn):
+        assert context["org_id"] == _CONTEXT["org_id"]
+        assert conversation_id == "conv-test"
+        self.routed_turn = turn
+        return "routed-run-1"
+
+
+def _make_api_server_with_conversation_backend():
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    setattr(server, "conversation_router_backend", _RecordingConversationRouterBackend())
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread, f"http://127.0.0.1:{server.server_port}"
+
+
+def _post_json_response(url: str, payload: dict) -> tuple[int, dict]:
+    body = json.dumps(payload).encode()
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Content-Length", str(len(body)))
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, json.loads(r.read().decode())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode())
+
+
+def test_api_service_routes_conversations_resolve():
+    server, thread, base = _make_api_server_with_conversation_backend()
+    try:
+        status, payload = _post_json_response(
+            f"{base}/conversations/resolve",
+            {"context": _CONTEXT, "event": {"conversation_id": "event-conv"}},
+        )
+        assert status == 200
+        assert payload == {"conversation_id": "event-conv"}
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_api_service_routes_conversations_active_run():
+    server, thread, base = _make_api_server_with_conversation_backend()
+    try:
+        status, payload = _post_json_response(
+            f"{base}/conversations/conv-test/active-run",
+            {"context": _CONTEXT},
+        )
+        assert status == 200
+        assert payload == {"run_id": "active-run-1"}
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_api_service_routes_conversations_route_and_preserves_turn_payload():
+    server, thread, base = _make_api_server_with_conversation_backend()
+    try:
+        turn = {"message": "hello", "metadata": {"safe": "value"}}
+        status, payload = _post_json_response(
+            f"{base}/conversations/conv-test/route",
+            {"context": _CONTEXT, "turn": turn},
+        )
+        assert status == 200
+        assert payload == {"run_id": "routed-run-1"}
+        assert getattr(server, "conversation_router_backend").routed_turn == turn
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+@pytest.mark.parametrize("service_name", ["worker", "scheduler", "local-secrets"])
+def test_non_api_services_return_404_for_conversations(service_name):
+    server, thread = _make_non_api_server(service_name)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({"context": _CONTEXT, "event": {}}).encode()
+        status = _http_post(f"{base}/conversations/resolve", body)
+        assert status == 404, f"{service_name} should return 404 for /conversations/resolve"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_api_conversations_resolve_auth_before_backend(monkeypatch):
+    backend_constructed = []
+
+    def _raise_backend():
+        backend_constructed.append(True)
+        raise ValueError("LEAKSENTINEL-backend-secret")
+
+    monkeypatch.setattr(compose_services, "_get_or_create_conversation_router_backend", _raise_backend)
+
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        import urllib.request
+
+        body = json.dumps({"context": _CONTEXT, "event": {}}).encode()
+        req = urllib.request.Request(f"{base}/conversations/resolve", data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Content-Length", str(len(body)))
+        req.add_header("Authorization", "Bearer wrong-token")
+        req.add_header("AGENTOPS_RUNTIME_TOKEN", "real-token")
+
+        monkeypatch.setenv("AGENTOPS_RUNTIME_TOKEN", "real-token")
+
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                status = r.status
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+        assert status == 401
+        assert not backend_constructed, "backend must not be constructed before auth check"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()

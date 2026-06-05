@@ -386,3 +386,40 @@ def test_scheduler_does_not_have_cron_db_path_env():
     services = _compose()["services"]
     scheduler_env = "\n".join(services["scheduler"]["environment"])
     assert "AGENTOPS_CRON_DB_PATH" not in scheduler_env
+
+
+# ---------------------------------------------------------------------------
+# M12B: Conversation-router volume and env (api service only)
+# ---------------------------------------------------------------------------
+
+
+def test_api_service_has_conversation_router_db_path_env():
+    services = _compose()["services"]
+    api_env = "\n".join(services["api"]["environment"])
+    assert "AGENTOPS_CONVERSATION_ROUTER_DB_PATH=/var/lib/agentops/conversations/conversations.db" in api_env
+
+
+def test_api_service_mounts_conversations_volume():
+    services = _compose()["services"]
+    api = services["api"]
+    assert "volumes" in api
+    volume_strings = [str(v) for v in api["volumes"]]
+    assert any("/var/lib/agentops/conversations" in v for v in volume_strings)
+
+
+def test_compose_declares_conversations_volume():
+    compose = _compose()
+    assert "volumes" in compose
+    assert "agentops-conversations" in compose["volumes"]
+
+
+def test_worker_does_not_have_conversation_router_db_path_env():
+    services = _compose()["services"]
+    worker_env = "\n".join(services["worker"]["environment"])
+    assert "AGENTOPS_CONVERSATION_ROUTER_DB_PATH" not in worker_env
+
+
+def test_scheduler_does_not_have_conversation_router_db_path_env():
+    services = _compose()["services"]
+    scheduler_env = "\n".join(services["scheduler"]["environment"])
+    assert "AGENTOPS_CONVERSATION_ROUTER_DB_PATH" not in scheduler_env
