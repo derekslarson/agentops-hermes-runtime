@@ -36,6 +36,7 @@ _MAX_RUN_LEASE_REQUEST_BODY_BYTES = 1_048_576
 _MAX_CRON_REQUEST_BODY_BYTES = 1_048_576
 _MAX_CONVERSATION_REQUEST_BODY_BYTES = 1_048_576
 _MAX_WORKER_REQUEST_BODY_BYTES = 1_048_576
+_MAX_DELIVERY_REQUEST_BODY_BYTES = 1_048_576
 
 _SKILL_EXACT_PATHS = frozenset({"/skills/list", "/skills/view", "/skills/manage"})
 _QUEUE_EXACT_PATHS = frozenset({
@@ -235,6 +236,12 @@ class _Handler(BaseHTTPRequestHandler):
                 self.send_error(404)
                 return
             self._dispatch_workers(raw_path)
+            return
+        if raw_path == "/delivery/deliver":
+            if self.server.service_name != "api":  # type: ignore[attr-defined]
+                self.send_error(404)
+                return
+            self._dispatch_delivery(raw_path)
             return
         self.send_error(404)
 
@@ -919,6 +926,52 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _dispatch_delivery(self, raw_path: str) -> None:
+        from agentops_runtime.delivery_api import handle_delivery_request
+
+        token = os.getenv("AGENTOPS_RUNTIME_TOKEN") or None
+        auth_header = self.headers.get("Authorization")
+
+        if token and auth_header != f"Bearer {token}":
+            self._send_json_error(401, "unauthorized")
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            self._send_json_error(400, "invalid content length")
+            return
+        if length < 0:
+            self._send_json_error(400, "invalid content length")
+            return
+        if length > _MAX_DELIVERY_REQUEST_BODY_BYTES:
+            self._send_json_error(413, "request body too large")
+            return
+        body_bytes = self.rfile.read(length)
+
+        try:
+            backend = getattr(self.server, "delivery_backend", None) or _get_or_create_delivery_backend()
+        except Exception:
+            self._send_json_error(503, "delivery backend unavailable")
+            return
+
+        status, response = handle_delivery_request(
+            method="POST",
+            path=raw_path,
+            query_string="",
+            body_bytes=body_bytes,
+            auth_header=auth_header,
+            token=token,
+            backend=backend,
+        )
+
+        body = json.dumps(response).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _send_json_error(self, status: int, message: str) -> None:
         body = json.dumps({"error": message}).encode("utf-8")
         self.send_response(status)
@@ -947,6 +1000,7 @@ class _Server(ThreadingHTTPServer):
     cron_backend: Any = None
     conversation_router_backend: Any = None
     worker_registry_backend: Any = None
+    delivery_backend: Any = None
 
 
 _memory_backend_lock = threading.Lock()
@@ -987,6 +1041,9 @@ _conversation_router_backend_instance: Any = None
 
 _worker_registry_backend_lock = threading.Lock()
 _worker_registry_backend_instance: Any = None
+
+_delivery_backend_lock = threading.Lock()
+_delivery_backend_instance: Any = None
 
 _SESSION_STATIC_PATH_SEGMENTS = frozenset({
     "create", "append", "messages", "search", "turn-lock",
@@ -1184,8 +1241,24 @@ def _sanitize_log_message(message: str) -> str:
         _redact_worker_path,
         message,
     )
+    # Delivery: encoded %2F and rejected route aliases can include delivery refs or tokens.
     message = re.sub(
-        r"(/(?:memory/records|memory|artifacts|audit|sessions|credentials|secrets|skills|queue|run-leases|cron/jobs|cron|conversations|workers)[^\s?\"]*)\?[^\s]+",
+        r"(/delivery)%2[fF][^\s?\"]+(\?[^\s\"]+)?",
+        lambda m: f"{m.group(1)}/<redacted>{'?<redacted>' if m.group(2) else ''}",
+        message,
+    )
+    message = re.sub(
+        r"(/delivery)(?!/deliver(?:[?\s\"]|$)|[?\s\"]|$)[^\s?\"]+(\?[^\s\"]+)?",
+        lambda m: f"{m.group(1)}/<redacted>{'?<redacted>' if m.group(2) else ''}",
+        message,
+    )
+    message = re.sub(
+        r"(/delivery/deliver);[^\s?\"]*(\?[^\s\"]+)?",
+        lambda m: f"{m.group(1)};<redacted>{'?<redacted>' if m.group(2) else ''}",
+        message,
+    )
+    message = re.sub(
+        r"(/(?:memory/records|memory|artifacts|audit|sessions|credentials|secrets|skills|queue|run-leases|cron/jobs|cron|conversations|workers|delivery)[^\s?\"]*)\?[^\s]+",
         r"\1?<redacted>",
         message,
     )
@@ -1557,6 +1630,39 @@ def _get_or_create_worker_registry_backend() -> Any:
         if _worker_registry_backend_instance is None:
             _worker_registry_backend_instance = _make_worker_registry_backend(dict(os.environ))
         return _worker_registry_backend_instance
+
+
+def _make_delivery_backend(environ: dict[str, str]) -> Any:
+    """Create a SQLiteDeliveryBackend from the given environment mapping.
+
+    AGENTOPS_DELIVERY_DB_PATH is required; blank, ':memory:', and relative paths
+    are rejected. No cwd/tmp fallback is provided for compose/cloud profiles.
+    """
+    db_path = environ.get("AGENTOPS_DELIVERY_DB_PATH", "").strip()
+    if not db_path:
+        raise ValueError(
+            "compose delivery backend requires AGENTOPS_DELIVERY_DB_PATH; "
+            "no local fallback is provided for compose/cloud profiles"
+        )
+    if db_path == ":memory:":
+        raise ValueError(
+            "AGENTOPS_DELIVERY_DB_PATH must be a durable file path, not ':memory:'"
+        )
+    if not db_path.startswith("/"):
+        raise ValueError(
+            "AGENTOPS_DELIVERY_DB_PATH must be an absolute path"
+        )
+    from agentops_runtime.delivery_api import SQLiteDeliveryBackend
+
+    return SQLiteDeliveryBackend(db_path)
+
+
+def _get_or_create_delivery_backend() -> Any:
+    global _delivery_backend_instance
+    with _delivery_backend_lock:
+        if _delivery_backend_instance is None:
+            _delivery_backend_instance = _make_delivery_backend(dict(os.environ))
+        return _delivery_backend_instance
 
 
 class _DeterministicCredentialResolver:

@@ -3518,3 +3518,246 @@ def test_workers_log_message_redacts_unknown_action():
     )
     assert "LEAKSENTINEL-action" not in rendered
     assert "<redacted>" in rendered
+
+
+# ---------------------------------------------------------------------------
+# M12B: Delivery dispatch and backend (delivery_api)
+# ---------------------------------------------------------------------------
+
+
+def test_make_delivery_backend_fails_closed_when_blank():
+    with pytest.raises(ValueError, match="AGENTOPS_DELIVERY_DB_PATH"):
+        compose_services._make_delivery_backend({})
+
+
+def test_make_delivery_backend_fails_closed_on_whitespace():
+    with pytest.raises(ValueError, match="AGENTOPS_DELIVERY_DB_PATH"):
+        compose_services._make_delivery_backend({"AGENTOPS_DELIVERY_DB_PATH": "   "})
+
+
+def test_make_delivery_backend_fails_closed_on_memory():
+    with pytest.raises(ValueError, match=":memory:"):
+        compose_services._make_delivery_backend({"AGENTOPS_DELIVERY_DB_PATH": ":memory:"})
+
+
+def test_make_delivery_backend_fails_closed_on_relative_path():
+    with pytest.raises(ValueError, match="absolute"):
+        compose_services._make_delivery_backend({"AGENTOPS_DELIVERY_DB_PATH": "relative/path.db"})
+
+
+def test_make_delivery_backend_accepts_absolute_path(tmp_path):
+    from agentops_runtime.delivery_api import SQLiteDeliveryBackend
+
+    db_path = str(tmp_path / "delivery.db")
+    backend = compose_services._make_delivery_backend({
+        "AGENTOPS_DELIVERY_DB_PATH": db_path,
+    })
+    assert isinstance(backend, SQLiteDeliveryBackend)
+
+
+class _RecordingDeliveryBackend:
+    def __init__(self):
+        self.deliveries = []
+
+    def deliver(self, context, message):
+        self.deliveries.append({"context": context, "message": message})
+
+
+def _make_api_server_with_delivery_backend():
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    setattr(server, "delivery_backend", _RecordingDeliveryBackend())
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread, f"http://127.0.0.1:{server.server_port}"
+
+
+def test_api_service_routes_delivery_deliver():
+    server, thread, base = _make_api_server_with_delivery_backend()
+    try:
+        status, payload = _post_json_response(
+            f"{base}/delivery/deliver",
+            {"context": _CONTEXT, "message": {"text": "hello"}},
+        )
+        assert status == 200
+        assert payload == {}
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_http_delivery_backend_delivers_to_compose_server_endpoint():
+    from agent.runtime_context import RuntimeContext
+    from agent.runtime_delivery_http import HttpDeliveryBackend
+
+    server, thread, base = _make_api_server_with_delivery_backend()
+    try:
+        context = RuntimeContext(
+            mode="agentops",
+            org_id="org1",
+            workspace_id="ws1",
+            user_id="alice",
+            conversation_id="conv1",
+            agent_profile_id="bot",
+            project_id="proj1",
+            delivery_ref="slack:channel/thread",
+        )
+        result = HttpDeliveryBackend(base).deliver(context, {"text": "hello"})
+        assert result is None
+        assert server.delivery_backend.deliveries == [
+            {
+                "context": {
+                    "mode": "agentops",
+                    "org_id": "org1",
+                    "workspace_id": "ws1",
+                    "workspace_type": None,
+                    "project_id": "proj1",
+                    "external_channel_id": None,
+                    "external_thread_id": None,
+                    "conversation_id": "conv1",
+                    "user_id": "alice",
+                    "agent_profile_id": "bot",
+                    "run_type": "conversation",
+                    "parent_session_id": None,
+                    "backend_profile": None,
+                    "delivery_ref": "slack:channel/thread",
+                },
+                "message": {"text": "hello"},
+            }
+        ]
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+@pytest.mark.parametrize("service_name", ["worker", "scheduler", "local-secrets"])
+def test_non_api_services_return_404_for_delivery_deliver(service_name):
+    server, thread = _make_non_api_server(service_name)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({"context": _CONTEXT, "message": {"text": "hi"}}).encode()
+        status = _http_post(f"{base}/delivery/deliver", body)
+        assert status == 404, f"{service_name} should return 404 for POST /delivery/deliver"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_api_delivery_auth_before_backend(monkeypatch):
+    backend_constructed = []
+
+    def _raise_backend():
+        backend_constructed.append(True)
+        raise ValueError("LEAKSENTINEL-backend-secret")
+
+    monkeypatch.setattr(compose_services, "_get_or_create_delivery_backend", _raise_backend)
+
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({"context": _CONTEXT, "message": {"text": "hi"}}).encode()
+        req = urllib.request.Request(f"{base}/delivery/deliver", data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Content-Length", str(len(body)))
+        req.add_header("Authorization", "Bearer wrong-token")
+
+        monkeypatch.setenv("AGENTOPS_RUNTIME_TOKEN", "real-token")
+
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                status = r.status
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+        assert status == 401
+        assert not backend_constructed, "backend must not be constructed before auth check"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_api_delivery_backend_unavailable_returns_sanitized_503(monkeypatch):
+    def _raise_backend():
+        raise RuntimeError("LEAKSENTINEL /private/delivery.db token=raw-token")
+
+    monkeypatch.setattr(compose_services, "_get_or_create_delivery_backend", _raise_backend)
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        status, payload = _post_json_response(
+            f"{base}/delivery/deliver",
+            {"context": _CONTEXT, "message": {"text": "hello"}},
+        )
+        assert status == 503
+        assert payload == {"error": "delivery backend unavailable"}
+        assert "LEAKSENTINEL" not in json.dumps(payload)
+        assert "raw-token" not in json.dumps(payload)
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    ["", ";LEAKSENTINEL", ";", "/extra", "XYZ", "%2Fdeliver"],
+)
+def test_api_delivery_route_exactness_before_backend(monkeypatch, suffix):
+    backend_constructed = []
+
+    def _raise_backend():
+        backend_constructed.append(True)
+        raise AssertionError("backend must not be constructed for rejected delivery route")
+
+    monkeypatch.setattr(compose_services, "_get_or_create_delivery_backend", _raise_backend)
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({"context": _CONTEXT, "message": {"text": "hi"}}).encode()
+        target = f"{base}/delivery/deliver{suffix}" if suffix != "%2Fdeliver" else f"{base}/delivery%2Fdeliver"
+        status = _http_post(target, body)
+        if suffix == "":
+            assert status == 503
+            assert backend_constructed
+        else:
+            assert status == 404
+            assert not backend_constructed
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_delivery_log_message_redacts_query_and_rejected_route_material():
+    rendered = compose_services._sanitize_log_message(
+        '"POST /delivery/deliver;LEAKSENTINEL?delivery_ref=secret-ref HTTP/1.1" 404 -'
+    )
+    assert "LEAKSENTINEL" not in rendered
+    assert "secret-ref" not in rendered
+    assert "<redacted>" in rendered
+
+    prefix_rendered = compose_services._sanitize_log_message(
+        '"POST /deliveryXYZLEAK?token=secret-token HTTP/1.1" 404 -'
+    )
+    assert "XYZLEAK" not in prefix_rendered
+    assert "secret-token" not in prefix_rendered
+    assert "<redacted>" in prefix_rendered
+
+    encoded_rendered = compose_services._sanitize_log_message(
+        '"POST /delivery%2FdeliverLEAK?delivery_ref=secret-ref HTTP/1.1" 404 -'
+    )
+    assert "deliverLEAK" not in encoded_rendered
+    assert "secret-ref" not in encoded_rendered
+    assert "<redacted>" in encoded_rendered
