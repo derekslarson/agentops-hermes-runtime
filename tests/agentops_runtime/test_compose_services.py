@@ -3761,3 +3761,274 @@ def test_delivery_log_message_redacts_query_and_rejected_route_material():
     assert "deliverLEAK" not in encoded_rendered
     assert "secret-ref" not in encoded_rendered
     assert "<redacted>" in encoded_rendered
+
+
+# ---------------------------------------------------------------------------
+# RED tests: worker self-registration on startup (M12B scaled smoke)
+# ---------------------------------------------------------------------------
+
+
+def test_register_worker_self_calls_worker_registry_register(monkeypatch, tmp_path):
+    """_register_worker_self calls register on the WORKER_REGISTRY backend."""
+    from agent.runtime_backends import BackendCapability
+
+    register_calls: list[tuple] = []
+
+    class FakeWorkerBackend:
+        def register(self, ctx, worker, *, ttl_seconds=None, now=None):
+            register_calls.append((ctx, worker, ttl_seconds))
+            return "fake-worker-id"
+
+    fake_backend = FakeWorkerBackend()
+
+    def fake_configure(registry, *, environ):
+        return None
+
+    monkeypatch.setattr(
+        compose_services,
+        "configure_compose_runtime_backends",
+        fake_configure,
+        raising=False,
+    )
+
+    from agent.runtime_backends import RuntimeBackendRegistry
+
+    monkeypatch.setattr(
+        RuntimeBackendRegistry,
+        "get",
+        lambda self, cap, ctx: fake_backend if cap == BackendCapability.WORKER_REGISTRY else None,
+    )
+
+    compose_services._register_worker_self(
+        environ={
+            "AGENTOPS_API_URL": "http://localhost:9999",
+            "AGENTOPS_SECRET_STORE_URL": "http://localhost:9998",
+            "HOSTNAME": "test-host-abc",
+        }
+    )
+
+    assert len(register_calls) == 1
+
+
+def test_register_worker_self_uses_fleet_context(monkeypatch, tmp_path):
+    """_register_worker_self registers under a fleet/infrastructure context, not tenant."""
+    from agent.runtime_backends import BackendCapability
+    from agent.runtime_context import RuntimeContext
+
+    registered_contexts: list[RuntimeContext] = []
+
+    class FakeWorkerBackend:
+        def register(self, ctx, worker, *, ttl_seconds=None, now=None):
+            registered_contexts.append(ctx)
+            return "fake-worker-id"
+
+    fake_backend = FakeWorkerBackend()
+
+    monkeypatch.setattr(
+        compose_services,
+        "configure_compose_runtime_backends",
+        lambda registry, *, environ: None,
+        raising=False,
+    )
+    from agent.runtime_backends import RuntimeBackendRegistry
+    monkeypatch.setattr(
+        RuntimeBackendRegistry,
+        "get",
+        lambda self, cap, ctx: fake_backend,
+    )
+
+    compose_services._register_worker_self(
+        environ={
+            "AGENTOPS_API_URL": "http://localhost:9999",
+            "AGENTOPS_SECRET_STORE_URL": "http://localhost:9998",
+            "HOSTNAME": "worker-host-42",
+        }
+    )
+
+    assert len(registered_contexts) == 1
+    ctx = registered_contexts[0]
+    assert ctx.org_id == "__fleet__", f"expected __fleet__ org_id, got {ctx.org_id!r}"
+    assert ctx.workspace_id == "__fleet__"
+
+
+def test_register_worker_self_stable_id_from_hostname(monkeypatch):
+    """Worker ID is derived from HOSTNAME env and is stable."""
+    from agent.runtime_backends import BackendCapability
+
+    worker_payloads: list[dict] = []
+
+    class FakeWorkerBackend:
+        def register(self, ctx, worker, *, ttl_seconds=None, now=None):
+            worker_payloads.append(dict(worker))
+            return "fake-worker-id"
+
+    monkeypatch.setattr(
+        compose_services,
+        "configure_compose_runtime_backends",
+        lambda registry, *, environ: None,
+        raising=False,
+    )
+    from agent.runtime_backends import RuntimeBackendRegistry
+    monkeypatch.setattr(
+        RuntimeBackendRegistry,
+        "get",
+        lambda self, cap, ctx: FakeWorkerBackend(),
+    )
+
+    compose_services._register_worker_self(
+        environ={
+            "AGENTOPS_API_URL": "http://localhost:9999",
+            "AGENTOPS_SECRET_STORE_URL": "http://localhost:9998",
+            "HOSTNAME": "compose-worker-hostname",
+        }
+    )
+
+    assert len(worker_payloads) == 1
+    assert "compose-worker-hostname" in worker_payloads[0].get("id", "")
+
+
+def test_register_worker_self_id_from_agentops_worker_id_override(monkeypatch):
+    """AGENTOPS_WORKER_ID env overrides the HOSTNAME-derived worker ID."""
+    worker_payloads: list[dict] = []
+
+    class FakeWorkerBackend:
+        def register(self, ctx, worker, *, ttl_seconds=None, now=None):
+            worker_payloads.append(dict(worker))
+            return "fake-worker-id"
+
+    monkeypatch.setattr(
+        compose_services,
+        "configure_compose_runtime_backends",
+        lambda registry, *, environ: None,
+        raising=False,
+    )
+    from agent.runtime_backends import RuntimeBackendRegistry
+    monkeypatch.setattr(
+        RuntimeBackendRegistry,
+        "get",
+        lambda self, cap, ctx: FakeWorkerBackend(),
+    )
+
+    compose_services._register_worker_self(
+        environ={
+            "AGENTOPS_API_URL": "http://localhost:9999",
+            "AGENTOPS_SECRET_STORE_URL": "http://localhost:9998",
+            "HOSTNAME": "some-hostname",
+            "AGENTOPS_WORKER_ID": "explicit-worker-override-id",
+        }
+    )
+
+    assert len(worker_payloads) == 1
+    assert worker_payloads[0].get("id") == "explicit-worker-override-id"
+
+
+def test_register_worker_self_includes_max_concurrent_runs(monkeypatch):
+    """Worker registration includes max_concurrent_runs from AGENTOPS_WORKER_MAX_CONCURRENT_RUNS."""
+    worker_payloads: list[dict] = []
+
+    class FakeWorkerBackend:
+        def register(self, ctx, worker, *, ttl_seconds=None, now=None):
+            worker_payloads.append(dict(worker))
+            return "fake-worker-id"
+
+    monkeypatch.setattr(
+        compose_services,
+        "configure_compose_runtime_backends",
+        lambda registry, *, environ: None,
+        raising=False,
+    )
+    from agent.runtime_backends import RuntimeBackendRegistry
+    monkeypatch.setattr(
+        RuntimeBackendRegistry,
+        "get",
+        lambda self, cap, ctx: FakeWorkerBackend(),
+    )
+
+    compose_services._register_worker_self(
+        environ={
+            "AGENTOPS_API_URL": "http://localhost:9999",
+            "AGENTOPS_SECRET_STORE_URL": "http://localhost:9998",
+            "HOSTNAME": "worker-host",
+            "AGENTOPS_WORKER_MAX_CONCURRENT_RUNS": "4",
+        }
+    )
+
+    assert len(worker_payloads) == 1
+    assert worker_payloads[0].get("max_concurrent_runs") == 4
+
+
+def test_register_worker_self_includes_smoke_fleet_run_id_when_set(monkeypatch):
+    """Worker registration carries the current smoke run id so scale proof can ignore stale rows."""
+    worker_payloads: list[dict] = []
+
+    class FakeWorkerBackend:
+        def register(self, ctx, worker, *, ttl_seconds=None, now=None):
+            worker_payloads.append(dict(worker))
+            return "fake-worker-id"
+
+    monkeypatch.setattr(
+        compose_services,
+        "configure_compose_runtime_backends",
+        lambda registry, *, environ: None,
+        raising=False,
+    )
+    from agent.runtime_backends import RuntimeBackendRegistry
+    monkeypatch.setattr(
+        RuntimeBackendRegistry,
+        "get",
+        lambda self, cap, ctx: FakeWorkerBackend(),
+    )
+
+    compose_services._register_worker_self(
+        environ={
+            "AGENTOPS_API_URL": "http://localhost:9999",
+            "AGENTOPS_SECRET_STORE_URL": "http://localhost:9998",
+            "HOSTNAME": "worker-host",
+            "AGENTOPS_SMOKE_FLEET_RUN_ID": "smoke-run-123",
+        }
+    )
+
+    assert len(worker_payloads) == 1
+    assert worker_payloads[0].get("smoke_fleet_run_id") == "smoke-run-123"
+
+
+def test_register_worker_self_fails_closed_on_backend_error(monkeypatch):
+    """Registration failure does not crash; server health remains available."""
+    monkeypatch.setattr(
+        compose_services,
+        "configure_compose_runtime_backends",
+        lambda registry, *, environ: (_ for _ in ()).throw(RuntimeError("backend wiring broken")),
+        raising=False,
+    )
+
+    compose_services._register_worker_self(
+        environ={
+            "AGENTOPS_API_URL": "http://localhost:9999",
+            "AGENTOPS_SECRET_STORE_URL": "http://localhost:9998",
+            "HOSTNAME": "worker-host",
+        }
+    )
+
+
+def test_register_worker_self_failure_log_does_not_expose_urls(monkeypatch, capsys):
+    """Registration failure log message does not contain API URLs or env values."""
+    monkeypatch.setattr(
+        compose_services,
+        "configure_compose_runtime_backends",
+        lambda registry, *, environ: (_ for _ in ()).throw(RuntimeError("http://secret-host:9999/token=abc")),
+        raising=False,
+    )
+
+    compose_services._register_worker_self(
+        environ={
+            "AGENTOPS_API_URL": "http://secret-host:9999",
+            "AGENTOPS_SECRET_STORE_URL": "http://secret-store:9998",
+            "HOSTNAME": "worker-host-secret",
+        }
+    )
+
+    captured = capsys.readouterr()
+    combined = captured.out + captured.err
+    assert "secret-host" not in combined
+    assert "token=abc" not in combined
+    assert "worker-host-secret" not in combined

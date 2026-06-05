@@ -303,6 +303,47 @@ def test_run_durable_smoke_none_environ_passes_none_to_configure(monkeypatch):
     assert captured[0] is None, f"expected None but configure received {captured[0]!r}"
 
 
+def test_run_durable_smoke_none_environ_threads_process_env_to_scale_step(monkeypatch):
+    """CLI/default environ=None must still let worker_fleet_scale see process env vars."""
+    from agentops_runtime import compose_durable_smoke
+
+    monkeypatch.setenv("AGENTOPS_SMOKE_EXPECTED_WORKERS", "3")
+    monkeypatch.setattr(
+        compose_durable_smoke,
+        "configure_compose_runtime_backends",
+        lambda registry, *, environ: None,
+    )
+    for name in (
+        "_step_worker_fleet",
+        "_step_queue_tenant_isolation",
+        "_step_conversation_routing",
+        "_step_secret_roundtrip",
+        "_step_native_state_continuity",
+    ):
+        monkeypatch.setattr(
+            compose_durable_smoke,
+            name,
+            lambda registry, step=name.removeprefix("_step_"): {"step": step, "ok": True},
+        )
+
+    captured: list[dict[str, str] | None] = []
+
+    def fake_scale_step(registry, *, environ=None):
+        captured.append(environ)
+        expected = (environ or {}).get("AGENTOPS_SMOKE_EXPECTED_WORKERS")
+        return {"step": "worker_fleet_scale", "ok": expected == "3", "enforced": expected == "3"}
+
+    monkeypatch.setattr(compose_durable_smoke, "_step_worker_fleet_scale", fake_scale_step)
+
+    result = run_durable_smoke(environ=None)
+
+    assert result["ok"] is True
+    scale_step = next(s for s in result["steps"] if s["step"] == "worker_fleet_scale")
+    assert scale_step["enforced"] is True
+    assert captured and captured[0] is not None
+    assert captured[0].get("AGENTOPS_SMOKE_EXPECTED_WORKERS") == "3"
+
+
 # ---------------------------------------------------------------------------
 # native_state_continuity step
 # ---------------------------------------------------------------------------
@@ -587,3 +628,195 @@ def test_queue_tenant_isolation_b_claim_before_a_claim():
     assert call_log.index("claim_b") < call_log.index("claim_a"), (
         f"tenant B claim must happen before tenant A claim; got order: {call_log}"
     )
+
+
+# ---------------------------------------------------------------------------
+# RED tests: worker_fleet_scale gated durable smoke step (M12B scaled smoke)
+# ---------------------------------------------------------------------------
+
+
+def _register_fleet_worker_http(api_base: str, worker_id: str, *, smoke_fleet_run_id: str | None = None) -> None:
+    """Register a fleet worker via HTTP POST to /workers/register."""
+    fleet_scope = {
+        "mode": "agentops",
+        "org_id": "__fleet__",
+        "workspace_id": "__fleet__",
+        "workspace_type": "infrastructure",
+        "user_id": "__fleet__",
+        "project_id": "__fleet__",
+        "agent_profile_id": "__fleet__",
+        "run_type": "manual",
+        "backend_profile": "compose-self-hosted",
+        "conversation_id": None,
+        "external_channel_id": None,
+        "external_thread_id": None,
+        "parent_session_id": None,
+        "delivery_ref": None,
+    }
+    worker = {"id": worker_id, "capabilities": ["run"]}
+    if smoke_fleet_run_id is not None:
+        worker["smoke_fleet_run_id"] = smoke_fleet_run_id
+    body = json.dumps({
+        "context": fleet_scope,
+        "worker": worker,
+        "ttl_seconds": 300,
+    }).encode()
+    status, resp = _http_post(f"{api_base}/workers/register", body)
+    assert status == 200, f"fleet worker register failed ({status}): {resp}"
+
+
+def test_worker_fleet_scale_step_in_steps_list(_two_servers):
+    """worker_fleet_scale step is always included in the smoke steps list."""
+    result = run_durable_smoke(environ=_two_servers)
+    names = {s["step"] for s in result["steps"]}
+    assert "worker_fleet_scale" in names
+
+
+def test_worker_fleet_scale_step_gated_off_when_env_unset(_two_servers):
+    """Returns ok=True, enforced=False when AGENTOPS_SMOKE_EXPECTED_WORKERS is not set."""
+    env = dict(_two_servers)
+    env.pop("AGENTOPS_SMOKE_EXPECTED_WORKERS", None)
+    result = run_durable_smoke(environ=env)
+    step = next(s for s in result["steps"] if s["step"] == "worker_fleet_scale")
+    assert step["ok"] is True
+    assert step["enforced"] is False
+
+
+def test_worker_fleet_scale_step_gated_off_when_env_zero(_two_servers):
+    """Returns ok=True, enforced=False when AGENTOPS_SMOKE_EXPECTED_WORKERS=0."""
+    env = dict(_two_servers)
+    env["AGENTOPS_SMOKE_EXPECTED_WORKERS"] = "0"
+    result = run_durable_smoke(environ=env)
+    step = next(s for s in result["steps"] if s["step"] == "worker_fleet_scale")
+    assert step["ok"] is True
+    assert step["enforced"] is False
+
+
+def test_worker_fleet_scale_fails_closed_for_invalid_expected_workers(_two_servers):
+    """A typo in AGENTOPS_SMOKE_EXPECTED_WORKERS must not silently disable scale proof."""
+    env = dict(_two_servers)
+    env["AGENTOPS_SMOKE_EXPECTED_WORKERS"] = "not-an-int"
+
+    result = run_durable_smoke(environ=env)
+
+    step = next(s for s in result["steps"] if s["step"] == "worker_fleet_scale")
+    assert step["ok"] is False
+    assert step["enforced"] is True
+    assert step.get("error") == "invalid expected worker count"
+
+
+def test_worker_fleet_scale_passes_with_enough_fleet_workers(_two_servers):
+    """Passes when >= N distinct fleet workers are pre-registered under the fleet context."""
+    env = dict(_two_servers)
+    env["AGENTOPS_SMOKE_EXPECTED_WORKERS"] = "2"
+    api_base = env["AGENTOPS_API_URL"]
+    _register_fleet_worker_http(api_base, "fleet-worker-1")
+    _register_fleet_worker_http(api_base, "fleet-worker-2")
+    result = run_durable_smoke(environ=env)
+    step = next(s for s in result["steps"] if s["step"] == "worker_fleet_scale")
+    assert step["ok"] is True
+    assert step["enforced"] is True
+    assert step.get("enough") is True
+
+
+def test_worker_fleet_scale_filters_to_current_smoke_fleet_run_id(_two_servers):
+    """When a smoke run id is set, previous-run fleet workers cannot satisfy scale proof."""
+    env = dict(_two_servers)
+    env["AGENTOPS_SMOKE_EXPECTED_WORKERS"] = "1"
+    env["AGENTOPS_SMOKE_FLEET_RUN_ID"] = "current-smoke-run"
+    api_base = env["AGENTOPS_API_URL"]
+    _register_fleet_worker_http(api_base, "previous-run-worker", smoke_fleet_run_id="previous-smoke-run")
+
+    result = run_durable_smoke(environ=env)
+
+    step = next(s for s in result["steps"] if s["step"] == "worker_fleet_scale")
+    assert step["ok"] is False
+    assert step["enforced"] is True
+    assert step.get("distinct_count") == 0
+    assert step.get("enough") is False
+
+
+def test_worker_fleet_scale_accepts_current_smoke_fleet_run_id(_two_servers):
+    """Workers tagged with the current smoke run id count toward the live scale proof."""
+    env = dict(_two_servers)
+    env["AGENTOPS_SMOKE_EXPECTED_WORKERS"] = "1"
+    env["AGENTOPS_SMOKE_FLEET_RUN_ID"] = "current-smoke-run"
+    api_base = env["AGENTOPS_API_URL"]
+    _register_fleet_worker_http(api_base, "current-run-worker", smoke_fleet_run_id="current-smoke-run")
+
+    result = run_durable_smoke(environ=env)
+
+    step = next(s for s in result["steps"] if s["step"] == "worker_fleet_scale")
+    assert step["ok"] is True
+    assert step["enforced"] is True
+    assert step.get("distinct_count") == 1
+    assert step.get("enough") is True
+
+
+def test_worker_fleet_scale_fails_with_insufficient_fleet_workers(_two_servers):
+    """Fails when fleet worker count < expected (n-1 registered, expected n)."""
+    env = dict(_two_servers)
+    env["AGENTOPS_SMOKE_EXPECTED_WORKERS"] = "3"
+    api_base = env["AGENTOPS_API_URL"]
+    _register_fleet_worker_http(api_base, "fleet-worker-a")
+    _register_fleet_worker_http(api_base, "fleet-worker-b")
+    result = run_durable_smoke(environ=env)
+    step = next(s for s in result["steps"] if s["step"] == "worker_fleet_scale")
+    assert step["ok"] is False
+    assert step["enforced"] is True
+    assert step.get("enough") is False
+
+
+def test_worker_fleet_scale_duplicate_ids_count_once(_two_servers):
+    """Duplicate worker_ids registered under fleet scope count as one distinct worker."""
+    env = dict(_two_servers)
+    env["AGENTOPS_SMOKE_EXPECTED_WORKERS"] = "2"
+    api_base = env["AGENTOPS_API_URL"]
+    _register_fleet_worker_http(api_base, "fleet-dup-worker")
+    _register_fleet_worker_http(api_base, "fleet-dup-worker")
+    result = run_durable_smoke(environ=env)
+    step = next(s for s in result["steps"] if s["step"] == "worker_fleet_scale")
+    assert step.get("distinct_count", 0) == 1
+    assert step["ok"] is False
+
+
+def test_worker_fleet_scale_tenant_scope_cannot_list_fleet_workers(_two_servers):
+    """Tenant-scoped list cannot see fleet workers."""
+    env = dict(_two_servers)
+    env["AGENTOPS_SMOKE_EXPECTED_WORKERS"] = "1"
+    api_base = env["AGENTOPS_API_URL"]
+    _register_fleet_worker_http(api_base, "fleet-worker-x")
+    result = run_durable_smoke(environ=env)
+    step = next(s for s in result["steps"] if s["step"] == "worker_fleet_scale")
+    assert step.get("tenant_isolated") is True
+
+
+def test_worker_fleet_scale_report_contains_no_worker_ids(_two_servers):
+    """Report from worker_fleet_scale contains no raw worker IDs or hostnames."""
+    env = dict(_two_servers)
+    env["AGENTOPS_SMOKE_EXPECTED_WORKERS"] = "1"
+    api_base = env["AGENTOPS_API_URL"]
+    _register_fleet_worker_http(api_base, "fleet-worker-secret-id")
+    result = run_durable_smoke(environ=env)
+    text = json.dumps(result)
+    assert "fleet-worker-secret-id" not in text
+    assert "__fleet__" not in text
+
+
+def test_fleet_ctx_has_reserved_org_and_workspace():
+    """_fleet_ctx returns a RuntimeContext with reserved __fleet__ identifiers."""
+    from agentops_runtime.compose_durable_smoke import _fleet_ctx
+    ctx = _fleet_ctx()
+    assert ctx.org_id == "__fleet__"
+    assert ctx.workspace_id == "__fleet__"
+    assert ctx.backend_profile == "compose-self-hosted"
+    assert ctx.mode == "agentops"
+
+
+def test_fleet_ctx_differs_from_tenant_ctx():
+    """Fleet context produces a different scope than any tenant smoke context."""
+    from agentops_runtime.compose_durable_smoke import _fleet_ctx, _ctx
+    from agent.runtime_worker_registry_http import HttpWorkerRegistry
+    fleet_scope = HttpWorkerRegistry._scope_payload(_fleet_ctx())
+    tenant_scope = HttpWorkerRegistry._scope_payload(_ctx("smoke-tenant-a"))
+    assert fleet_scope != tenant_scope

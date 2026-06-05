@@ -70,6 +70,7 @@ services:
       - AGENTOPS_SECRET_STORE_URL=http://local-secrets:8713
       - AGENTOPS_API_URL=http://api:8710
       - AGENTOPS_WORKER_MAX_CONCURRENT_RUNS=${AGENTOPS_WORKER_MAX_CONCURRENT_RUNS:-2}
+      - AGENTOPS_SMOKE_FLEET_RUN_ID=${AGENTOPS_SMOKE_FLEET_RUN_ID:-}
     depends_on:
       api:
         condition: service_healthy
@@ -211,6 +212,8 @@ services:
     environment:
       - AGENTOPS_API_URL=http://api:8710
       - AGENTOPS_SECRET_STORE_URL=http://local-secrets:8713
+      - AGENTOPS_SMOKE_EXPECTED_WORKERS=${AGENTOPS_SMOKE_EXPECTED_WORKERS:-0}
+      - AGENTOPS_SMOKE_FLEET_RUN_ID=${AGENTOPS_SMOKE_FLEET_RUN_ID:-}
 
 volumes:
   agentops-postgres:

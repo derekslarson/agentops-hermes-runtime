@@ -19,7 +19,8 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from agent.runtime_backends import RuntimeBackendRegistry
+from agent.runtime_backends import BackendCapability, RuntimeBackendRegistry
+from agent.runtime_context import RuntimeContext
 from agentops_runtime.compose_backends import (
     COMPOSE_REQUIRED_CAPABILITIES,
     configure_compose_runtime_backends,
@@ -1695,6 +1696,63 @@ class _DeterministicCredentialResolver:
         return f"cred-{digest[:32]}"
 
 
+def _register_worker_self(*, environ: dict[str, str]) -> None:
+    """Register this worker process with the fleet registry on startup.
+
+    Uses the reserved fleet RuntimeContext (not a tenant scope). Worker ID is
+    stable per container: seeded from AGENTOPS_WORKER_ID if set, else from
+    HOSTNAME env. Fails closed: any exception is caught and logged as a
+    sanitized message without env values, URLs, or hostnames; the health
+    server starts regardless.
+    """
+    import socket
+
+    try:
+        worker_id = environ.get("AGENTOPS_WORKER_ID", "").strip()
+        if not worker_id:
+            hostname = environ.get("HOSTNAME", "").strip() or socket.gethostname()
+            worker_id = f"worker-{hostname}"
+
+        max_runs_raw = environ.get("AGENTOPS_WORKER_MAX_CONCURRENT_RUNS", "1")
+        try:
+            max_runs = int(max_runs_raw)
+        except (ValueError, TypeError):
+            max_runs = 1
+
+        registry = RuntimeBackendRegistry()
+        configure_compose_runtime_backends(registry, environ=environ)
+
+        fleet_ctx = RuntimeContext(
+            mode="agentops",
+            org_id="__fleet__",
+            workspace_id="__fleet__",
+            workspace_type="infrastructure",
+            user_id="__fleet__",
+            conversation_id=None,
+            agent_profile_id="__fleet__",
+            project_id="__fleet__",
+            permissions_ref="fleet-perms",
+            run_id="__fleet__",
+            run_type="manual",
+            backend_profile="compose-self-hosted",
+            delivery_ref=None,
+        )
+
+        backend = registry.get(BackendCapability.WORKER_REGISTRY, fleet_ctx)
+        worker_payload = {"id": worker_id, "capabilities": ["run"], "max_concurrent_runs": max_runs}
+        smoke_fleet_run_id = environ.get("AGENTOPS_SMOKE_FLEET_RUN_ID", "").strip()
+        if smoke_fleet_run_id:
+            worker_payload["smoke_fleet_run_id"] = smoke_fleet_run_id
+        backend.register(
+            fleet_ctx,
+            worker_payload,
+            ttl_seconds=300,
+        )
+        print(f"worker registered (capacity={max_runs})", file=sys.stderr, flush=True)
+    except Exception:
+        print("worker self-registration failed; health server still starting", file=sys.stderr, flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = argv if argv is not None else sys.argv[1:]
     service = args[0] if args else "api"
@@ -1714,6 +1772,8 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
     print(f"AgentOps {service} listening on :{port}", flush=True)
+    if service == "worker":
+        _register_worker_self(environ=dict(os.environ))
     server.serve_forever(poll_interval=0.2)
     stopped.set()
     return 0

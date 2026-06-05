@@ -4,13 +4,15 @@ Run against a live Compose stack (or a test harness with in-process SQLite serve
 
     python -m agentops_runtime.compose_durable_smoke
 
-The module probes five durable-backend slices:
+The module probes six durable-backend slices:
 - ``worker_fleet``           register/list two workers via WorkerRegistry
 - ``queue_tenant_isolation`` tenant A enqueue/claim/ack; tenant B cannot claim tenant A's item
 - ``conversation_routing``   resolve-conversation idempotency, route_turn, find_active_run
 - ``secret_roundtrip``       put/get sentinel; cross-tenant get is isolated
 - ``native_state_continuity`` curated memory write/read, session create/append/read, deep-memory
                                upsert/get — all three surfaces isolated between tenant A and B
+- ``worker_fleet_scale``     optional live scaled-worker proof when AGENTOPS_SMOKE_EXPECTED_WORKERS
+                               is set by the Compose smoke script
 
 Only sanitized, JSON-safe data is reported: step names, booleans, and integer counts.
 No raw IDs, tenant IDs, secret values, URLs, local paths, or backend error text is emitted.
@@ -19,6 +21,7 @@ No raw IDs, tenant IDs, secret values, URLs, local paths, or backend error text 
 from __future__ import annotations
 
 import json
+import os
 import sys
 from typing import Any
 
@@ -36,6 +39,29 @@ _SECRET_VALUE = "durable-smoke-sentinel"
 _MEMORY_SENTINEL = "smoke-curated-mem-sentinel"
 _SESSION_SENTINEL = "smoke-session-sentinel"
 _DEEP_MEM_SENTINEL = "smoke-deep-mem-sentinel"
+
+# Reserved fleet/infrastructure scope — never collides with tenant scopes.
+_FLEET_ORG_ID = "__fleet__"
+_FLEET_WS_ID = "__fleet__"
+
+
+def _fleet_ctx() -> RuntimeContext:
+    """Reserved infrastructure RuntimeContext for fleet worker registration."""
+    return RuntimeContext(
+        mode="agentops",
+        org_id=_FLEET_ORG_ID,
+        workspace_id=_FLEET_WS_ID,
+        workspace_type="infrastructure",
+        user_id="__fleet__",
+        conversation_id=None,
+        agent_profile_id="__fleet__",
+        project_id="__fleet__",
+        permissions_ref="fleet-perms",
+        run_id="__fleet__",
+        run_type="manual",
+        backend_profile=_COMPOSE_PROFILE,
+        delivery_ref=None,
+    )
 
 
 def _ctx(scope_label: str, conversation_id: str = "smoke-conv-1") -> RuntimeContext:
@@ -57,13 +83,94 @@ def _ctx(scope_label: str, conversation_id: str = "smoke-conv-1") -> RuntimeCont
 
 
 def _step_worker_fleet(registry: RuntimeBackendRegistry) -> dict[str, Any]:
+    """Synthetic contract guard: register/list via the native adapter with a smoke tenant context.
+
+    This step proves the worker-registry HTTP adapter wiring is functional.
+    It is NOT live multi-container scale proof — see worker_fleet_scale for that.
+    """
     ctx = _ctx(_SCOPE_A)
     backend = registry.get(BackendCapability.WORKER_REGISTRY, ctx)
     backend.register(ctx, {"capabilities": ["run"]}, ttl_seconds=300)
     backend.register(ctx, {"capabilities": ["run"]}, ttl_seconds=300)
     listed = backend.list_workers(ctx)
     count = len(listed)
-    return {"step": "worker_fleet", "ok": count >= 2, "registered": 2, "listed": count}
+    return {"step": "worker_fleet", "ok": count >= 2, "registered": 2, "listed": count, "synthetic": True}
+
+
+def _step_worker_fleet_scale(
+    registry: RuntimeBackendRegistry,
+    *,
+    environ: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Gated live scale check: verify fleet worker count meets the expected minimum.
+
+    Reads AGENTOPS_SMOKE_EXPECTED_WORKERS from environ. If unset or 0, reports
+    enforced=False and ok=True (gate is off). If > 0, lists fleet workers under the
+    reserved fleet scope and requires distinct count >= expected. Also asserts that
+    a tenant-scoped list cannot see fleet workers.
+
+    Only sanitized counts and booleans are reported — no raw worker IDs, hostnames,
+    URLs, or backend error text.
+    """
+    env = environ or {}
+    expected_raw = env.get("AGENTOPS_SMOKE_EXPECTED_WORKERS", "") or ""
+    if not str(expected_raw).strip():
+        return {"step": "worker_fleet_scale", "ok": True, "enforced": False}
+    try:
+        expected = int(str(expected_raw).strip())
+    except (ValueError, TypeError):
+        return {"step": "worker_fleet_scale", "ok": False, "enforced": True, "error": "invalid expected worker count"}
+
+    if expected < 0:
+        return {"step": "worker_fleet_scale", "ok": False, "enforced": True, "error": "invalid expected worker count"}
+    if expected == 0:
+        return {"step": "worker_fleet_scale", "ok": True, "enforced": False}
+
+    fleet_ctx = _fleet_ctx()
+    tenant_ctx = _ctx(_SCOPE_A)
+
+    try:
+        fleet_backend = registry.get(BackendCapability.WORKER_REGISTRY, fleet_ctx)
+        fleet_backend.recover_expired(fleet_ctx)
+        fleet_workers = fleet_backend.list_workers(fleet_ctx)
+    except Exception:
+        return {"step": "worker_fleet_scale", "ok": False, "enforced": True, "error": "fleet worker list failed"}
+
+    smoke_fleet_run_id = env.get("AGENTOPS_SMOKE_FLEET_RUN_ID", "") or ""
+    seen_ids: set[str] = set()
+    for w in fleet_workers:
+        worker_payload = w.get("worker") if isinstance(w, dict) else None
+        if smoke_fleet_run_id:
+            if not isinstance(worker_payload, dict) or worker_payload.get("smoke_fleet_run_id") != smoke_fleet_run_id:
+                continue
+        wid = w.get("worker_id") if isinstance(w, dict) else None
+        if wid and isinstance(wid, str):
+            seen_ids.add(wid)
+    distinct_count = len(seen_ids)
+    enough = distinct_count >= expected
+
+    try:
+        tenant_backend = registry.get(BackendCapability.WORKER_REGISTRY, tenant_ctx)
+        tenant_workers = tenant_backend.list_workers(tenant_ctx)
+        fleet_ids_in_tenant = sum(
+            1
+            for w in tenant_workers
+            if isinstance(w, dict) and w.get("worker_id") in seen_ids
+        )
+        tenant_isolated = fleet_ids_in_tenant == 0
+    except Exception:
+        tenant_isolated = False
+
+    ok = enough and tenant_isolated
+    return {
+        "step": "worker_fleet_scale",
+        "ok": ok,
+        "enforced": True,
+        "expected": expected,
+        "distinct_count": distinct_count,
+        "enough": enough,
+        "tenant_isolated": tenant_isolated,
+    }
 
 
 def _step_queue_tenant_isolation(registry: RuntimeBackendRegistry) -> dict[str, Any]:
@@ -244,6 +351,13 @@ def run_durable_smoke(*, environ: dict[str, str] | None = None) -> dict[str, Any
     except Exception:
         return {"ok": False, "error": "compose backend wiring failed"}
 
+    _env_for_scale = environ if environ is not None else dict(os.environ)
+
+    def _scale_step(reg: RuntimeBackendRegistry) -> dict[str, Any]:
+        return _step_worker_fleet_scale(reg, environ=_env_for_scale)
+
+    _scale_step.__name__ = "_step_worker_fleet_scale"
+
     steps: list[dict[str, Any]] = []
     all_ok = True
     for step_fn in (
@@ -252,6 +366,7 @@ def run_durable_smoke(*, environ: dict[str, str] | None = None) -> dict[str, Any
         _step_conversation_routing,
         _step_secret_roundtrip,
         _step_native_state_continuity,
+        _scale_step,
     ):
         try:
             step = step_fn(registry)

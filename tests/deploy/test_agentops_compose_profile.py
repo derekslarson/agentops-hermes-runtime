@@ -540,3 +540,49 @@ def test_readme_documents_durable_smoke_command():
     readme_text = README.read_text(encoding="utf-8")
     assert "durable-smoke" in readme_text
     assert "compose_durable_smoke" in readme_text
+
+
+# ---------------------------------------------------------------------------
+# M12B scaled durable smoke: smoke.sh scale flags, expected-workers env,
+# README scaled smoke docs and M12B Started caveat
+# ---------------------------------------------------------------------------
+
+
+def test_smoke_sh_has_worker_scale_flag():
+    """smoke.sh passes --scale worker=${...} to docker compose up."""
+    script = SMOKE_SCRIPT.read_text(encoding="utf-8")
+    assert "--scale worker=" in script
+
+
+def test_smoke_sh_has_scheduler_scale_flag():
+    """smoke.sh passes --scale scheduler=${...} to docker compose up."""
+    script = SMOKE_SCRIPT.read_text(encoding="utf-8")
+    assert "--scale scheduler=" in script
+
+
+def test_smoke_sh_passes_expected_workers_to_durable_smoke():
+    """smoke.sh passes AGENTOPS_SMOKE_EXPECTED_WORKERS when running durable-smoke."""
+    script = SMOKE_SCRIPT.read_text(encoding="utf-8")
+    assert "AGENTOPS_SMOKE_EXPECTED_WORKERS" in script
+    assert "durable-smoke" in script
+
+
+def test_durable_smoke_service_has_expected_workers_env():
+    """durable-smoke service environment includes AGENTOPS_SMOKE_EXPECTED_WORKERS."""
+    services = _compose()["services"]
+    durable_smoke = services["durable-smoke"]
+    env_items = "\n".join(str(e) for e in durable_smoke.get("environment", []))
+    assert "AGENTOPS_SMOKE_EXPECTED_WORKERS" in env_items
+
+
+def test_readme_documents_scaled_smoke_command():
+    """README documents the scaled live smoke command with explicit scale flags."""
+    readme_text = README.read_text(encoding="utf-8")
+    assert "AGENTOPS_SMOKE_WORKERS" in readme_text or "--scale worker=" in readme_text
+
+
+def test_readme_states_m12b_started_live_transcript_pending():
+    """README states that M12B remains Started pending a live transcript."""
+    readme_text = README.read_text(encoding="utf-8")
+    assert "M12B" in readme_text
+    assert "Started" in readme_text or "live transcript" in readme_text

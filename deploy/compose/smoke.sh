@@ -13,11 +13,19 @@ if ! docker info >/dev/null 2>&1; then
   exit 2
 fi
 
+SMOKE_WORKERS=${AGENTOPS_SMOKE_WORKERS:-3}
+SMOKE_SCHEDULERS=${AGENTOPS_SMOKE_SCHEDULERS:-2}
+SMOKE_FLEET_RUN_ID=${AGENTOPS_SMOKE_FLEET_RUN_ID:-smoke-$(date +%s)-$$}
+export AGENTOPS_SMOKE_FLEET_RUN_ID=${SMOKE_FLEET_RUN_ID}
+
 cleanup() {
   docker compose down --remove-orphans
 }
 trap cleanup EXIT
 
-docker compose up --build -d
+docker compose up --build -d --scale worker=${SMOKE_WORKERS} --scale scheduler=${SMOKE_SCHEDULERS}
 docker compose --profile smoke run --rm smoke
-docker compose --profile smoke run --rm durable-smoke
+docker compose --profile smoke run --rm \
+  -e AGENTOPS_SMOKE_EXPECTED_WORKERS=${SMOKE_WORKERS} \
+  -e AGENTOPS_SMOKE_FLEET_RUN_ID=${SMOKE_FLEET_RUN_ID} \
+  durable-smoke
