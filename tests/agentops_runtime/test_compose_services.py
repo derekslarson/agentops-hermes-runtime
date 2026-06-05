@@ -2070,3 +2070,321 @@ def test_skills_manage_log_message_redacts_query_values():
     )
     assert "LEAKSENTINEL" not in rendered
     assert "/skills/manage" in rendered
+
+
+# ---------------------------------------------------------------------------
+# M12B: Queue endpoint routing and backend
+# ---------------------------------------------------------------------------
+
+
+class _FakeQueueBackend:
+    def __init__(self):
+        self._items = []
+
+    def enqueue(self, scope, payload, *, idempotency_key=None):
+        import uuid as _uuid
+
+        r = str(_uuid.uuid4())
+        self._items.append({"receipt": r, "scope": scope, "payload": payload})
+        return r
+
+    def claim(self, scope):
+        for item in self._items:
+            if item["scope"] == scope:
+                return {"receipt": item["receipt"], "payload": item["payload"]}
+        return None
+
+    def ack(self, scope, receipt):
+        pass
+
+    def nack(self, scope, receipt, *, requeue):
+        pass
+
+    def extend_lease(self, scope, receipt, *, seconds):
+        pass
+
+
+_QUEUE_CTX = {
+    "mode": "agentops",
+    "org_id": "org1",
+    "workspace_id": "ws1",
+    "workspace_type": "team",
+    "project_id": "proj1",
+    "external_channel_id": None,
+    "external_thread_id": None,
+    "conversation_id": "conv1",
+    "user_id": "alice",
+    "agent_profile_id": "bot",
+    "run_type": "conversation",
+    "parent_session_id": None,
+    "backend_profile": "compose-self-hosted",
+    "delivery_ref": None,
+    "run_id": "run1",
+    "job_id": None,
+}
+
+
+@pytest.fixture
+def _api_server_with_queue():
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    server.queue_backend = _FakeQueueBackend()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        yield base
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_api_service_routes_queue_enqueue(_api_server_with_queue):
+    body = json.dumps({"context": _QUEUE_CTX, "payload": {"task": "routing-test"}}).encode()
+    status = _http_post(f"{_api_server_with_queue}/queue/enqueue", body)
+    assert status == 200
+
+
+def test_api_service_routes_queue_claim(_api_server_with_queue):
+    body = json.dumps({"context": _QUEUE_CTX}).encode()
+    status = _http_post(f"{_api_server_with_queue}/queue/claim", body)
+    assert status == 200
+
+
+def test_api_service_routes_queue_ack(_api_server_with_queue):
+    body = json.dumps({"context": _QUEUE_CTX, "receipt": "fake-receipt-for-routing"}).encode()
+    status = _http_post(f"{_api_server_with_queue}/queue/ack", body)
+    assert status == 200
+
+
+def test_api_service_routes_queue_nack(_api_server_with_queue):
+    body = json.dumps({"context": _QUEUE_CTX, "receipt": "fake-receipt-for-routing", "requeue": True}).encode()
+    status = _http_post(f"{_api_server_with_queue}/queue/nack", body)
+    assert status == 200
+
+
+def test_api_service_routes_queue_extend_lease(_api_server_with_queue):
+    body = json.dumps({"context": _QUEUE_CTX, "receipt": "fake-receipt-for-routing", "seconds": 30}).encode()
+    status = _http_post(f"{_api_server_with_queue}/queue/extend-lease", body)
+    assert status == 200
+
+
+@pytest.mark.parametrize("service_name", ["worker", "scheduler", "local-secrets"])
+def test_non_api_services_return_404_for_queue_enqueue(service_name):
+    server, thread = _make_non_api_server(service_name)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({"context": _QUEUE_CTX, "payload": {"x": 1}}).encode()
+        status = _http_post(f"{base}/queue/enqueue", body)
+        assert status == 404, f"{service_name} should return 404 for POST /queue/enqueue"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+@pytest.mark.parametrize("queue_alias", [
+    "/queue/enqueue;anything",
+    "/queue/enqueue;",
+    "/queue/claim;x=1",
+    "/queue/ack;jsessionid=abc",
+])
+def test_semicolon_alias_queue_paths_return_404_before_backend(_api_server_with_queue, queue_alias):
+    body = json.dumps({"context": _QUEUE_CTX, "payload": {"x": 1}}).encode()
+    req = urllib.request.Request(f"{_api_server_with_queue}{queue_alias}", data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Content-Length", str(len(body)))
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            status = r.status
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+    assert status == 404, f"Semicolon alias {queue_alias!r} should return 404, got {status}"
+
+
+def test_queue_prefix_lookalike_returns_404(monkeypatch):
+    calls = []
+
+    def _raise():
+        calls.append("called")
+        raise ValueError("LEAKSENTINEL queue backend failure")
+
+    monkeypatch.setattr(compose_services, "_get_or_create_queue_backend", _raise, raising=False)
+
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        status = _http_post(f"{base}/queueXYZ", b"{}")
+        assert status == 404
+        assert calls == []
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_queue_dispatch_returns_401_before_backend_setup(monkeypatch):
+    calls = []
+
+    def _raise():
+        calls.append("called")
+        raise ValueError("LEAKSENTINEL queue backend failure password=x")
+
+    monkeypatch.setenv("AGENTOPS_RUNTIME_TOKEN", "expected-token")
+    monkeypatch.setattr(compose_services, "_get_or_create_queue_backend", _raise, raising=False)
+
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({"context": _QUEUE_CTX, "payload": {"x": 1}}).encode()
+        req = urllib.request.Request(f"{base}/queue/enqueue", data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Content-Length", str(len(body)))
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                status = r.status
+                response_body = r.read()
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            response_body = exc.read()
+        assert status == 401
+        assert calls == []
+        response_text = response_body.decode("utf-8")
+        assert "LEAKSENTINEL" not in response_text
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_queue_dispatch_returns_503_on_backend_failure(monkeypatch):
+    def _raise():
+        raise ValueError("LEAKSENTINEL queue backend failure password=x")
+
+    monkeypatch.setattr(compose_services, "_get_or_create_queue_backend", _raise, raising=False)
+
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({"context": _QUEUE_CTX, "payload": {"x": 1}}).encode()
+        req = urllib.request.Request(f"{base}/queue/enqueue", data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Content-Length", str(len(body)))
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                status = r.status
+                response_body = r.read()
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            response_body = exc.read()
+        assert status == 503
+        response_text = response_body.decode("utf-8")
+        assert "LEAKSENTINEL" not in response_text
+        assert "password=x" not in response_text
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_queue_dispatch_rejects_oversized_body_before_backend(monkeypatch):
+    calls = []
+
+    def _raise():
+        calls.append("called")
+        raise ValueError("LEAKSENTINEL queue backend failure")
+
+    monkeypatch.setattr(compose_services, "_get_or_create_queue_backend", _raise, raising=False)
+
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with socket.create_connection(("127.0.0.1", server.server_port), timeout=5) as sock:
+            request = (
+                "POST /queue/enqueue HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{server.server_port}\r\n"
+                "Content-Type: application/json\r\n"
+                f"Content-Length: {compose_services._MAX_QUEUE_REQUEST_BODY_BYTES + 1}\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+            ).encode("ascii")
+            sock.sendall(request)
+            response_body = sock.recv(4096).decode("utf-8", errors="replace")
+        assert "413" in response_body
+        assert calls == []
+        assert "LEAKSENTINEL" not in response_body
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_make_queue_backend_fails_closed_when_unconfigured():
+    with pytest.raises(ValueError, match="AGENTOPS_QUEUE_DB_PATH"):
+        compose_services._make_queue_backend({})
+
+
+def test_make_queue_backend_rejects_memory_path():
+    with pytest.raises(ValueError, match=":memory:"):
+        compose_services._make_queue_backend({"AGENTOPS_QUEUE_DB_PATH": ":memory:"})
+
+
+def test_make_queue_backend_rejects_relative_path():
+    with pytest.raises(ValueError, match="absolute"):
+        compose_services._make_queue_backend({"AGENTOPS_QUEUE_DB_PATH": "relative/path.db"})
+
+
+def test_make_queue_backend_rejects_blank_path():
+    with pytest.raises(ValueError, match="AGENTOPS_QUEUE_DB_PATH"):
+        compose_services._make_queue_backend({"AGENTOPS_QUEUE_DB_PATH": "   "})
+
+
+def test_make_queue_backend_creates_sqlite_backend(tmp_path):
+    from agentops_runtime.queue_api import SQLiteQueueBackend
+
+    db_path = str(tmp_path / "queue_seam.db")
+    backend = compose_services._make_queue_backend({"AGENTOPS_QUEUE_DB_PATH": db_path})
+    assert isinstance(backend, SQLiteQueueBackend)
+
+
+def test_get_or_create_queue_backend_fails_closed_when_unconfigured(monkeypatch):
+    monkeypatch.setattr(compose_services, "_queue_backend_instance", None, raising=False)
+    monkeypatch.setattr(compose_services.os, "environ", {})
+    with pytest.raises(ValueError, match="AGENTOPS_QUEUE_DB_PATH"):
+        compose_services._get_or_create_queue_backend()
+
+
+def test_queue_log_message_redacts_query_values():
+    rendered = compose_services._sanitize_log_message(
+        '"POST /queue/enqueue?LEAKSENTINEL=secret HTTP/1.1" 200 -'
+    )
+    assert "LEAKSENTINEL" not in rendered
+    assert "/queue/enqueue" in rendered
+    assert "?<redacted>" in rendered
+
+
+@pytest.mark.parametrize(
+    "raw_request",
+    [
+        '"POST /queue/ack/LEAKSENTINEL-receipt HTTP/1.1" 404 -',
+        '"POST /queue/enqueue;receipt=LEAKSENTINEL HTTP/1.1" 404 -',
+        '"POST /queue%2Fack%2FLEAKSENTINEL-receipt HTTP/1.1" 404 -',
+        '"POST /queueXYZ/LEAKSENTINEL-receipt HTTP/1.1" 404 -',
+    ],
+)
+def test_queue_log_message_redacts_invalid_path_receipt_material(raw_request):
+    rendered = compose_services._sanitize_log_message(raw_request)
+    assert "LEAKSENTINEL" not in rendered
+    assert "/queue/<redacted>" in rendered

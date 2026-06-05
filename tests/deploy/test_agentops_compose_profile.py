@@ -287,3 +287,28 @@ def test_compose_declares_skills_volume():
     compose = _compose()
     assert "volumes" in compose
     assert "agentops-skills" in compose["volumes"]
+
+
+# ---------------------------------------------------------------------------
+# M12B: Queue volume and env (api service)
+# ---------------------------------------------------------------------------
+
+
+def test_api_service_has_queue_db_path_env():
+    services = _compose()["services"]
+    api_env = "\n".join(services["api"]["environment"])
+    assert "AGENTOPS_QUEUE_DB_PATH=/var/lib/agentops/queue/queue.db" in api_env
+
+
+def test_api_service_mounts_queue_volume():
+    services = _compose()["services"]
+    api = services["api"]
+    assert "volumes" in api
+    volume_strings = [str(v) for v in api["volumes"]]
+    assert any("/var/lib/agentops/queue" in v for v in volume_strings)
+
+
+def test_compose_declares_queue_volume():
+    compose = _compose()
+    assert "volumes" in compose
+    assert "agentops-queue" in compose["volumes"]
