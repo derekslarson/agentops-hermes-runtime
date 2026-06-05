@@ -55,8 +55,11 @@ def _stop_server(server: compose_services._Server, thread: threading.Thread) -> 
 def _two_servers(tmp_path):
     from agentops_runtime.compose_services import (
         _make_conversation_router_backend,
+        _make_curated_memory_backend,
+        _make_memory_backend,
         _make_queue_backend,
         _make_secret_backend,
+        _make_session_backend,
         _make_worker_registry_backend,
     )
 
@@ -64,12 +67,18 @@ def _two_servers(tmp_path):
     worker_db = str(tmp_path / "workers.db")
     conv_db = str(tmp_path / "conversations.db")
     secret_db = str(tmp_path / "secrets.db")
+    curated_mem_db = str(tmp_path / "curated_memory.db")
+    session_db = str(tmp_path / "sessions.db")
+    deep_mem_db = str(tmp_path / "deep_memory.db")
 
     api_server, api_thread, api_base = _start_server(
         "api",
         queue_backend=_make_queue_backend({"AGENTOPS_QUEUE_DB_PATH": queue_db}),
         worker_registry_backend=_make_worker_registry_backend({"AGENTOPS_WORKER_REGISTRY_DB_PATH": worker_db}),
         conversation_router_backend=_make_conversation_router_backend({"AGENTOPS_CONVERSATION_ROUTER_DB_PATH": conv_db}),
+        curated_memory_backend=_make_curated_memory_backend({"AGENTOPS_CURATED_MEMORY_DB_PATH": curated_mem_db}),
+        session_backend=_make_session_backend({"AGENTOPS_SESSION_DB_PATH": session_db}),
+        memory_backend=_make_memory_backend({"AGENTOPS_DEEP_MEMORY_DB_URL": "sqlite:///" + deep_mem_db}),
     )
     secret_server, secret_thread, secret_base = _start_server(
         "local-secrets",
@@ -292,6 +301,253 @@ def test_run_durable_smoke_none_environ_passes_none_to_configure(monkeypatch):
     run_durable_smoke(environ=None)
     assert len(captured) == 1
     assert captured[0] is None, f"expected None but configure received {captured[0]!r}"
+
+
+# ---------------------------------------------------------------------------
+# native_state_continuity step
+# ---------------------------------------------------------------------------
+
+
+def test_native_state_continuity_step_in_steps_list(_two_servers):
+    result = run_durable_smoke(environ=_two_servers)
+    names = {s["step"] for s in result["steps"]}
+    assert "native_state_continuity" in names
+
+
+def test_native_state_continuity_step_passes(_two_servers):
+    result = run_durable_smoke(environ=_two_servers)
+    step = next(s for s in result["steps"] if s["step"] == "native_state_continuity")
+    assert step["ok"] is True
+
+
+def test_native_state_continuity_reports_all_surfaces(_two_servers):
+    result = run_durable_smoke(environ=_two_servers)
+    step = next(s for s in result["steps"] if s["step"] == "native_state_continuity")
+    assert step.get("curated_memory_ok") is True
+    assert step.get("session_ok") is True
+    assert step.get("deep_memory_ok") is True
+    assert step.get("tenant_b_isolated") is True
+
+
+def test_native_state_continuity_exercises_session_search_and_deep_memory_get_many():
+    from agentops_runtime.compose_durable_smoke import _step_native_state_continuity
+
+    calls: list[str] = []
+
+    class FakeMemory:
+        def __init__(self, visible: bool):
+            self.visible = visible
+
+        def write(self, ctx, content, *, target, action):
+            calls.append("memory.write")
+
+        def read(self, ctx, *, target):
+            calls.append("memory.read")
+            return "smoke-curated-mem-sentinel" if self.visible else None
+
+    class FakeSession:
+        def __init__(self, visible: bool):
+            self.visible = visible
+
+        def create_session(self, ctx):
+            calls.append("session.create_session")
+            return "session-id"
+
+        def append_message(self, ctx, message):
+            calls.append("session.append_message")
+
+        def read_messages(self, ctx, *, session_id):
+            calls.append("session.read_messages")
+            return [{"session_id": session_id, "content": "smoke-session-sentinel"}] if self.visible else []
+
+        def search(self, ctx, query):
+            calls.append("session.search")
+            return [{"session_id": "session-id", "content": query}] if self.visible else []
+
+    class FakeRecord:
+        id = "record-id"
+        text = "smoke-deep-mem-sentinel"
+
+    class FakeDeepMemory:
+        def __init__(self, visible: bool):
+            self.visible = visible
+
+        def upsert_record(self, ctx, *, text, source):
+            calls.append("deep_memory.upsert_record")
+            return FakeRecord()
+
+        def get_record(self, ctx, record_id):
+            calls.append("deep_memory.get_record")
+            return FakeRecord() if self.visible else None
+
+        def get_many(self, ctx, ids):
+            calls.append("deep_memory.get_many")
+            return [FakeRecord()] if self.visible else []
+
+        def search(self, ctx, query, *, limit):
+            calls.append("deep_memory.search")
+            return [FakeRecord()] if self.visible else []
+
+    class FakeRegistry:
+        def get(self, cap, ctx):
+            visible = "smoke-tenant-a" in ctx.org_id
+            if cap.value == "memory":
+                return FakeMemory(visible)
+            if cap.value == "session":
+                return FakeSession(visible)
+            if cap.value == "deep_memory":
+                return FakeDeepMemory(visible)
+            raise AssertionError(cap)
+
+    step = _step_native_state_continuity(FakeRegistry())
+
+    assert step["ok"] is True
+    assert "session.search" in calls
+    assert calls.count("deep_memory.get_many") == 2
+    assert calls.count("deep_memory.search") == 2
+
+
+def test_native_state_continuity_fails_when_session_search_returns_wrong_session():
+    from agentops_runtime.compose_durable_smoke import _step_native_state_continuity
+
+    class FakeMemory:
+        def __init__(self, visible: bool):
+            self.visible = visible
+
+        def write(self, ctx, content, *, target, action):
+            pass
+
+        def read(self, ctx, *, target):
+            return "smoke-curated-mem-sentinel" if self.visible else None
+
+    class FakeSession:
+        def __init__(self, visible: bool):
+            self.visible = visible
+
+        def create_session(self, ctx):
+            return "session-id"
+
+        def append_message(self, ctx, message):
+            pass
+
+        def read_messages(self, ctx, *, session_id):
+            return [{"session_id": session_id, "content": "smoke-session-sentinel"}] if self.visible else []
+
+        def search(self, ctx, query):
+            return [{"session_id": "wrong-session-id", "content": query}] if self.visible else []
+
+    class FakeRecord:
+        id = "record-id"
+        text = "smoke-deep-mem-sentinel"
+
+    class FakeDeepMemory:
+        def __init__(self, visible: bool):
+            self.visible = visible
+
+        def upsert_record(self, ctx, *, text, source):
+            return FakeRecord()
+
+        def get_record(self, ctx, record_id):
+            return FakeRecord() if self.visible else None
+
+        def get_many(self, ctx, ids):
+            return [FakeRecord()] if self.visible else []
+
+        def search(self, ctx, query, *, limit):
+            return [FakeRecord()] if self.visible else []
+
+    class FakeRegistry:
+        def get(self, cap, ctx):
+            visible = "smoke-tenant-a" in ctx.org_id
+            if cap.value == "memory":
+                return FakeMemory(visible)
+            if cap.value == "session":
+                return FakeSession(visible)
+            if cap.value == "deep_memory":
+                return FakeDeepMemory(visible)
+            raise AssertionError(cap)
+
+    step = _step_native_state_continuity(FakeRegistry())
+
+    assert step["ok"] is False
+    assert step["session_ok"] is False
+
+
+def test_native_state_continuity_fails_when_tenant_b_deep_memory_get_many_leaks():
+    from agentops_runtime.compose_durable_smoke import _step_native_state_continuity
+
+    class FakeMemory:
+        def __init__(self, visible: bool):
+            self.visible = visible
+
+        def write(self, ctx, content, *, target, action):
+            pass
+
+        def read(self, ctx, *, target):
+            return "smoke-curated-mem-sentinel" if self.visible else None
+
+    class FakeSession:
+        def __init__(self, visible: bool):
+            self.visible = visible
+
+        def create_session(self, ctx):
+            return "session-id"
+
+        def append_message(self, ctx, message):
+            pass
+
+        def read_messages(self, ctx, *, session_id):
+            return [{"content": "smoke-session-sentinel"}] if self.visible else []
+
+        def search(self, ctx, query):
+            return [{"session_id": "session-id", "content": query}] if self.visible else []
+
+    class FakeRecord:
+        id = "record-id"
+        text = "smoke-deep-mem-sentinel"
+
+    class FakeDeepMemory:
+        def __init__(self, visible: bool):
+            self.visible = visible
+
+        def upsert_record(self, ctx, *, text, source):
+            return FakeRecord()
+
+        def get_record(self, ctx, record_id):
+            return FakeRecord() if self.visible else None
+
+        def get_many(self, ctx, ids):
+            return [FakeRecord()]
+
+        def search(self, ctx, query, *, limit):
+            return [FakeRecord()] if self.visible else []
+
+    class FakeRegistry:
+        def get(self, cap, ctx):
+            visible = "smoke-tenant-a" in ctx.org_id
+            if cap.value == "memory":
+                return FakeMemory(visible)
+            if cap.value == "session":
+                return FakeSession(visible)
+            if cap.value == "deep_memory":
+                return FakeDeepMemory(visible)
+            raise AssertionError(cap)
+
+    step = _step_native_state_continuity(FakeRegistry())
+
+    assert step["ok"] is False
+    assert step["tenant_b_isolated"] is False
+
+
+def test_native_state_continuity_no_sentinel_text_in_report(_two_servers):
+    result = run_durable_smoke(environ=_two_servers)
+    text = json.dumps(result)
+    for sentinel in (
+        "smoke-curated-mem-sentinel",
+        "smoke-session-sentinel",
+        "smoke-deep-mem-sentinel",
+    ):
+        assert sentinel not in text, f"sentinel {sentinel!r} leaked into report"
 
 
 def test_queue_tenant_isolation_b_claim_before_a_claim():
