@@ -33,6 +33,7 @@ _MAX_CURATED_MEMORY_REQUEST_BODY_BYTES = 1_048_576
 _MAX_SKILL_REQUEST_BODY_BYTES = 1_048_576
 _MAX_QUEUE_REQUEST_BODY_BYTES = 1_048_576
 _MAX_RUN_LEASE_REQUEST_BODY_BYTES = 1_048_576
+_MAX_CRON_REQUEST_BODY_BYTES = 1_048_576
 
 _SKILL_EXACT_PATHS = frozenset({"/skills/list", "/skills/view", "/skills/manage"})
 _QUEUE_EXACT_PATHS = frozenset({
@@ -108,13 +109,14 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib callback name
         parsed = urllib.parse.urlparse(self.path)
+        raw_path = self.path.split("?", 1)[0]
         if parsed.path.startswith("/memory/records"):
             if self.server.service_name != "api":  # type: ignore[attr-defined]
                 self.send_error(404)
                 return
             self._dispatch_memory_records("GET", parsed)
             return
-        if parsed.path == "/memory" and self.path.split("?", 1)[0] == "/memory":
+        if parsed.path == "/memory" and raw_path == "/memory":
             if self.server.service_name != "api":  # type: ignore[attr-defined]
                 self.send_error(404)
                 return
@@ -132,6 +134,12 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             self._dispatch_audit("GET", parsed)
             return
+        if raw_path == "/cron/jobs" or raw_path.startswith("/cron/jobs/"):
+            if self.server.service_name != "api":  # type: ignore[attr-defined]
+                self.send_error(404)
+                return
+            self._dispatch_cron("GET", raw_path)
+            return
         if self.path not in {"/healthz", "/readyz"}:
             self.send_error(404)
             return
@@ -145,13 +153,14 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib callback name
         parsed = urllib.parse.urlparse(self.path)
+        raw_path = self.path.split("?", 1)[0]
         if parsed.path.startswith("/memory/records"):
             if self.server.service_name != "api":  # type: ignore[attr-defined]
                 self.send_error(404)
                 return
             self._dispatch_memory_records("POST", parsed)
             return
-        if parsed.path == "/memory" and self.path.split("?", 1)[0] == "/memory":
+        if parsed.path == "/memory" and raw_path == "/memory":
             if self.server.service_name != "api":  # type: ignore[attr-defined]
                 self.send_error(404)
                 return
@@ -206,6 +215,32 @@ class _Handler(BaseHTTPRequestHandler):
                 self.send_error(404)
                 return
             self._dispatch_run_leases(raw_path)
+            return
+        if raw_path == "/cron/jobs" or raw_path.startswith("/cron/jobs/"):
+            if self.server.service_name != "api":  # type: ignore[attr-defined]
+                self.send_error(404)
+                return
+            self._dispatch_cron("POST", raw_path)
+            return
+        self.send_error(404)
+
+    def do_PATCH(self) -> None:  # noqa: N802 - stdlib callback name
+        raw_path = self.path.split("?", 1)[0]
+        if raw_path.startswith("/cron/jobs/"):
+            if self.server.service_name != "api":  # type: ignore[attr-defined]
+                self.send_error(404)
+                return
+            self._dispatch_cron("PATCH", raw_path)
+            return
+        self.send_error(404)
+
+    def do_DELETE(self) -> None:  # noqa: N802 - stdlib callback name
+        raw_path = self.path.split("?", 1)[0]
+        if raw_path.startswith("/cron/jobs/"):
+            if self.server.service_name != "api":  # type: ignore[attr-defined]
+                self.send_error(404)
+                return
+            self._dispatch_cron("DELETE", raw_path)
             return
         self.send_error(404)
 
@@ -716,6 +751,60 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _dispatch_cron(self, method: str, raw_path: str) -> None:
+        from agentops_runtime.cron_api import handle_cron_request, is_cron_route
+
+        token = os.getenv("AGENTOPS_RUNTIME_TOKEN") or None
+        auth_header = self.headers.get("Authorization")
+
+        if token and auth_header != f"Bearer {token}":
+            self._send_json_error(401, "unauthorized")
+            return
+
+        if not is_cron_route(raw_path):
+            self._send_json_error(404, "not found")
+            return
+
+        body_bytes = b""
+        if method in {"POST", "PATCH"}:
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+            except ValueError:
+                self._send_json_error(400, "invalid content length")
+                return
+            if length < 0:
+                self._send_json_error(400, "invalid content length")
+                return
+            if length > _MAX_CRON_REQUEST_BODY_BYTES:
+                self._send_json_error(413, "request body too large")
+                return
+            body_bytes = self.rfile.read(length)
+
+        try:
+            backend = getattr(self.server, "cron_backend", None) or _get_or_create_cron_backend()
+        except Exception:
+            self._send_json_error(503, "cron backend unavailable")
+            return
+
+        context_header = self.headers.get("X-Hermes-Runtime-Context")
+        status, response = handle_cron_request(
+            method=method,
+            path=raw_path,
+            query_string="",
+            body_bytes=body_bytes,
+            auth_header=auth_header,
+            token=token,
+            backend=backend,
+            context_header=context_header,
+        )
+
+        body = json.dumps(response).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _send_json_error(self, status: int, message: str) -> None:
         body = json.dumps({"error": message}).encode("utf-8")
         self.send_response(status)
@@ -741,6 +830,7 @@ class _Server(ThreadingHTTPServer):
     skill_backend: Any = None
     queue_backend: Any = None
     run_lease_backend: Any = None
+    cron_backend: Any = None
 
 
 _memory_backend_lock = threading.Lock()
@@ -772,6 +862,9 @@ _queue_backend_instance: Any = None
 
 _run_lease_backend_lock = threading.Lock()
 _run_lease_backend_instance: Any = None
+
+_cron_backend_lock = threading.Lock()
+_cron_backend_instance: Any = None
 
 _SESSION_STATIC_PATH_SEGMENTS = frozenset({
     "create", "append", "messages", "search", "turn-lock",
@@ -826,6 +919,20 @@ def _sanitize_log_message(message: str) -> str:
         action_str = "" if action is None else action.split(";", 1)[0]
         return f"{match.group(1)}/<redacted>{action_str}{query}"
 
+    def _redact_cron_job_id_path(match: re.Match[str]) -> str:
+        prefix = match.group(1)
+        job_id_seg = match.group(2)
+        rest = match.group(3)
+        query = "?<redacted>" if match.group(4) else ""
+        if job_id_seg == "claim-due" and rest is None:
+            return f"{prefix}/claim-due{query}"
+        if rest is None:
+            return f"{prefix}/<redacted>{query}"
+        rest_str = rest.split(";", 1)[0]
+        if rest_str in {"/pause", "/resume", "/renew-lease", "/release-lease", "/complete", "/fail", "/history"}:
+            return f"{prefix}/<redacted>{rest_str}{query}"
+        return f"{prefix}/<redacted>/<redacted>{query}"
+
     message = re.sub(r"(/artifacts)/[^\s?\"]+(\?[^\s\"]+)?", _redact_artifact_path, message)
     message = re.sub(
         r"(/secrets)/(?!get(?:[?\s\"]|$)|put(?:[?\s\"]|$))[^\s?\"]+(\?[^\s\"]+)?",
@@ -867,8 +974,31 @@ def _sanitize_log_message(message: str) -> str:
         _redact_run_lease_key_path,
         message,
     )
+    # Cron: encoded %2F after /cron or /cron/jobs
     message = re.sub(
-        r"(/(?:memory/records|memory|artifacts|audit|sessions|credentials|secrets|skills|queue|run-leases)[^\s?\"]*)\?[^\s]+",
+        r"(/cron(?:/jobs)?)%2[fF][^\s?\"]*(\?[^\s\"]+)?",
+        lambda m: f"{m.group(1)}/<redacted>{'?<redacted>' if m.group(2) else ''}",
+        message,
+    )
+    # Cron: prefix lookalike (/cronXYZ, /cron/jobsXYZ)
+    message = re.sub(
+        r"(/cron)(?!/|%2[fF]|[?\s\"]|$)[^\s?\"]+(\?[^\s\"]+)?",
+        lambda m: f"{m.group(1)}/<redacted>{'?<redacted>' if m.group(2) else ''}",
+        message,
+    )
+    message = re.sub(
+        r"(/cron/jobs)(?!/|%2[fF]|[?\s\"]|$)[^\s?\"]+(\?[^\s\"]+)?",
+        lambda m: f"{m.group(1)}/<redacted>{'?<redacted>' if m.group(2) else ''}",
+        message,
+    )
+    # Cron: /cron/jobs/<job_id>[/<action>] — redact job ID, keep static action name
+    message = re.sub(
+        r"(/cron/jobs)/([^/\s?\"]+)(/[^\s?\"]*)?(\?[^\s\"]+)?",
+        _redact_cron_job_id_path,
+        message,
+    )
+    message = re.sub(
+        r"(/(?:memory/records|memory|artifacts|audit|sessions|credentials|secrets|skills|queue|run-leases|cron/jobs|cron)[^\s?\"]*)\?[^\s]+",
         r"\1?<redacted>",
         message,
     )
@@ -1141,6 +1271,39 @@ def _get_or_create_run_lease_backend() -> Any:
         if _run_lease_backend_instance is None:
             _run_lease_backend_instance = _make_run_lease_backend(dict(os.environ))
         return _run_lease_backend_instance
+
+
+def _make_cron_backend(environ: dict[str, str]) -> Any:
+    """Create a SQLiteCronBackend from the given environment mapping.
+
+    AGENTOPS_CRON_DB_PATH is required; blank, ':memory:', and relative paths
+    are rejected. No cwd/tmp fallback is provided for compose/cloud profiles.
+    """
+    db_path = environ.get("AGENTOPS_CRON_DB_PATH", "").strip()
+    if not db_path:
+        raise ValueError(
+            "compose cron backend requires AGENTOPS_CRON_DB_PATH; "
+            "no local fallback is provided for compose/cloud profiles"
+        )
+    if db_path == ":memory:":
+        raise ValueError(
+            "AGENTOPS_CRON_DB_PATH must be a durable file path, not ':memory:'"
+        )
+    if not db_path.startswith("/"):
+        raise ValueError(
+            "AGENTOPS_CRON_DB_PATH must be an absolute path"
+        )
+    from agent.runtime_cron_sqlite import SQLiteCronBackend
+
+    return SQLiteCronBackend(db_path)
+
+
+def _get_or_create_cron_backend() -> Any:
+    global _cron_backend_instance
+    with _cron_backend_lock:
+        if _cron_backend_instance is None:
+            _cron_backend_instance = _make_cron_backend(dict(os.environ))
+        return _cron_backend_instance
 
 
 class _DeterministicCredentialResolver:

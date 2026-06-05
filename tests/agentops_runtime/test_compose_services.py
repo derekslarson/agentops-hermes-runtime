@@ -2611,3 +2611,441 @@ def test_run_lease_invalid_semicolon_route_404s_before_backend_construction(monk
         server.shutdown()
         thread.join(timeout=5)
         server.server_close()
+
+
+# ---------------------------------------------------------------------------
+# M12B: Cron endpoint routing and backend
+# ---------------------------------------------------------------------------
+
+
+class _FakeCronBackend:
+    def __init__(self):
+        self._jobs = {}
+        self._next_id = 0
+
+    def create(self, ctx, job):
+        self._next_id += 1
+        job_id = f"job-{self._next_id}"
+        self._jobs[job_id] = dict(job, id=job_id, paused=False)
+        return job_id
+
+    def list_jobs(self, ctx):
+        return list(self._jobs.values())
+
+    def get_job(self, ctx, job_id):
+        return self._jobs.get(job_id)
+
+    def update(self, ctx, job_id, job):
+        if job_id in self._jobs:
+            self._jobs[job_id].update(job)
+
+    def remove(self, ctx, job_id):
+        self._jobs.pop(job_id, None)
+
+    def pause(self, ctx, job_id):
+        if job_id in self._jobs:
+            self._jobs[job_id]["paused"] = True
+
+    def resume(self, ctx, job_id):
+        if job_id in self._jobs:
+            self._jobs[job_id]["paused"] = False
+
+    def run_history(self, ctx, job_id):
+        return []
+
+    def claim_due(self, ctx, *, owner, now=None, lease_seconds=60.0, draining=False, limit=None):
+        return []
+
+    def renew_lease(self, ctx, job_id, *, owner, now=None, lease_seconds=60.0):
+        return True
+
+    def release_lease(self, ctx, job_id, *, owner):
+        pass
+
+    def complete_run(self, ctx, job_id, *, owner, **kwargs):
+        return {"status": "success"}
+
+    def fail_run(self, ctx, job_id, *, owner, error, **kwargs):
+        return {"status": "error"}
+
+
+_CRON_CTX = {
+    "mode": "agentops",
+    "org_id": "org1",
+    "workspace_id": "ws1",
+    "workspace_type": "team",
+    "project_id": "proj1",
+    "user_id": "alice",
+    "conversation_id": "conv1",
+    "agent_profile_id": "bot",
+    "run_type": "cron",
+    "backend_profile": "compose-self-hosted",
+}
+
+
+@pytest.fixture
+def _api_server_with_cron():
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    server.cron_backend = _FakeCronBackend()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        yield base
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def _http_request(url, method, body=None, *, headers=None):
+    req = urllib.request.Request(url, data=body, method=method)
+    if headers:
+        for k, v in headers.items():
+            req.add_header(k, v)
+    if body is not None:
+        req.add_header("Content-Length", str(len(body)))
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status
+    except urllib.error.HTTPError as exc:
+        return exc.code
+
+
+def test_api_service_routes_cron_create(_api_server_with_cron):
+    body = json.dumps({"context": _CRON_CTX, "job": {"prompt": "test", "schedule": "5m"}}).encode()
+    status = _http_post(f"{_api_server_with_cron}/cron/jobs", body)
+    assert status == 200
+
+
+def test_api_service_routes_cron_list(_api_server_with_cron):
+    import urllib.parse as _up
+    ctx_header = json.dumps(_CRON_CTX)
+    req = urllib.request.Request(f"{_api_server_with_cron}/cron/jobs", method="GET")
+    req.add_header("X-Hermes-Runtime-Context", ctx_header)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            status = r.status
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+    assert status == 200
+
+
+def test_api_service_routes_cron_claim_due(_api_server_with_cron):
+    body = json.dumps({"context": _CRON_CTX, "owner": "worker-1", "now": 9999.0}).encode()
+    status = _http_post(f"{_api_server_with_cron}/cron/jobs/claim-due", body)
+    assert status == 200
+
+
+@pytest.mark.parametrize("service_name", ["worker", "scheduler", "local-secrets"])
+def test_non_api_services_return_404_for_cron_create(service_name):
+    server, thread = _make_non_api_server(service_name)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({"context": _CRON_CTX, "job": {"prompt": "x"}}).encode()
+        status = _http_post(f"{base}/cron/jobs", body)
+        assert status == 404, f"{service_name} should return 404 for POST /cron/jobs"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+@pytest.mark.parametrize("service_name", ["worker", "scheduler", "local-secrets"])
+def test_non_api_services_return_404_for_cron_get(service_name):
+    server, thread = _make_non_api_server(service_name)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        req = urllib.request.Request(f"{base}/cron/jobs", method="GET")
+        req.add_header("X-Hermes-Runtime-Context", json.dumps(_CRON_CTX))
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                status = r.status
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+        assert status == 404, f"{service_name} should return 404 for GET /cron/jobs"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+@pytest.mark.parametrize("cron_alias", [
+    "/cron/jobs;scope=leak",
+    "/cron/jobs/abc;jsessionid=x",
+    "/cron/jobs/abc/pause;leak",
+])
+def test_semicolon_alias_cron_paths_return_404(_api_server_with_cron, cron_alias):
+    body = json.dumps({"context": _CRON_CTX, "job": {"prompt": "x"}}).encode()
+    req = urllib.request.Request(f"{_api_server_with_cron}{cron_alias}", data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Content-Length", str(len(body)))
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            status = r.status
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+    assert status == 404, f"Semicolon alias {cron_alias!r} should return 404"
+
+
+def test_cron_prefix_lookalike_returns_404_before_backend(monkeypatch):
+    calls = []
+
+    def _raise():
+        calls.append("called")
+        raise ValueError("LEAKSENTINEL cron backend")
+
+    monkeypatch.setattr(compose_services, "_get_or_create_cron_backend", _raise, raising=False)
+
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        status = _http_post(f"{base}/cron/jobsXYZ", b"{}")
+        assert status == 404
+        assert calls == []
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+@pytest.mark.parametrize("ambiguous_path", [
+    "/cron/jobs/foo%2Fbar",
+    "/cron/jobs/foo%2Fbar/pause",
+    "/cron/jobs/foo%5Cbar",
+])
+def test_cron_encoded_path_separator_returns_404_before_backend(monkeypatch, ambiguous_path):
+    calls = []
+
+    def _raise():
+        calls.append("called")
+        raise ValueError("LEAKSENTINEL cron backend")
+
+    monkeypatch.setattr(compose_services, "_get_or_create_cron_backend", _raise, raising=False)
+
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        status = _http_post(f"{base}{ambiguous_path}", b'{"context":{},"owner":"w"}')
+        assert status == 404
+        assert calls == []
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_cron_dispatch_returns_401_before_backend_setup(monkeypatch):
+    calls = []
+
+    def _raise():
+        calls.append("called")
+        raise ValueError("LEAKSENTINEL cron backend failure password=x")
+
+    monkeypatch.setenv("AGENTOPS_RUNTIME_TOKEN", "expected-token")
+    monkeypatch.setattr(compose_services, "_get_or_create_cron_backend", _raise, raising=False)
+
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({"context": _CRON_CTX, "job": {"prompt": "x"}}).encode()
+        req = urllib.request.Request(f"{base}/cron/jobs", data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Content-Length", str(len(body)))
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                status = r.status
+                response_body = r.read()
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            response_body = exc.read()
+        assert status == 401
+        assert calls == []
+        assert "LEAKSENTINEL" not in response_body.decode("utf-8")
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_cron_dispatch_returns_503_on_backend_failure(monkeypatch):
+    def _raise():
+        raise ValueError("LEAKSENTINEL cron backend failure password=x")
+
+    monkeypatch.setattr(compose_services, "_get_or_create_cron_backend", _raise, raising=False)
+
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({"context": _CRON_CTX, "job": {"prompt": "x"}}).encode()
+        req = urllib.request.Request(f"{base}/cron/jobs", data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Content-Length", str(len(body)))
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                status = r.status
+                response_body = r.read()
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            response_body = exc.read()
+        assert status == 503
+        assert "LEAKSENTINEL" not in response_body.decode("utf-8")
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_cron_dispatch_rejects_oversized_body_before_backend(monkeypatch):
+    calls = []
+
+    def _raise():
+        calls.append("called")
+        raise ValueError("LEAKSENTINEL cron backend failure")
+
+    monkeypatch.setattr(compose_services, "_get_or_create_cron_backend", _raise, raising=False)
+
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with socket.create_connection(("127.0.0.1", server.server_port), timeout=5) as sock:
+            request = (
+                "POST /cron/jobs HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{server.server_port}\r\n"
+                "Content-Type: application/json\r\n"
+                f"Content-Length: {compose_services._MAX_CRON_REQUEST_BODY_BYTES + 1}\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+            ).encode("ascii")
+            sock.sendall(request)
+            response_body = sock.recv(4096).decode("utf-8", errors="replace")
+        assert "413" in response_body
+        assert calls == []
+        assert "LEAKSENTINEL" not in response_body
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_make_cron_backend_fails_closed_when_unconfigured():
+    with pytest.raises(ValueError, match="AGENTOPS_CRON_DB_PATH"):
+        compose_services._make_cron_backend({})
+
+
+def test_make_cron_backend_rejects_memory_path():
+    with pytest.raises(ValueError, match=":memory:"):
+        compose_services._make_cron_backend({"AGENTOPS_CRON_DB_PATH": ":memory:"})
+
+
+def test_make_cron_backend_rejects_relative_path():
+    with pytest.raises(ValueError, match="absolute"):
+        compose_services._make_cron_backend({"AGENTOPS_CRON_DB_PATH": "relative/path.db"})
+
+
+def test_make_cron_backend_rejects_blank_path():
+    with pytest.raises(ValueError, match="AGENTOPS_CRON_DB_PATH"):
+        compose_services._make_cron_backend({"AGENTOPS_CRON_DB_PATH": "   "})
+
+
+def test_make_cron_backend_creates_sqlite_backend(tmp_path):
+    from agent.runtime_cron_sqlite import SQLiteCronBackend
+
+    db_path = str(tmp_path / "cron_seam.db")
+    backend = compose_services._make_cron_backend({"AGENTOPS_CRON_DB_PATH": db_path})
+    assert isinstance(backend, SQLiteCronBackend)
+
+
+def test_get_or_create_cron_backend_fails_closed_when_unconfigured(monkeypatch):
+    monkeypatch.setattr(compose_services, "_cron_backend_instance", None, raising=False)
+    monkeypatch.setattr(compose_services.os, "environ", {})
+    with pytest.raises(ValueError, match="AGENTOPS_CRON_DB_PATH"):
+        compose_services._get_or_create_cron_backend()
+
+
+# ---------------------------------------------------------------------------
+# M12B: Cron log sanitization
+# ---------------------------------------------------------------------------
+
+
+def test_cron_log_message_redacts_job_id_path():
+    rendered = compose_services._sanitize_log_message(
+        '"POST /cron/jobs/LEAKSENTINEL-job-id/pause HTTP/1.1" 200 -'
+    )
+    assert "LEAKSENTINEL-job-id" not in rendered
+    assert "/cron/jobs/<redacted>/pause" in rendered
+
+
+def test_cron_log_message_keeps_claim_due_unredacted():
+    rendered = compose_services._sanitize_log_message(
+        '"POST /cron/jobs/claim-due HTTP/1.1" 200 -'
+    )
+    assert "/cron/jobs/claim-due" in rendered
+
+
+def test_cron_log_message_redacts_job_id_in_get():
+    rendered = compose_services._sanitize_log_message(
+        '"GET /cron/jobs/LEAKSENTINEL-job-id HTTP/1.1" 200 -'
+    )
+    assert "LEAKSENTINEL-job-id" not in rendered
+    assert "/cron/jobs/<redacted>" in rendered
+
+
+def test_cron_log_message_redacts_query_values():
+    rendered = compose_services._sanitize_log_message(
+        '"GET /cron/jobs?LEAKSENTINEL=secret HTTP/1.1" 200 -'
+    )
+    assert "LEAKSENTINEL" not in rendered
+    assert "/cron/jobs" in rendered
+    assert "?<redacted>" in rendered
+
+
+def test_cron_log_message_redacts_semicolon_alias():
+    rendered = compose_services._sanitize_log_message(
+        '"POST /cron/jobs;LEAKSENTINEL HTTP/1.1" 404 -'
+    )
+    assert "LEAKSENTINEL" not in rendered
+    assert "<redacted>" in rendered
+
+
+@pytest.mark.parametrize(
+    "raw_request",
+    [
+        '"POST /cron/jobsXYZ/LEAKSENTINEL-job-id HTTP/1.1" 404 -',
+        '"POST /cron%2FjobsLEAKSENTINEL HTTP/1.1" 404 -',
+        '"GET /cron/jobs%2FLEAKSENTINEL-job-id HTTP/1.1" 404 -',
+    ],
+)
+def test_cron_log_message_redacts_prefix_lookalike_and_encoded_material(raw_request):
+    rendered = compose_services._sanitize_log_message(raw_request)
+    assert "LEAKSENTINEL" not in rendered
+    assert "/cron" in rendered
+    assert "<redacted>" in rendered
+
+
+@pytest.mark.parametrize(
+    "raw_request",
+    [
+        '"POST /cron/jobs/abc/LEAKSENTINEL-action HTTP/1.1" 404 -',
+        '"POST /cron/jobs/abc/pause/LEAKSENTINEL-extra HTTP/1.1" 404 -',
+    ],
+)
+def test_cron_log_message_redacts_unknown_and_extra_action_tails(raw_request):
+    rendered = compose_services._sanitize_log_message(raw_request)
+    assert "LEAKSENTINEL" not in rendered
+    assert "/cron/jobs/<redacted>" in rendered

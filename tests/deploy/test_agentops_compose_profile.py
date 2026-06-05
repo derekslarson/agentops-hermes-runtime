@@ -349,3 +349,40 @@ def test_scheduler_does_not_have_run_lease_db_path_env():
     services = _compose()["services"]
     scheduler_env = "\n".join(services["scheduler"]["environment"])
     assert "AGENTOPS_RUN_LEASE_DB_PATH" not in scheduler_env
+
+
+# ---------------------------------------------------------------------------
+# M12B: Cron volume and env (api service only)
+# ---------------------------------------------------------------------------
+
+
+def test_api_service_has_cron_db_path_env():
+    services = _compose()["services"]
+    api_env = "\n".join(services["api"]["environment"])
+    assert "AGENTOPS_CRON_DB_PATH=/var/lib/agentops/cron/cron.db" in api_env
+
+
+def test_api_service_mounts_cron_volume():
+    services = _compose()["services"]
+    api = services["api"]
+    assert "volumes" in api
+    volume_strings = [str(v) for v in api["volumes"]]
+    assert any("/var/lib/agentops/cron" in v for v in volume_strings)
+
+
+def test_compose_declares_cron_volume():
+    compose = _compose()
+    assert "volumes" in compose
+    assert "agentops-cron" in compose["volumes"]
+
+
+def test_worker_does_not_have_cron_db_path_env():
+    services = _compose()["services"]
+    worker_env = "\n".join(services["worker"]["environment"])
+    assert "AGENTOPS_CRON_DB_PATH" not in worker_env
+
+
+def test_scheduler_does_not_have_cron_db_path_env():
+    services = _compose()["services"]
+    scheduler_env = "\n".join(services["scheduler"]["environment"])
+    assert "AGENTOPS_CRON_DB_PATH" not in scheduler_env
