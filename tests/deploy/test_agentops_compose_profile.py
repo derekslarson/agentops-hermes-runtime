@@ -312,3 +312,40 @@ def test_compose_declares_queue_volume():
     compose = _compose()
     assert "volumes" in compose
     assert "agentops-queue" in compose["volumes"]
+
+
+# ---------------------------------------------------------------------------
+# M12B: Run-lease volume and env (api service only)
+# ---------------------------------------------------------------------------
+
+
+def test_api_service_has_run_lease_db_path_env():
+    services = _compose()["services"]
+    api_env = "\n".join(services["api"]["environment"])
+    assert "AGENTOPS_RUN_LEASE_DB_PATH=/var/lib/agentops/run-leases/run-leases.db" in api_env
+
+
+def test_api_service_mounts_run_leases_volume():
+    services = _compose()["services"]
+    api = services["api"]
+    assert "volumes" in api
+    volume_strings = [str(v) for v in api["volumes"]]
+    assert any("/var/lib/agentops/run-leases" in v for v in volume_strings)
+
+
+def test_compose_declares_run_leases_volume():
+    compose = _compose()
+    assert "volumes" in compose
+    assert "agentops-run-leases" in compose["volumes"]
+
+
+def test_worker_does_not_have_run_lease_db_path_env():
+    services = _compose()["services"]
+    worker_env = "\n".join(services["worker"]["environment"])
+    assert "AGENTOPS_RUN_LEASE_DB_PATH" not in worker_env
+
+
+def test_scheduler_does_not_have_run_lease_db_path_env():
+    services = _compose()["services"]
+    scheduler_env = "\n".join(services["scheduler"]["environment"])
+    assert "AGENTOPS_RUN_LEASE_DB_PATH" not in scheduler_env

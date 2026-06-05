@@ -20,6 +20,7 @@ services:
       - AGENTOPS_CURATED_MEMORY_DB_PATH=/var/lib/agentops/curated-memory/curated.db
       - AGENTOPS_SKILL_DB_PATH=/var/lib/agentops/skills/skills.db
       - AGENTOPS_QUEUE_DB_PATH=/var/lib/agentops/queue/queue.db
+      - AGENTOPS_RUN_LEASE_DB_PATH=/var/lib/agentops/run-leases/run-leases.db
       - AGENTOPS_SECRET_STORE_URL=http://local-secrets:8713
       - AGENTOPS_API_URL=http://api:8710
     volumes:
@@ -28,6 +29,7 @@ services:
       - agentops-curated-memory:/var/lib/agentops/curated-memory
       - agentops-skills:/var/lib/agentops/skills
       - agentops-queue:/var/lib/agentops/queue
+      - agentops-run-leases:/var/lib/agentops/run-leases
     depends_on:
       postgres:
         condition: service_healthy
@@ -196,4 +198,5 @@ volumes:
   agentops-curated-memory:
   agentops-skills:
   agentops-queue:
+  agentops-run-leases:
   agentops-secrets:

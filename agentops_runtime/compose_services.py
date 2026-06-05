@@ -32,6 +32,7 @@ _MAX_SECRET_REQUEST_BODY_BYTES = 1_048_576
 _MAX_CURATED_MEMORY_REQUEST_BODY_BYTES = 1_048_576
 _MAX_SKILL_REQUEST_BODY_BYTES = 1_048_576
 _MAX_QUEUE_REQUEST_BODY_BYTES = 1_048_576
+_MAX_RUN_LEASE_REQUEST_BODY_BYTES = 1_048_576
 
 _SKILL_EXACT_PATHS = frozenset({"/skills/list", "/skills/view", "/skills/manage"})
 _QUEUE_EXACT_PATHS = frozenset({
@@ -199,6 +200,12 @@ class _Handler(BaseHTTPRequestHandler):
                 self.send_error(404)
                 return
             self._dispatch_skills(raw_path)
+            return
+        if raw_path.startswith("/run-leases/"):
+            if self.server.service_name != "api":  # type: ignore[attr-defined]
+                self.send_error(404)
+                return
+            self._dispatch_run_leases(raw_path)
             return
         self.send_error(404)
 
@@ -659,6 +666,56 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _dispatch_run_leases(self, raw_path: str) -> None:
+        from agentops_runtime.run_leases_api import handle_run_lease_request, is_run_lease_route
+
+        token = os.getenv("AGENTOPS_RUNTIME_TOKEN") or None
+        auth_header = self.headers.get("Authorization")
+
+        if token and auth_header != f"Bearer {token}":
+            self._send_json_error(401, "unauthorized")
+            return
+
+        if not is_run_lease_route(raw_path):
+            self._send_json_error(404, "not found")
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            self._send_json_error(400, "invalid content length")
+            return
+        if length < 0:
+            self._send_json_error(400, "invalid content length")
+            return
+        if length > _MAX_RUN_LEASE_REQUEST_BODY_BYTES:
+            self._send_json_error(413, "request body too large")
+            return
+        body_bytes = self.rfile.read(length)
+
+        try:
+            backend = getattr(self.server, "run_lease_backend", None) or _get_or_create_run_lease_backend()
+        except Exception:
+            self._send_json_error(503, "run-lease backend unavailable")
+            return
+
+        status, response = handle_run_lease_request(
+            method="POST",
+            path=raw_path,
+            query_string="",
+            body_bytes=body_bytes,
+            auth_header=auth_header,
+            token=token,
+            backend=backend,
+        )
+
+        body = json.dumps(response).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _send_json_error(self, status: int, message: str) -> None:
         body = json.dumps({"error": message}).encode("utf-8")
         self.send_response(status)
@@ -683,6 +740,7 @@ class _Server(ThreadingHTTPServer):
     secret_backend: Any = None
     skill_backend: Any = None
     queue_backend: Any = None
+    run_lease_backend: Any = None
 
 
 _memory_backend_lock = threading.Lock()
@@ -711,6 +769,9 @@ _skill_backend_instance: Any = None
 
 _queue_backend_lock = threading.Lock()
 _queue_backend_instance: Any = None
+
+_run_lease_backend_lock = threading.Lock()
+_run_lease_backend_instance: Any = None
 
 _SESSION_STATIC_PATH_SEGMENTS = frozenset({
     "create", "append", "messages", "search", "turn-lock",
@@ -748,6 +809,23 @@ def _sanitize_log_message(message: str) -> str:
         query = "?<redacted>" if match.group(2) else ""
         return f"{match.group(1)}/<redacted>{query}"
 
+    def _redact_run_lease_invalid_path(match: re.Match[str]) -> str:
+        query = "?<redacted>" if match.group(2) else ""
+        return f"{match.group(1)}/<redacted>{query}"
+
+    def _redact_run_lease_prefix_lookalike(match: re.Match[str]) -> str:
+        query = "?<redacted>" if match.group(2) else ""
+        return f"{match.group(1)}/<redacted>{query}"
+
+    def _redact_run_lease_key_path(match: re.Match[str]) -> str:
+        key_seg = match.group(2)
+        action = match.group(3)
+        query = "?<redacted>" if match.group(4) else ""
+        if key_seg == "expire-stale" and action is None:
+            return f"{match.group(1)}/expire-stale{query}"
+        action_str = "" if action is None else action.split(";", 1)[0]
+        return f"{match.group(1)}/<redacted>{action_str}{query}"
+
     message = re.sub(r"(/artifacts)/[^\s?\"]+(\?[^\s\"]+)?", _redact_artifact_path, message)
     message = re.sub(
         r"(/secrets)/(?!get(?:[?\s\"]|$)|put(?:[?\s\"]|$))[^\s?\"]+(\?[^\s\"]+)?",
@@ -775,7 +853,22 @@ def _sanitize_log_message(message: str) -> str:
         message,
     )
     message = re.sub(
-        r"(/(?:memory/records|memory|artifacts|audit|sessions|credentials|secrets|skills|queue)[^\s?\"]*)\?[^\s]+",
+        r"(/run-leases)%2[fF][^\s?\"]+(\?[^\s\"]+)?",
+        _redact_run_lease_invalid_path,
+        message,
+    )
+    message = re.sub(
+        r"(/run-leases)(?!/|%2[fF]|[?\s\"]|$)[^\s?\"]+(\?[^\s\"]+)?",
+        _redact_run_lease_prefix_lookalike,
+        message,
+    )
+    message = re.sub(
+        r"(/run-leases)/([^/\s?\"]+)(/[^\s?\"]*)?(\?[^\s\"]+)?",
+        _redact_run_lease_key_path,
+        message,
+    )
+    message = re.sub(
+        r"(/(?:memory/records|memory|artifacts|audit|sessions|credentials|secrets|skills|queue|run-leases)[^\s?\"]*)\?[^\s]+",
         r"\1?<redacted>",
         message,
     )
@@ -1020,6 +1113,34 @@ def _get_or_create_queue_backend() -> Any:
         if _queue_backend_instance is None:
             _queue_backend_instance = _make_queue_backend(dict(os.environ))
         return _queue_backend_instance
+
+
+def _make_run_lease_backend(environ: dict[str, str]) -> Any:
+    db_path = environ.get("AGENTOPS_RUN_LEASE_DB_PATH", "").strip()
+    if not db_path:
+        raise ValueError(
+            "compose run-lease backend requires AGENTOPS_RUN_LEASE_DB_PATH; "
+            "no local fallback is provided for compose/cloud profiles"
+        )
+    if db_path == ":memory:":
+        raise ValueError(
+            "AGENTOPS_RUN_LEASE_DB_PATH must be a durable file path, not ':memory:'"
+        )
+    if not db_path.startswith("/"):
+        raise ValueError(
+            "AGENTOPS_RUN_LEASE_DB_PATH must be an absolute path"
+        )
+    from agentops_runtime.run_leases_api import SQLiteRunLeaseBackend
+
+    return SQLiteRunLeaseBackend(db_path)
+
+
+def _get_or_create_run_lease_backend() -> Any:
+    global _run_lease_backend_instance
+    with _run_lease_backend_lock:
+        if _run_lease_backend_instance is None:
+            _run_lease_backend_instance = _make_run_lease_backend(dict(os.environ))
+        return _run_lease_backend_instance
 
 
 class _DeterministicCredentialResolver:

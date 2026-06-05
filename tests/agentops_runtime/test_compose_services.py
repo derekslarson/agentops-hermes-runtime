@@ -2388,3 +2388,226 @@ def test_queue_log_message_redacts_invalid_path_receipt_material(raw_request):
     rendered = compose_services._sanitize_log_message(raw_request)
     assert "LEAKSENTINEL" not in rendered
     assert "/queue/<redacted>" in rendered
+
+
+# ---------------------------------------------------------------------------
+# M12B: Run-lease endpoint routing and backend
+# ---------------------------------------------------------------------------
+
+
+class _FakeRunLeaseBackend:
+    def claim(self, scope, key, *, owner, now=None, lease_seconds=None):
+        return True
+
+    def renew(self, scope, key, *, owner, now=None, lease_seconds=None):
+        return True
+
+    def release(self, scope, key, *, owner):
+        pass
+
+    def request_cancel(self, scope, key, *, requester=None):
+        pass
+
+    def is_cancelled(self, scope, key):
+        return False
+
+    def clear_cancel(self, scope, key):
+        pass
+
+    def expire_stale(self, scope, *, now=None):
+        return 0
+
+
+_RUN_LEASE_CTX = {
+    "mode": "agentops",
+    "org_id": "org1",
+    "workspace_id": "ws1",
+    "workspace_type": "team",
+    "project_id": "proj1",
+    "external_channel_id": None,
+    "external_thread_id": None,
+    "conversation_id": "conv1",
+    "user_id": "alice",
+    "agent_profile_id": "bot",
+    "run_type": "conversation",
+    "parent_session_id": None,
+    "backend_profile": "compose-self-hosted",
+    "delivery_ref": None,
+}
+
+
+@pytest.fixture
+def _api_server_with_run_lease():
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    server.run_lease_backend = _FakeRunLeaseBackend()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        yield base
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_api_service_routes_run_lease_claim(_api_server_with_run_lease):
+    body = json.dumps({"context": _RUN_LEASE_CTX, "owner": "w"}).encode()
+    status = _http_post(f"{_api_server_with_run_lease}/run-leases/run-001/claim", body)
+    assert status == 200
+
+
+def test_api_service_routes_run_lease_renew(_api_server_with_run_lease):
+    body = json.dumps({"context": _RUN_LEASE_CTX, "owner": "w"}).encode()
+    status = _http_post(f"{_api_server_with_run_lease}/run-leases/run-001/renew", body)
+    assert status == 200
+
+
+def test_api_service_routes_run_lease_release(_api_server_with_run_lease):
+    body = json.dumps({"context": _RUN_LEASE_CTX, "owner": "w"}).encode()
+    status = _http_post(f"{_api_server_with_run_lease}/run-leases/run-001/release", body)
+    assert status == 200
+
+
+def test_api_service_routes_run_lease_request_cancel(_api_server_with_run_lease):
+    body = json.dumps({"context": _RUN_LEASE_CTX, "requester": "sup"}).encode()
+    status = _http_post(f"{_api_server_with_run_lease}/run-leases/run-001/request-cancel", body)
+    assert status == 200
+
+
+def test_api_service_routes_run_lease_is_cancelled(_api_server_with_run_lease):
+    body = json.dumps({"context": _RUN_LEASE_CTX}).encode()
+    status = _http_post(f"{_api_server_with_run_lease}/run-leases/run-001/is-cancelled", body)
+    assert status == 200
+
+
+def test_api_service_routes_run_lease_clear_cancel(_api_server_with_run_lease):
+    body = json.dumps({"context": _RUN_LEASE_CTX}).encode()
+    status = _http_post(f"{_api_server_with_run_lease}/run-leases/run-001/clear-cancel", body)
+    assert status == 200
+
+
+def test_api_service_routes_run_lease_expire_stale(_api_server_with_run_lease):
+    body = json.dumps({"context": _RUN_LEASE_CTX}).encode()
+    status = _http_post(f"{_api_server_with_run_lease}/run-leases/expire-stale", body)
+    assert status == 200
+
+
+@pytest.mark.parametrize("service_name", ["worker", "scheduler", "local-secrets"])
+def test_non_api_services_return_404_for_run_lease_claim(service_name):
+    server, thread = _make_non_api_server(service_name)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({"context": _RUN_LEASE_CTX, "owner": "w"}).encode()
+        status = _http_post(f"{base}/run-leases/run-001/claim", body)
+        assert status == 404, f"{service_name} should return 404 for POST /run-leases/<key>/claim"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+@pytest.mark.parametrize("service_name", ["worker", "scheduler", "local-secrets"])
+def test_non_api_services_return_404_for_run_lease_expire_stale(service_name):
+    server, thread = _make_non_api_server(service_name)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({"context": _RUN_LEASE_CTX}).encode()
+        status = _http_post(f"{base}/run-leases/expire-stale", body)
+        assert status == 404, f"{service_name} should return 404 for POST /run-leases/expire-stale"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_run_lease_prefix_lookalike_returns_404(_api_server_with_run_lease):
+    body = json.dumps({"context": _RUN_LEASE_CTX, "owner": "w"}).encode()
+    status = _http_post(f"{_api_server_with_run_lease}/run-leasesXYZ/run-001/claim", body)
+    assert status == 404
+
+
+def test_run_lease_log_message_redacts_key_path():
+    rendered = compose_services._sanitize_log_message(
+        '"POST /run-leases/LEAKSENTINEL-run-key/claim HTTP/1.1" 200 -'
+    )
+    assert "LEAKSENTINEL-run-key" not in rendered
+    assert "/run-leases/<redacted>/claim" in rendered
+
+
+def test_run_lease_expire_stale_log_message_not_redacted():
+    rendered = compose_services._sanitize_log_message(
+        '"POST /run-leases/expire-stale HTTP/1.1" 200 -'
+    )
+    assert "/run-leases/expire-stale" in rendered
+
+
+def test_run_lease_log_message_redacts_query_values():
+    rendered = compose_services._sanitize_log_message(
+        '"POST /run-leases/run-001/claim?LEAKSENTINEL=x HTTP/1.1" 200 -'
+    )
+    assert "LEAKSENTINEL" not in rendered
+
+
+def test_run_lease_log_message_redacts_semicolon_alias_material():
+    rendered = compose_services._sanitize_log_message(
+        '"POST /run-leases/run-001/claim;LEAKSENTINEL HTTP/1.1" 404 -'
+    )
+    assert "LEAKSENTINEL" not in rendered
+    assert "/run-leases/<redacted>/claim" in rendered
+
+
+@pytest.mark.parametrize(
+    "raw_request",
+    [
+        '"POST /run-leases;LEAKSENTINEL/run-001/claim HTTP/1.1" 404 -',
+        '"POST /run-leasesXYZ/LEAKSENTINEL-run-key/claim HTTP/1.1" 404 -',
+        '"POST /run-leases%2FLEAKSENTINEL-run-key%2Fclaim HTTP/1.1" 404 -',
+    ],
+)
+def test_run_lease_log_message_redacts_rejected_prefix_and_encoded_material(raw_request):
+    rendered = compose_services._sanitize_log_message(raw_request)
+    assert "LEAKSENTINEL" not in rendered
+    assert "/run-leases" in rendered
+    assert "<redacted>" in rendered
+
+
+def test_make_run_lease_backend_fails_closed_when_unconfigured():
+    with pytest.raises(ValueError, match="AGENTOPS_RUN_LEASE_DB_PATH"):
+        compose_services._make_run_lease_backend({})
+
+
+def test_make_run_lease_backend_rejects_memory_path():
+    with pytest.raises(ValueError, match=":memory:"):
+        compose_services._make_run_lease_backend({"AGENTOPS_RUN_LEASE_DB_PATH": ":memory:"})
+
+
+def test_make_run_lease_backend_rejects_relative_path():
+    with pytest.raises(ValueError, match="absolute"):
+        compose_services._make_run_lease_backend({"AGENTOPS_RUN_LEASE_DB_PATH": "relative/path.db"})
+
+
+def test_make_run_lease_backend_creates_sqlite_backend(tmp_path):
+    from agentops_runtime.run_leases_api import SQLiteRunLeaseBackend
+
+    db_path = str(tmp_path / "run_lease_seam.db")
+    backend = compose_services._make_run_lease_backend({"AGENTOPS_RUN_LEASE_DB_PATH": db_path})
+    assert isinstance(backend, SQLiteRunLeaseBackend)
+
+
+def test_run_lease_invalid_semicolon_route_404s_before_backend_construction(monkeypatch):
+    monkeypatch.delenv("AGENTOPS_RUN_LEASE_DB_PATH", raising=False)
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({"context": _RUN_LEASE_CTX, "owner": "w"}).encode()
+        status = _http_post(f"{base}/run-leases/run-001/claim;LEAKSENTINEL", body)
+        assert status == 404
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
