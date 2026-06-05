@@ -114,6 +114,13 @@ class ScopedSkillBackend:
 
     # -- seeding ---------------------------------------------------------------
 
+    def export_records(self) -> list[dict[str, Any]]:
+        """Return a deep copy of all internal records (JSON-serializable)."""
+        import copy
+
+        with self._lock:
+            return [copy.deepcopy(r) for r in self._records]
+
     def add_skill(
         self,
         *,

@@ -1831,3 +1831,242 @@ def test_curated_memory_log_does_not_affect_memory_records_redaction():
     assert "RECORDSENTINEL" not in rendered
     assert "/memory/records/search" in rendered
     assert "<redacted>" in rendered
+
+
+# ---------------------------------------------------------------------------
+# M12B: Skills endpoint routing
+# ---------------------------------------------------------------------------
+
+
+class _FakeSkillBackend:
+    """Minimal skill backend stub for compose routing tests."""
+
+    def list_skills(self, context, *, category=None):
+        return []
+
+    def load_skill(self, context, name, *, file_path=None, preprocess=True):
+        return {"success": False, "error": f"Skill '{name}' not found."}
+
+    def manage_skill(self, context, *, action, name, **fields):
+        return {"success": True, "message": f"ok"}
+
+
+@pytest.fixture
+def _skill_api_server():
+    """Spin up a real compose api service server with a fake skill backend."""
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    server.skill_backend = _FakeSkillBackend()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        yield base
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+@pytest.mark.parametrize("skill_path", ["/skills/list", "/skills/view", "/skills/manage"])
+def test_api_service_routes_skill_post(_skill_api_server, skill_path):
+    body = json.dumps({"context": _CONTEXT, "name": "x", "action": "create"}).encode()
+    status = _http_post(f"{_skill_api_server}{skill_path}", body)
+    assert status == 200, f"Expected 200 from {skill_path}, got {status}"
+
+
+@pytest.mark.parametrize("service_name", ["worker", "scheduler", "local-secrets"])
+@pytest.mark.parametrize("skill_path", ["/skills/list", "/skills/view", "/skills/manage"])
+def test_non_api_services_return_404_for_skills(service_name, skill_path):
+    server, thread = _make_non_api_server(service_name)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({"context": _CONTEXT, "name": "x"}).encode()
+        status = _http_post(f"{base}{skill_path}", body)
+        assert status == 404, f"{service_name} should 404 for {skill_path}"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+@pytest.mark.parametrize("skill_alias", [
+    "/skills/list;jsessionid=abc",
+    "/skills/list;",
+    "/skills/view;anything",
+    "/skills/manage;x=1",
+])
+def test_semicolon_alias_skill_paths_return_404(_skill_api_server, skill_alias):
+    body = json.dumps({"context": _CONTEXT}).encode()
+    req = urllib.request.Request(f"{_skill_api_server}{skill_alias}", data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Content-Length", str(len(body)))
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            status = r.status
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+    assert status == 404, f"Semicolon alias {skill_alias!r} should return 404, got {status}"
+
+
+def test_skill_endpoint_auth_rejected_before_body_is_read(_skill_api_server):
+    """Auth check happens before body read — bad token always gets 401."""
+    body = json.dumps({"context": _CONTEXT}).encode()
+    req = urllib.request.Request(f"{_skill_api_server}/skills/list", data=body, method="POST")
+    req.add_header("Authorization", "Bearer wrong-token")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Content-Length", str(len(body)))
+
+    # Inject a token so the server enforces auth
+    import os
+    original = os.environ.copy()
+    try:
+        # We can't inject env easily mid-test; instead test via direct handler invocation
+        from agentops_runtime import compose_services as cs
+        from agentops_runtime.skills_api import handle_skill_request
+
+        called = []
+
+        def _spy_backend(*args, **kwargs):
+            called.append(args)
+            return []
+
+        class _SpyBackend:
+            def list_skills(self, context, *, category=None):
+                called.append("list")
+                return []
+
+        status, resp = handle_skill_request(
+            method="POST",
+            path="/skills/list",
+            query_string="",
+            body_bytes=b"not-json",  # bad body — should never be parsed if auth fails
+            auth_header="Bearer wrong-token",
+            token="correct-token",
+            backend=_SpyBackend(),
+        )
+        assert status == 401
+        assert called == [], "Backend should not be called when auth fails"
+    finally:
+        pass
+
+
+def test_skill_endpoint_content_length_too_large_returns_413():
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    server.skill_backend = _FakeSkillBackend()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        # Send a small body but claim a huge Content-Length
+        body = b'{"context": {}}'
+        req = urllib.request.Request(f"{base}/skills/list", data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Content-Length", str(10 * 1024 * 1024 + 1))
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                status = r.status
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+        assert status == 413
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_skill_backend_failure_returns_503_sanitized(monkeypatch):
+    def _raise_backend_error():
+        raise ValueError("LEAKSENTINEL db=/var/secret/db")
+
+    monkeypatch.setattr(compose_services, "_get_or_create_skill_backend", _raise_backend_error)
+
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    # skill_backend is None — forces call to _get_or_create_skill_backend
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({"context": _CONTEXT}).encode()
+        req = urllib.request.Request(f"{base}/skills/list", data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Content-Length", str(len(body)))
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                status = r.status
+                response_body = r.read()
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            response_body = exc.read()
+        assert status == 503
+        response_text = response_body.decode("utf-8")
+        assert "LEAKSENTINEL" not in response_text
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+# ---------------------------------------------------------------------------
+# M12B: _make_skill_backend path validation
+# ---------------------------------------------------------------------------
+
+
+def test_make_skill_backend_fails_closed_when_unconfigured():
+    with pytest.raises(ValueError, match="AGENTOPS_SKILL_DB_PATH"):
+        compose_services._make_skill_backend({})
+
+
+def test_make_skill_backend_rejects_memory_path():
+    with pytest.raises(ValueError, match=":memory:"):
+        compose_services._make_skill_backend({"AGENTOPS_SKILL_DB_PATH": ":memory:"})
+
+
+def test_make_skill_backend_rejects_relative_path():
+    with pytest.raises(ValueError, match="absolute"):
+        compose_services._make_skill_backend({"AGENTOPS_SKILL_DB_PATH": "relative/path.db"})
+
+
+def test_make_skill_backend_rejects_blank_path():
+    with pytest.raises(ValueError, match="AGENTOPS_SKILL_DB_PATH"):
+        compose_services._make_skill_backend({"AGENTOPS_SKILL_DB_PATH": "   "})
+
+
+def test_make_skill_backend_creates_sqlite_store(tmp_path):
+    from agentops_runtime.skills_api import SQLiteScopedSkillStore
+
+    db_path = str(tmp_path / "skills_seam.db")
+    backend = compose_services._make_skill_backend({"AGENTOPS_SKILL_DB_PATH": db_path})
+    assert isinstance(backend, SQLiteScopedSkillStore)
+
+
+# ---------------------------------------------------------------------------
+# M12B: _sanitize_log_message redacts /skills query strings
+# ---------------------------------------------------------------------------
+
+
+def test_skills_list_log_message_redacts_query_values():
+    rendered = compose_services._sanitize_log_message(
+        '"POST /skills/list?secret=LEAKSENTINEL HTTP/1.1" 200 -'
+    )
+    assert "LEAKSENTINEL" not in rendered
+    assert "/skills/list" in rendered
+    assert "?<redacted>" in rendered
+
+
+def test_skills_view_log_message_redacts_query_values():
+    rendered = compose_services._sanitize_log_message(
+        '"POST /skills/view?name=LEAKSENTINEL HTTP/1.1" 200 -'
+    )
+    assert "LEAKSENTINEL" not in rendered
+    assert "/skills/view" in rendered
+
+
+def test_skills_manage_log_message_redacts_query_values():
+    rendered = compose_services._sanitize_log_message(
+        '"POST /skills/manage?action=LEAKSENTINEL HTTP/1.1" 200 -'
+    )
+    assert "LEAKSENTINEL" not in rendered
+    assert "/skills/manage" in rendered

@@ -18,12 +18,14 @@ services:
       - AGENTOPS_ARTIFACT_ROOT=/var/lib/agentops/artifacts
       - AGENTOPS_SESSION_DB_PATH=/var/lib/agentops/sessions/sessions.db
       - AGENTOPS_CURATED_MEMORY_DB_PATH=/var/lib/agentops/curated-memory/curated.db
+      - AGENTOPS_SKILL_DB_PATH=/var/lib/agentops/skills/skills.db
       - AGENTOPS_SECRET_STORE_URL=http://local-secrets:8713
       - AGENTOPS_API_URL=http://api:8710
     volumes:
       - agentops-artifacts:/var/lib/agentops/artifacts
       - agentops-sessions:/var/lib/agentops/sessions
       - agentops-curated-memory:/var/lib/agentops/curated-memory
+      - agentops-skills:/var/lib/agentops/skills
     depends_on:
       postgres:
         condition: service_healthy
@@ -190,4 +192,5 @@ volumes:
   agentops-artifacts:
   agentops-sessions:
   agentops-curated-memory:
+  agentops-skills:
   agentops-secrets:

@@ -30,6 +30,9 @@ _MAX_SESSION_REQUEST_BODY_BYTES = 1_048_576
 _MAX_CREDENTIAL_REQUEST_BODY_BYTES = 1_048_576
 _MAX_SECRET_REQUEST_BODY_BYTES = 1_048_576
 _MAX_CURATED_MEMORY_REQUEST_BODY_BYTES = 1_048_576
+_MAX_SKILL_REQUEST_BODY_BYTES = 1_048_576
+
+_SKILL_EXACT_PATHS = frozenset({"/skills/list", "/skills/view", "/skills/manage"})
 
 _SERVICE_PORTS = {
     "api": 8710,
@@ -174,6 +177,14 @@ class _Handler(BaseHTTPRequestHandler):
                 self.send_error(404)
                 return
             self._dispatch_secrets("POST", parsed)
+            return
+        # Skills: exact raw-path match prevents semicolon alias normalization by urllib.
+        raw_path = self.path.split("?", 1)[0]
+        if raw_path in _SKILL_EXACT_PATHS:
+            if self.server.service_name != "api":  # type: ignore[attr-defined]
+                self.send_error(404)
+                return
+            self._dispatch_skills(raw_path)
             return
         self.send_error(404)
 
@@ -542,6 +553,52 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _dispatch_skills(self, raw_path: str) -> None:
+        from agentops_runtime.skills_api import handle_skill_request
+
+        token = os.getenv("AGENTOPS_RUNTIME_TOKEN") or None
+        auth_header = self.headers.get("Authorization")
+
+        if token and auth_header != f"Bearer {token}":
+            self._send_json_error(401, "unauthorized")
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            self._send_json_error(400, "invalid content length")
+            return
+        if length < 0:
+            self._send_json_error(400, "invalid content length")
+            return
+        if length > _MAX_SKILL_REQUEST_BODY_BYTES:
+            self._send_json_error(413, "request body too large")
+            return
+        body_bytes = self.rfile.read(length)
+
+        try:
+            backend = getattr(self.server, "skill_backend", None) or _get_or_create_skill_backend()
+        except Exception:
+            self._send_json_error(503, "skill backend unavailable")
+            return
+
+        status, response = handle_skill_request(
+            method="POST",
+            path=raw_path,
+            query_string="",
+            body_bytes=body_bytes,
+            auth_header=auth_header,
+            token=token,
+            backend=backend,
+        )
+
+        body = json.dumps(response).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _send_json_error(self, status: int, message: str) -> None:
         body = json.dumps({"error": message}).encode("utf-8")
         self.send_response(status)
@@ -564,6 +621,7 @@ class _Server(ThreadingHTTPServer):
     session_backend: Any = None
     credential_backend: Any = None
     secret_backend: Any = None
+    skill_backend: Any = None
 
 
 _memory_backend_lock = threading.Lock()
@@ -586,6 +644,9 @@ _secret_backend_instance: Any = None
 
 _curated_memory_backend_lock = threading.Lock()
 _curated_memory_backend_instance: Any = None
+
+_skill_backend_lock = threading.Lock()
+_skill_backend_instance: Any = None
 
 _SESSION_STATIC_PATH_SEGMENTS = frozenset({
     "create", "append", "messages", "search", "turn-lock",
@@ -622,11 +683,12 @@ def _sanitize_log_message(message: str) -> str:
         _redact_session_id_path,
         message,
     )
-    return re.sub(
-        r"(/(?:memory/records|memory|artifacts|audit|sessions|credentials|secrets)[^\s?\"]*)\?[^\s]+",
+    message = re.sub(
+        r"(/(?:memory/records|memory|artifacts|audit|sessions|credentials|secrets|skills)[^\s?\"]*)\?[^\s]+",
         r"\1?<redacted>",
         message,
     )
+    return message
 
 
 def _make_memory_backend(environ: dict[str, str]) -> Any:
@@ -806,6 +868,39 @@ def _get_or_create_curated_memory_backend() -> Any:
         if _curated_memory_backend_instance is None:
             _curated_memory_backend_instance = _make_curated_memory_backend(dict(os.environ))
         return _curated_memory_backend_instance
+
+
+def _make_skill_backend(environ: dict[str, str]) -> Any:
+    """Create a SQLiteScopedSkillStore from the given environment mapping.
+
+    AGENTOPS_SKILL_DB_PATH is required; blank, ':memory:', and relative paths
+    are rejected. No cwd/tmp fallback is provided for compose/cloud profiles.
+    """
+    db_path = environ.get("AGENTOPS_SKILL_DB_PATH", "").strip()
+    if not db_path:
+        raise ValueError(
+            "compose skill backend requires AGENTOPS_SKILL_DB_PATH; "
+            "no local fallback is provided for compose/cloud profiles"
+        )
+    if db_path == ":memory:":
+        raise ValueError(
+            "AGENTOPS_SKILL_DB_PATH must be a durable file path, not ':memory:'"
+        )
+    if not db_path.startswith("/"):
+        raise ValueError(
+            "AGENTOPS_SKILL_DB_PATH must be an absolute path"
+        )
+    from agentops_runtime.skills_api import SQLiteScopedSkillStore
+
+    return SQLiteScopedSkillStore(db_path)
+
+
+def _get_or_create_skill_backend() -> Any:
+    global _skill_backend_instance
+    with _skill_backend_lock:
+        if _skill_backend_instance is None:
+            _skill_backend_instance = _make_skill_backend(dict(os.environ))
+        return _skill_backend_instance
 
 
 class _DeterministicCredentialResolver:
