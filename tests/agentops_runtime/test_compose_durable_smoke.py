@@ -1,4 +1,4 @@
-"""Tests for M12B compose durable smoke (worker_fleet, queue isolation, conversation routing, secret roundtrip)."""
+"""Tests for M12B compose durable smoke across native durable backend surfaces."""
 
 from __future__ import annotations
 
@@ -61,6 +61,7 @@ def _two_servers(tmp_path):
         _make_queue_backend,
         _make_secret_backend,
         _make_session_backend,
+        _make_skill_backend,
         _make_worker_registry_backend,
     )
 
@@ -72,6 +73,7 @@ def _two_servers(tmp_path):
     session_db = str(tmp_path / "sessions.db")
     deep_mem_db = str(tmp_path / "deep_memory.db")
     artifact_root = str(tmp_path / "artifacts")
+    skill_db = str(tmp_path / "skills.db")
 
     api_server, api_thread, api_base = _start_server(
         "api",
@@ -82,6 +84,7 @@ def _two_servers(tmp_path):
         session_backend=_make_session_backend({"AGENTOPS_SESSION_DB_PATH": session_db}),
         memory_backend=_make_memory_backend({"AGENTOPS_DEEP_MEMORY_DB_URL": "sqlite:///" + deep_mem_db}),
         artifact_backend=_make_artifact_backend({"AGENTOPS_ARTIFACT_ROOT": artifact_root}),
+        skill_backend=_make_skill_backend({"AGENTOPS_SKILL_DB_PATH": skill_db}),
     )
     secret_server, secret_thread, secret_base = _start_server(
         "local-secrets",
@@ -323,6 +326,7 @@ def test_run_durable_smoke_none_environ_threads_process_env_to_scale_step(monkey
         "_step_secret_roundtrip",
         "_step_native_state_continuity",
         "_step_artifact_roundtrip",
+        "_step_skill_roundtrip",
     ):
         monkeypatch.setattr(
             compose_durable_smoke,
@@ -883,5 +887,282 @@ def test_artifact_roundtrip_fails_when_tenant_b_can_get_or_list():
             return FakeArtifactBackend()
 
     step = _step_artifact_roundtrip(FakeRegistry())
+    assert step["ok"] is False
+    assert step["tenant_b_isolated"] is False
+
+
+# ---------------------------------------------------------------------------
+# skill_roundtrip step
+# ---------------------------------------------------------------------------
+
+
+def test_skill_roundtrip_step_in_steps_list(_two_servers):
+    result = run_durable_smoke(environ=_two_servers)
+    names = {s["step"] for s in result["steps"]}
+    assert "skill_roundtrip" in names
+
+
+def test_skill_roundtrip_step_passes(_two_servers):
+    result = run_durable_smoke(environ=_two_servers)
+    step = next(s for s in result["steps"] if s["step"] == "skill_roundtrip")
+    assert step["ok"] is True
+
+
+def test_skill_roundtrip_reports_booleans(_two_servers):
+    result = run_durable_smoke(environ=_two_servers)
+    step = next(s for s in result["steps"] if s["step"] == "skill_roundtrip")
+    assert step.get("unapproved_write_denied") is True
+    assert step.get("approved_create_ok") is True
+    assert step.get("author_read_ok") is True
+    assert step.get("shared_peer_visible") is True
+    assert step.get("tenant_b_isolated") is True
+
+
+def test_skill_roundtrip_report_contains_no_skill_sentinels(_two_servers):
+    result = run_durable_smoke(environ=_two_servers)
+    text = json.dumps(result)
+    for sentinel in (
+        "smoke-skill-roundtrip",
+        "smoke-skill-content-sentinel",
+        "smoke-skill-description-sentinel",
+        "smoke-skill-category-sentinel",
+        "shared_write_requires_approval",
+    ):
+        assert sentinel not in text, f"skill sentinel {sentinel!r} leaked into report"
+
+
+def test_skill_roundtrip_fails_when_unapproved_write_succeeds():
+    from agentops_runtime.compose_durable_smoke import _step_skill_roundtrip
+
+    class FakeSkillBackend:
+        def manage_skill(self, ctx, *, action, name, **fields):
+            return {"success": True, "message": "ok", "scope": "project"}
+
+        def load_skill(self, ctx, name, **kwargs):
+            return {"success": False}
+
+        def list_skills(self, ctx, **kwargs):
+            return []
+
+    class FakeRegistry:
+        def get(self, cap, ctx):
+            return FakeSkillBackend()
+
+    step = _step_skill_roundtrip(FakeRegistry())
+    assert step["ok"] is False
+    assert step["unapproved_write_denied"] is False
+
+
+def test_skill_roundtrip_fails_when_peer_cannot_see_skill():
+    from agentops_runtime.compose_durable_smoke import _step_skill_roundtrip
+
+    store: dict[str, str] = {}
+
+    class FakeSkillBackend:
+        def __init__(self, visible: bool):
+            self._visible = visible
+
+        def manage_skill(self, ctx, *, action, name, **fields):
+            if action == "delete":
+                store.pop(name, None)
+                return {"success": True}
+            if action == "create":
+                metadata = getattr(ctx, "metadata", None) or {}
+                approved = bool(metadata.get("skill_write_approved") if hasattr(metadata, "get") else False)
+                if not approved:
+                    return {"success": False, "policy": "shared_write_requires_approval"}
+                store[name] = fields.get("content", "")
+                return {"success": True, "scope": "project"}
+            return {"success": False}
+
+        def load_skill(self, ctx, name, **kwargs):
+            if self._visible and name in store:
+                return {"success": True, "content": store[name]}
+            return {"success": False}
+
+        def list_skills(self, ctx, **kwargs):
+            if self._visible:
+                return [{"name": k, "scope": "project"} for k in store]
+            return []
+
+    class FakeRegistry:
+        def get(self, cap, ctx):
+            is_peer = "peer" in (getattr(ctx, "user_id", "") or "")
+            is_b = "smoke-tenant-b" in (getattr(ctx, "org_id", "") or "")
+            return FakeSkillBackend(visible=not is_peer and not is_b)
+
+    step = _step_skill_roundtrip(FakeRegistry())
+    assert step["ok"] is False
+    assert step["shared_peer_visible"] is False
+
+
+def test_skill_roundtrip_fails_when_unapproved_write_persists_skill():
+    from agentops_runtime.compose_durable_smoke import _step_skill_roundtrip
+
+    store: dict[str, str] = {}
+
+    class FakeSkillBackend:
+        def manage_skill(self, ctx, *, action, name, **fields):
+            if action == "delete":
+                store.pop(name, None)
+                return {"success": True}
+            if action == "create":
+                metadata = getattr(ctx, "metadata", None) or {}
+                approved = bool(metadata.get("skill_write_approved") if hasattr(metadata, "get") else False)
+                store[name] = fields.get("content", "")
+                if not approved:
+                    return {"success": False, "policy": "shared_write_requires_approval"}
+                return {"success": True, "scope": "project"}
+            return {"success": False}
+
+        def load_skill(self, ctx, name, **kwargs):
+            if name in store:
+                return {"success": True, "content": store[name]}
+            return {"success": False}
+
+        def list_skills(self, ctx, **kwargs):
+            return [{"name": k, "scope": "project"} for k in store]
+
+    class FakeRegistry:
+        def get(self, cap, ctx):
+            is_b = "smoke-tenant-b" in (getattr(ctx, "org_id", "") or "")
+            if is_b:
+                return EmptySkillBackend()
+            return FakeSkillBackend()
+
+    class EmptySkillBackend:
+        def manage_skill(self, ctx, *, action, name, **fields):
+            return {"success": True}
+
+        def load_skill(self, ctx, name, **kwargs):
+            return {"success": False}
+
+        def list_skills(self, ctx, **kwargs):
+            return []
+
+    step = _step_skill_roundtrip(FakeRegistry())
+    assert step["ok"] is False
+    assert step["unapproved_write_denied"] is False
+
+
+def test_skill_roundtrip_fails_when_author_cannot_list_created_skill():
+    from agentops_runtime.compose_durable_smoke import _step_skill_roundtrip
+
+    store: dict[str, str] = {}
+
+    class FakeSkillBackend:
+        def __init__(self, author: bool = False, tenant_b: bool = False):
+            self._author = author
+            self._tenant_b = tenant_b
+
+        def manage_skill(self, ctx, *, action, name, **fields):
+            if action == "delete":
+                store.pop(name, None)
+                return {"success": True}
+            if action == "create":
+                metadata = getattr(ctx, "metadata", None) or {}
+                approved = bool(metadata.get("skill_write_approved") if hasattr(metadata, "get") else False)
+                if not approved:
+                    return {"success": False, "policy": "shared_write_requires_approval"}
+                store[name] = fields.get("content", "")
+                return {"success": True, "scope": "project"}
+            return {"success": False}
+
+        def load_skill(self, ctx, name, **kwargs):
+            if self._tenant_b or name not in store:
+                return {"success": False}
+            return {"success": True, "content": store[name]}
+
+        def list_skills(self, ctx, **kwargs):
+            if self._tenant_b or self._author:
+                return []
+            return [{"name": k, "scope": "project"} for k in store]
+
+    class FakeRegistry:
+        def get(self, cap, ctx):
+            is_b = "smoke-tenant-b" in (getattr(ctx, "org_id", "") or "")
+            is_author = (getattr(ctx, "user_id", "") or "") == "user-smoke-tenant-a"
+            return FakeSkillBackend(author=is_author, tenant_b=is_b)
+
+    step = _step_skill_roundtrip(FakeRegistry())
+    assert step["ok"] is False
+    assert step["author_read_ok"] is False
+
+
+def test_skill_roundtrip_fails_when_peer_loads_wrong_skill_content():
+    from agentops_runtime.compose_durable_smoke import _step_skill_roundtrip
+
+    store: dict[str, str] = {}
+
+    class FakeSkillBackend:
+        def __init__(self, peer: bool = False):
+            self._peer = peer
+
+        def manage_skill(self, ctx, *, action, name, **fields):
+            if action == "delete":
+                store.pop(name, None)
+                return {"success": True}
+            if action == "create":
+                metadata = getattr(ctx, "metadata", None) or {}
+                approved = bool(metadata.get("skill_write_approved") if hasattr(metadata, "get") else False)
+                if not approved:
+                    return {"success": False, "policy": "shared_write_requires_approval"}
+                store[name] = fields.get("content", "")
+                return {"success": True, "scope": "project"}
+            return {"success": False}
+
+        def load_skill(self, ctx, name, **kwargs):
+            if name not in store:
+                return {"success": False}
+            content = "wrong-peer-content" if self._peer else store[name]
+            return {"success": True, "content": content}
+
+        def list_skills(self, ctx, **kwargs):
+            return [{"name": k, "scope": "project"} for k in store]
+
+    class FakeRegistry:
+        def get(self, cap, ctx):
+            assert cap.value == "skill"
+            is_peer = "peer" in (getattr(ctx, "user_id", "") or "")
+            is_b = "smoke-tenant-b" in (getattr(ctx, "org_id", "") or "")
+            return FakeSkillBackend(peer=is_peer and not is_b)
+
+    step = _step_skill_roundtrip(FakeRegistry())
+    assert step["ok"] is False
+    assert step["shared_peer_visible"] is False
+
+
+def test_skill_roundtrip_fails_when_tenant_b_can_see_skill():
+    from agentops_runtime.compose_durable_smoke import _step_skill_roundtrip
+
+    store: dict[str, str] = {}
+
+    class FakeSkillBackend:
+        def manage_skill(self, ctx, *, action, name, **fields):
+            if action == "delete":
+                store.pop(name, None)
+                return {"success": True}
+            if action == "create":
+                metadata = getattr(ctx, "metadata", None) or {}
+                approved = bool(metadata.get("skill_write_approved") if hasattr(metadata, "get") else False)
+                if not approved:
+                    return {"success": False, "policy": "shared_write_requires_approval"}
+                store[name] = fields.get("content", "")
+                return {"success": True, "scope": "project"}
+            return {"success": False}
+
+        def load_skill(self, ctx, name, **kwargs):
+            if name in store:
+                return {"success": True, "content": store[name]}
+            return {"success": False}
+
+        def list_skills(self, ctx, **kwargs):
+            return [{"name": k, "scope": "project"} for k in store]
+
+    class FakeRegistry:
+        def get(self, cap, ctx):
+            return FakeSkillBackend()
+
+    step = _step_skill_roundtrip(FakeRegistry())
     assert step["ok"] is False
     assert step["tenant_b_isolated"] is False

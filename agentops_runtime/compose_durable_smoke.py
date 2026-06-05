@@ -1,10 +1,10 @@
-"""M12B compose durable smoke — exercises WORKER_REGISTRY, QUEUE, CONVERSATION_ROUTER, SECRET, MEMORY, SESSION, DEEP_MEMORY, ARTIFACT via HTTP adapters.
+"""M12B compose durable smoke — exercises WORKER_REGISTRY, QUEUE, CONVERSATION_ROUTER, SECRET, MEMORY, SESSION, DEEP_MEMORY, ARTIFACT, SKILL via HTTP adapters.
 
 Run against a live Compose stack (or a test harness with in-process SQLite servers)::
 
     python -m agentops_runtime.compose_durable_smoke
 
-The module probes seven durable-backend slices:
+The module probes eight durable-backend slices:
 - ``worker_fleet``           register/list two workers via WorkerRegistry
 - ``queue_tenant_isolation`` tenant A enqueue/claim/ack; tenant B cannot claim tenant A's item
 - ``conversation_routing``   resolve-conversation idempotency, route_turn, find_active_run
@@ -13,11 +13,14 @@ The module probes seven durable-backend slices:
                                upsert/get — all three surfaces isolated between tenant A and B
 - ``artifact_roundtrip``     put/get/list a durable artifact via HttpArtifactBackend + API server
                                + LocalFileArtifactBackend; tenant B cannot get or list tenant A's ref
+- ``skill_roundtrip``        project-scope skill create (approval gate), peer visibility, and
+                               tenant B isolation via HttpSkillBackend + SQLiteScopedSkillStore
 - ``worker_fleet_scale``     optional live scaled-worker proof when AGENTOPS_SMOKE_EXPECTED_WORKERS
                                is set by the Compose smoke script
 
 Only sanitized, JSON-safe data is reported: step names, booleans, and integer counts.
 No raw IDs, tenant IDs, secret values, URLs, local paths, artifact refs, artifact bytes,
+skill names, skill content, skill descriptions, skill categories, policy strings,
 or backend error text is emitted.
 """
 
@@ -46,6 +49,12 @@ _DEEP_MEM_SENTINEL = "smoke-deep-mem-sentinel"
 # Artifact roundtrip scope labels — never leaked to the report.
 _ARTIFACT_REF = "smoke/roundtrip/sentinel.bin"
 _ARTIFACT_DATA = b"durable-smoke-artifact-sentinel"
+
+# Skill roundtrip scope labels — never leaked to the report.
+_SKILL_NAME = "smoke-skill-roundtrip"
+_SKILL_CONTENT = "smoke-skill-content-sentinel"
+_SKILL_DESCRIPTION = "smoke-skill-description-sentinel"
+_SKILL_CATEGORY = "smoke-skill-category-sentinel"
 
 # Reserved fleet/infrastructure scope — never collides with tenant scopes.
 _FLEET_ORG_ID = "__fleet__"
@@ -381,6 +390,123 @@ def _step_artifact_roundtrip(registry: RuntimeBackendRegistry) -> dict[str, Any]
     }
 
 
+def _step_skill_roundtrip(registry: RuntimeBackendRegistry) -> dict[str, Any]:
+    """Prove project-scope skill approval gate, peer visibility, and tenant B isolation."""
+    ctx_author = _ctx(_SCOPE_A)
+    ctx_approver = RuntimeContext(
+        mode=ctx_author.mode,
+        org_id=ctx_author.org_id,
+        workspace_id=ctx_author.workspace_id,
+        workspace_type=ctx_author.workspace_type,
+        user_id=ctx_author.user_id,
+        conversation_id=ctx_author.conversation_id,
+        agent_profile_id=ctx_author.agent_profile_id,
+        project_id=ctx_author.project_id,
+        permissions_ref=ctx_author.permissions_ref,
+        run_id=ctx_author.run_id,
+        run_type=ctx_author.run_type,
+        backend_profile=ctx_author.backend_profile,
+        delivery_ref=ctx_author.delivery_ref,
+        metadata={"skill_write_approved": True},
+    )
+    ctx_peer = RuntimeContext(
+        mode="agentops",
+        org_id=ctx_author.org_id,
+        workspace_id=ctx_author.workspace_id,
+        workspace_type="team",
+        user_id="user-smoke-peer-a",
+        conversation_id="smoke-conv-peer",
+        agent_profile_id="smoke-agent",
+        project_id=ctx_author.project_id,
+        permissions_ref="smoke-perms",
+        run_id="run-smoke-peer-a",
+        run_type="manual",
+        backend_profile=_COMPOSE_PROFILE,
+        delivery_ref="thread://smoke/peer-a",
+    )
+    ctx_b = _ctx(_SCOPE_B)
+
+    backend_author = registry.get(BackendCapability.SKILL, ctx_author)
+    backend_approver = registry.get(BackendCapability.SKILL, ctx_approver)
+    backend_peer = registry.get(BackendCapability.SKILL, ctx_peer)
+    backend_b = registry.get(BackendCapability.SKILL, ctx_b)
+
+    try:
+        backend_approver.manage_skill(ctx_approver, action="delete", name=_SKILL_NAME, scope="project")
+    except Exception:
+        pass
+
+    unapproved_result = backend_author.manage_skill(
+        ctx_author,
+        action="create",
+        name=_SKILL_NAME,
+        scope="project",
+        content=_SKILL_CONTENT,
+        description=_SKILL_DESCRIPTION,
+        category=_SKILL_CATEGORY,
+    )
+    unapproved_load = backend_author.load_skill(ctx_author, _SKILL_NAME)
+    unapproved_list = backend_author.list_skills(ctx_author)
+    unapproved_names = [s.get("name") for s in unapproved_list if isinstance(s, dict)]
+    unapproved_absent = (
+        (unapproved_load is None or unapproved_load.get("success") is not True)
+        and _SKILL_NAME not in unapproved_names
+    )
+    unapproved_write_denied = unapproved_result.get("success") is not True and unapproved_absent
+
+    approved_result = backend_approver.manage_skill(
+        ctx_approver,
+        action="create",
+        name=_SKILL_NAME,
+        scope="project",
+        content=_SKILL_CONTENT,
+        description=_SKILL_DESCRIPTION,
+        category=_SKILL_CATEGORY,
+    )
+    approved_create_ok = approved_result.get("success") is True
+
+    author_load = backend_author.load_skill(ctx_author, _SKILL_NAME)
+    author_list = backend_author.list_skills(ctx_author)
+    author_names = [s.get("name") for s in author_list if isinstance(s, dict)]
+    author_read_ok = (
+        _SKILL_NAME in author_names
+        and author_load is not None
+        and author_load.get("success") is True
+        and _SKILL_CONTENT in (author_load.get("content") or "")
+    )
+
+    peer_list = backend_peer.list_skills(ctx_peer)
+    peer_load = backend_peer.load_skill(ctx_peer, _SKILL_NAME)
+    peer_names = [s.get("name") for s in peer_list if isinstance(s, dict)]
+    shared_peer_visible = (
+        _SKILL_NAME in peer_names
+        and peer_load is not None
+        and peer_load.get("success") is True
+        and _SKILL_CONTENT in (peer_load.get("content") or "")
+    )
+
+    b_list = backend_b.list_skills(ctx_b)
+    b_load = backend_b.load_skill(ctx_b, _SKILL_NAME)
+    b_names = [s.get("name") for s in b_list if isinstance(s, dict)]
+    tenant_b_isolated = _SKILL_NAME not in b_names and (b_load is None or b_load.get("success") is not True)
+
+    try:
+        backend_approver.manage_skill(ctx_approver, action="delete", name=_SKILL_NAME, scope="project")
+    except Exception:
+        pass
+
+    ok = unapproved_write_denied and approved_create_ok and author_read_ok and shared_peer_visible and tenant_b_isolated
+    return {
+        "step": "skill_roundtrip",
+        "ok": ok,
+        "unapproved_write_denied": unapproved_write_denied,
+        "approved_create_ok": approved_create_ok,
+        "author_read_ok": author_read_ok,
+        "shared_peer_visible": shared_peer_visible,
+        "tenant_b_isolated": tenant_b_isolated,
+    }
+
+
 def run_durable_smoke(*, environ: dict[str, str] | None = None) -> dict[str, Any]:
     """Run all durable smoke steps and return a sanitized, JSON-safe report dict."""
     try:
@@ -405,6 +531,7 @@ def run_durable_smoke(*, environ: dict[str, str] | None = None) -> dict[str, Any
         _step_secret_roundtrip,
         _step_native_state_continuity,
         _step_artifact_roundtrip,
+        _step_skill_roundtrip,
         _scale_step,
     ):
         try:
