@@ -54,6 +54,7 @@ def _stop_server(server: compose_services._Server, thread: threading.Thread) -> 
 @pytest.fixture
 def _two_servers(tmp_path):
     from agentops_runtime.compose_services import (
+        _make_artifact_backend,
         _make_conversation_router_backend,
         _make_curated_memory_backend,
         _make_memory_backend,
@@ -70,6 +71,7 @@ def _two_servers(tmp_path):
     curated_mem_db = str(tmp_path / "curated_memory.db")
     session_db = str(tmp_path / "sessions.db")
     deep_mem_db = str(tmp_path / "deep_memory.db")
+    artifact_root = str(tmp_path / "artifacts")
 
     api_server, api_thread, api_base = _start_server(
         "api",
@@ -79,6 +81,7 @@ def _two_servers(tmp_path):
         curated_memory_backend=_make_curated_memory_backend({"AGENTOPS_CURATED_MEMORY_DB_PATH": curated_mem_db}),
         session_backend=_make_session_backend({"AGENTOPS_SESSION_DB_PATH": session_db}),
         memory_backend=_make_memory_backend({"AGENTOPS_DEEP_MEMORY_DB_URL": "sqlite:///" + deep_mem_db}),
+        artifact_backend=_make_artifact_backend({"AGENTOPS_ARTIFACT_ROOT": artifact_root}),
     )
     secret_server, secret_thread, secret_base = _start_server(
         "local-secrets",
@@ -319,6 +322,7 @@ def test_run_durable_smoke_none_environ_threads_process_env_to_scale_step(monkey
         "_step_conversation_routing",
         "_step_secret_roundtrip",
         "_step_native_state_continuity",
+        "_step_artifact_roundtrip",
     ):
         monkeypatch.setattr(
             compose_durable_smoke,
@@ -820,3 +824,64 @@ def test_fleet_ctx_differs_from_tenant_ctx():
     fleet_scope = HttpWorkerRegistry._scope_payload(_fleet_ctx())
     tenant_scope = HttpWorkerRegistry._scope_payload(_ctx("smoke-tenant-a"))
     assert fleet_scope != tenant_scope
+
+
+# ---------------------------------------------------------------------------
+# artifact_roundtrip step
+# ---------------------------------------------------------------------------
+
+
+def test_artifact_roundtrip_step_in_steps_list(_two_servers):
+    result = run_durable_smoke(environ=_two_servers)
+    names = {s["step"] for s in result["steps"]}
+    assert "artifact_roundtrip" in names
+
+
+def test_artifact_roundtrip_step_passes(_two_servers):
+    result = run_durable_smoke(environ=_two_servers)
+    step = next(s for s in result["steps"] if s["step"] == "artifact_roundtrip")
+    assert step["ok"] is True
+
+
+def test_artifact_roundtrip_reports_put_get_list_and_isolation(_two_servers):
+    result = run_durable_smoke(environ=_two_servers)
+    step = next(s for s in result["steps"] if s["step"] == "artifact_roundtrip")
+    assert step.get("put_ok") is True
+    assert step.get("get_ok") is True
+    assert step.get("list_ok") is True
+    assert step.get("tenant_b_isolated") is True
+
+
+def test_artifact_roundtrip_report_contains_no_artifact_sentinels(_two_servers):
+    result = run_durable_smoke(environ=_two_servers)
+    text = json.dumps(result)
+    for sentinel in (
+        "smoke/roundtrip/sentinel.bin",
+        "durable-smoke-artifact-sentinel",
+    ):
+        assert sentinel not in text, f"artifact sentinel {sentinel!r} leaked into report"
+
+
+def test_artifact_roundtrip_fails_when_tenant_b_can_get_or_list():
+    from agentops_runtime.compose_durable_smoke import _step_artifact_roundtrip
+
+    store: dict[str, bytes] = {}
+
+    class FakeArtifactBackend:
+        def put(self, ctx, ref, data):
+            store[ref] = data
+            return ref
+
+        def get(self, ctx, ref):
+            return store.get(ref)
+
+        def list_artifacts(self, ctx):
+            return list(store.keys())
+
+    class FakeRegistry:
+        def get(self, cap, ctx):
+            return FakeArtifactBackend()
+
+    step = _step_artifact_roundtrip(FakeRegistry())
+    assert step["ok"] is False
+    assert step["tenant_b_isolated"] is False

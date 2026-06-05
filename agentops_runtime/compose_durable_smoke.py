@@ -1,21 +1,24 @@
-"""M12B compose durable smoke — exercises WORKER_REGISTRY, QUEUE, CONVERSATION_ROUTER, SECRET, MEMORY, SESSION, DEEP_MEMORY via HTTP adapters.
+"""M12B compose durable smoke — exercises WORKER_REGISTRY, QUEUE, CONVERSATION_ROUTER, SECRET, MEMORY, SESSION, DEEP_MEMORY, ARTIFACT via HTTP adapters.
 
 Run against a live Compose stack (or a test harness with in-process SQLite servers)::
 
     python -m agentops_runtime.compose_durable_smoke
 
-The module probes six durable-backend slices:
+The module probes seven durable-backend slices:
 - ``worker_fleet``           register/list two workers via WorkerRegistry
 - ``queue_tenant_isolation`` tenant A enqueue/claim/ack; tenant B cannot claim tenant A's item
 - ``conversation_routing``   resolve-conversation idempotency, route_turn, find_active_run
 - ``secret_roundtrip``       put/get sentinel; cross-tenant get is isolated
 - ``native_state_continuity`` curated memory write/read, session create/append/read, deep-memory
                                upsert/get — all three surfaces isolated between tenant A and B
+- ``artifact_roundtrip``     put/get/list a durable artifact via HttpArtifactBackend + API server
+                               + LocalFileArtifactBackend; tenant B cannot get or list tenant A's ref
 - ``worker_fleet_scale``     optional live scaled-worker proof when AGENTOPS_SMOKE_EXPECTED_WORKERS
                                is set by the Compose smoke script
 
 Only sanitized, JSON-safe data is reported: step names, booleans, and integer counts.
-No raw IDs, tenant IDs, secret values, URLs, local paths, or backend error text is emitted.
+No raw IDs, tenant IDs, secret values, URLs, local paths, artifact refs, artifact bytes,
+or backend error text is emitted.
 """
 
 from __future__ import annotations
@@ -39,6 +42,10 @@ _SECRET_VALUE = "durable-smoke-sentinel"
 _MEMORY_SENTINEL = "smoke-curated-mem-sentinel"
 _SESSION_SENTINEL = "smoke-session-sentinel"
 _DEEP_MEM_SENTINEL = "smoke-deep-mem-sentinel"
+
+# Artifact roundtrip scope labels — never leaked to the report.
+_ARTIFACT_REF = "smoke/roundtrip/sentinel.bin"
+_ARTIFACT_DATA = b"durable-smoke-artifact-sentinel"
 
 # Reserved fleet/infrastructure scope — never collides with tenant scopes.
 _FLEET_ORG_ID = "__fleet__"
@@ -343,6 +350,37 @@ def _step_native_state_continuity(registry: RuntimeBackendRegistry) -> dict[str,
     }
 
 
+def _step_artifact_roundtrip(registry: RuntimeBackendRegistry) -> dict[str, Any]:
+    """Prove tenant A can put/get/list a durable artifact; tenant B cannot get or list the same ref."""
+    ctx_a = _ctx(_SCOPE_A)
+    ctx_b = _ctx(_SCOPE_B)
+    backend_a = registry.get(BackendCapability.ARTIFACT, ctx_a)
+    backend_b = registry.get(BackendCapability.ARTIFACT, ctx_b)
+
+    stored_ref = backend_a.put(ctx_a, _ARTIFACT_REF, _ARTIFACT_DATA)
+    put_ok = bool(stored_ref)
+
+    retrieved = backend_a.get(ctx_a, _ARTIFACT_REF)
+    get_ok = retrieved == _ARTIFACT_DATA
+
+    listed = backend_a.list_artifacts(ctx_a)
+    list_ok = stored_ref in listed
+
+    b_get = backend_b.get(ctx_b, stored_ref)
+    b_list = backend_b.list_artifacts(ctx_b)
+    tenant_b_isolated = b_get is None and stored_ref not in b_list
+
+    ok = put_ok and get_ok and list_ok and tenant_b_isolated
+    return {
+        "step": "artifact_roundtrip",
+        "ok": ok,
+        "put_ok": put_ok,
+        "get_ok": get_ok,
+        "list_ok": list_ok,
+        "tenant_b_isolated": tenant_b_isolated,
+    }
+
+
 def run_durable_smoke(*, environ: dict[str, str] | None = None) -> dict[str, Any]:
     """Run all durable smoke steps and return a sanitized, JSON-safe report dict."""
     try:
@@ -366,6 +404,7 @@ def run_durable_smoke(*, environ: dict[str, str] | None = None) -> dict[str, Any
         _step_conversation_routing,
         _step_secret_roundtrip,
         _step_native_state_continuity,
+        _step_artifact_roundtrip,
         _scale_step,
     ):
         try:
