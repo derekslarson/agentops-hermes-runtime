@@ -29,6 +29,7 @@ from agentops_runtime.compose_backends import (
 _MAX_SESSION_REQUEST_BODY_BYTES = 1_048_576
 _MAX_CREDENTIAL_REQUEST_BODY_BYTES = 1_048_576
 _MAX_SECRET_REQUEST_BODY_BYTES = 1_048_576
+_MAX_CURATED_MEMORY_REQUEST_BODY_BYTES = 1_048_576
 
 _SERVICE_PORTS = {
     "api": 8710,
@@ -101,6 +102,12 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             self._dispatch_memory_records("GET", parsed)
             return
+        if parsed.path == "/memory" and self.path.split("?", 1)[0] == "/memory":
+            if self.server.service_name != "api":  # type: ignore[attr-defined]
+                self.send_error(404)
+                return
+            self._dispatch_curated_memory("GET", parsed)
+            return
         if parsed.path == "/artifacts" or parsed.path.startswith("/artifacts/"):
             if self.server.service_name != "api":  # type: ignore[attr-defined]
                 self.send_error(404)
@@ -131,6 +138,12 @@ class _Handler(BaseHTTPRequestHandler):
                 self.send_error(404)
                 return
             self._dispatch_memory_records("POST", parsed)
+            return
+        if parsed.path == "/memory" and self.path.split("?", 1)[0] == "/memory":
+            if self.server.service_name != "api":  # type: ignore[attr-defined]
+                self.send_error(404)
+                return
+            self._dispatch_curated_memory("POST", parsed)
             return
         if parsed.path == "/artifacts":
             if self.server.service_name != "api":  # type: ignore[attr-defined]
@@ -186,6 +199,63 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         status, response = handle_memory_records_request(
+            method=method,
+            path=parsed.path,
+            query_string=parsed.query,
+            body_bytes=body_bytes,
+            auth_header=auth_header,
+            token=token,
+            backend=backend,
+        )
+
+        body = json.dumps(response).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _dispatch_curated_memory(self, method: str, parsed: urllib.parse.ParseResult) -> None:
+        from agentops_runtime.curated_memory_api import handle_curated_memory_request
+
+        token = os.getenv("AGENTOPS_RUNTIME_TOKEN") or None
+        auth_header = self.headers.get("Authorization")
+        if token and auth_header != f"Bearer {token}":
+            error_body = json.dumps({"error": "unauthorized"}).encode("utf-8")
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(error_body)))
+            self.end_headers()
+            self.wfile.write(error_body)
+            return
+
+        body_bytes = b""
+        if method == "POST":
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+            except ValueError:
+                self._send_json_error(400, "invalid content length")
+                return
+            if length < 0:
+                self._send_json_error(400, "invalid content length")
+                return
+            if length > _MAX_CURATED_MEMORY_REQUEST_BODY_BYTES:
+                self._send_json_error(413, "request body too large")
+                return
+            body_bytes = self.rfile.read(length)
+
+        try:
+            backend = getattr(self.server, "curated_memory_backend", None) or _get_or_create_curated_memory_backend()
+        except Exception:
+            error_body = json.dumps({"error": "curated memory backend unavailable"}).encode("utf-8")
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(error_body)))
+            self.end_headers()
+            self.wfile.write(error_body)
+            return
+
+        status, response = handle_curated_memory_request(
             method=method,
             path=parsed.path,
             query_string=parsed.query,
@@ -488,6 +558,7 @@ class _Handler(BaseHTTPRequestHandler):
 class _Server(ThreadingHTTPServer):
     service_name: str
     memory_backend: Any = None
+    curated_memory_backend: Any = None
     artifact_backend: Any = None
     audit_backend: Any = None
     session_backend: Any = None
@@ -512,6 +583,9 @@ _credential_resolver_instance: Any = None
 
 _secret_backend_lock = threading.Lock()
 _secret_backend_instance: Any = None
+
+_curated_memory_backend_lock = threading.Lock()
+_curated_memory_backend_instance: Any = None
 
 _SESSION_STATIC_PATH_SEGMENTS = frozenset({
     "create", "append", "messages", "search", "turn-lock",
@@ -549,7 +623,7 @@ def _sanitize_log_message(message: str) -> str:
         message,
     )
     return re.sub(
-        r"(/(?:memory/records|artifacts|audit|sessions|credentials|secrets)[^\s?\"]*)\?[^\s]+",
+        r"(/(?:memory/records|memory|artifacts|audit|sessions|credentials|secrets)[^\s?\"]*)\?[^\s]+",
         r"\1?<redacted>",
         message,
     )
@@ -699,6 +773,39 @@ def _get_or_create_secret_backend() -> Any:
         if _secret_backend_instance is None:
             _secret_backend_instance = _make_secret_backend(dict(os.environ))
         return _secret_backend_instance
+
+
+def _make_curated_memory_backend(environ: dict[str, str]) -> Any:
+    """Create a SQLiteCuratedMemoryStore from the given environment mapping.
+
+    AGENTOPS_CURATED_MEMORY_DB_PATH is required; blank, in-memory, and
+    relative paths are rejected. No cwd/tmp/local-profile fallback.
+    """
+    db_path = environ.get("AGENTOPS_CURATED_MEMORY_DB_PATH", "").strip()
+    if not db_path:
+        raise ValueError(
+            "compose curated-memory backend requires AGENTOPS_CURATED_MEMORY_DB_PATH; "
+            "no local fallback is provided for compose/cloud profiles"
+        )
+    if db_path == ":memory:":
+        raise ValueError(
+            "AGENTOPS_CURATED_MEMORY_DB_PATH must be a durable file path, not ':memory:'"
+        )
+    if not db_path.startswith("/"):
+        raise ValueError(
+            "AGENTOPS_CURATED_MEMORY_DB_PATH must be an absolute path"
+        )
+    from agentops_runtime.curated_memory_api import SQLiteCuratedMemoryStore
+
+    return SQLiteCuratedMemoryStore(db_path)
+
+
+def _get_or_create_curated_memory_backend() -> Any:
+    global _curated_memory_backend_instance
+    with _curated_memory_backend_lock:
+        if _curated_memory_backend_instance is None:
+            _curated_memory_backend_instance = _make_curated_memory_backend(dict(os.environ))
+        return _curated_memory_backend_instance
 
 
 class _DeterministicCredentialResolver:

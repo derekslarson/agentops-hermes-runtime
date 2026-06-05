@@ -1687,3 +1687,147 @@ def test_secrets_log_message_redacts_ref_path_and_query_values():
     assert "REFLEAKSENTINEL" not in rendered
     assert "QUERYLEAKSENTINEL" not in rendered
     assert "/secrets/<redacted>" in rendered
+
+
+# ---------------------------------------------------------------------------
+# M12B: Curated memory endpoint routing, backend, and log sanitization
+# ---------------------------------------------------------------------------
+
+
+import tempfile as _tempfile
+
+
+@pytest.fixture
+def _api_server_curated(tmp_path):
+    """Compose API server with a real SQLiteCuratedMemoryStore backend."""
+    from agentops_runtime.curated_memory_api import SQLiteCuratedMemoryStore
+
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    server.memory_backend = _FakeMemoryBackend()
+    server.curated_memory_backend = SQLiteCuratedMemoryStore(str(tmp_path / "curated.db"))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        yield base
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_api_service_routes_get_memory(_api_server_curated):
+    import urllib.parse
+
+    qs = urllib.parse.urlencode({"target": "memory", "context": "{}"})
+    status = _http_get(f"{_api_server_curated}/memory?{qs}")
+    assert status == 200
+
+
+def test_api_service_routes_post_memory(_api_server_curated):
+    body = json.dumps({"context": {}, "target": "memory", "content": "test routing", "action": "add"}).encode()
+    status = _http_post(f"{_api_server_curated}/memory", body)
+    assert status == 200
+
+
+@pytest.mark.parametrize("alias", ["/memory;scope-leak", "/memory;"])
+def test_api_service_rejects_path_parameter_alias_for_memory(_api_server_curated, alias):
+    """Exact /memory routing must reject urlparse path-parameter aliases."""
+    import urllib.parse
+
+    qs = urllib.parse.urlencode({"target": "memory", "context": "{}"})
+    status = _http_get(f"{_api_server_curated}{alias}?{qs}")
+    assert status == 404
+
+
+def test_api_service_memory_does_not_route_memory_records(_api_server_curated):
+    """GET /memory must not shadow GET /memory/records/search."""
+    import urllib.parse
+
+    qs = urllib.parse.urlencode({"context": json.dumps(_CONTEXT), "query": "x"})
+    status = _http_get(f"{_api_server_curated}/memory/records/search?{qs}")
+    assert status == 200
+
+
+@pytest.mark.parametrize("service_name", ["worker", "scheduler", "local-secrets"])
+def test_non_api_services_return_404_for_get_memory(service_name):
+    server, thread = _make_non_api_server(service_name)
+    base = f"http://127.0.0.1:{server.server_port}"
+    import urllib.parse
+
+    try:
+        qs = urllib.parse.urlencode({"target": "memory", "context": "{}"})
+        status = _http_get(f"{base}/memory?{qs}")
+        assert status == 404, f"{service_name} should return 404 for GET /memory"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+@pytest.mark.parametrize("service_name", ["worker", "scheduler", "local-secrets"])
+def test_non_api_services_return_404_for_post_memory(service_name):
+    server, thread = _make_non_api_server(service_name)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({"context": {}, "content": "x"}).encode()
+        status = _http_post(f"{base}/memory", body)
+        assert status == 404, f"{service_name} should return 404 for POST /memory"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_make_curated_memory_backend_fails_closed_when_unconfigured():
+    with pytest.raises(ValueError, match="AGENTOPS_CURATED_MEMORY_DB_PATH"):
+        compose_services._make_curated_memory_backend({})
+
+
+def test_make_curated_memory_backend_fails_closed_on_blank_path():
+    with pytest.raises(ValueError):
+        compose_services._make_curated_memory_backend({"AGENTOPS_CURATED_MEMORY_DB_PATH": "   "})
+
+
+def test_make_curated_memory_backend_creates_store(tmp_path):
+    from agentops_runtime.curated_memory_api import SQLiteCuratedMemoryStore
+
+    db_path = str(tmp_path / "curated.db")
+    backend = compose_services._make_curated_memory_backend({"AGENTOPS_CURATED_MEMORY_DB_PATH": db_path})
+    assert isinstance(backend, SQLiteCuratedMemoryStore)
+
+
+def test_make_curated_memory_backend_rejects_in_memory_path():
+    with pytest.raises(ValueError):
+        compose_services._make_curated_memory_backend({"AGENTOPS_CURATED_MEMORY_DB_PATH": ":memory:"})
+
+
+def test_make_curated_memory_backend_rejects_relative_path():
+    with pytest.raises(ValueError):
+        compose_services._make_curated_memory_backend({"AGENTOPS_CURATED_MEMORY_DB_PATH": "relative/path.db"})
+
+
+def test_get_or_create_curated_memory_backend_fails_closed_when_unconfigured(monkeypatch):
+    monkeypatch.setattr(compose_services, "_curated_memory_backend_instance", None)
+    monkeypatch.setattr(compose_services.os, "environ", {})
+    with pytest.raises(ValueError, match="AGENTOPS_CURATED_MEMORY_DB_PATH"):
+        compose_services._get_or_create_curated_memory_backend()
+
+
+def test_curated_memory_log_message_redacts_query_values():
+    rendered = compose_services._sanitize_log_message(
+        '"GET /memory?target=memory&context=%7B%22user_id%22%3A%22LEAKSENTINEL%22%7D HTTP/1.1" 200 -'
+    )
+    assert "LEAKSENTINEL" not in rendered
+    assert "/memory" in rendered
+    assert "?<redacted>" in rendered
+
+
+def test_curated_memory_log_does_not_affect_memory_records_redaction():
+    rendered = compose_services._sanitize_log_message(
+        '"GET /memory/records/search?context=%7B%7D&query=RECORDSENTINEL HTTP/1.1" 200 -'
+    )
+    assert "RECORDSENTINEL" not in rendered
+    assert "/memory/records/search" in rendered
+    assert "<redacted>" in rendered

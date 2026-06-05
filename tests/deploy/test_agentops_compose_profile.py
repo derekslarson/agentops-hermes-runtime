@@ -237,3 +237,28 @@ def test_compose_declares_secrets_volume():
     compose = _compose()
     assert "volumes" in compose
     assert "agentops-secrets" in compose["volumes"]
+
+
+# ---------------------------------------------------------------------------
+# M12B: Curated memory volume and env (api service)
+# ---------------------------------------------------------------------------
+
+
+def test_api_service_has_curated_memory_db_path_env():
+    services = _compose()["services"]
+    api_env = "\n".join(services["api"]["environment"])
+    assert "AGENTOPS_CURATED_MEMORY_DB_PATH=/var/lib/agentops/curated-memory/curated.db" in api_env
+
+
+def test_api_service_mounts_curated_memory_volume():
+    services = _compose()["services"]
+    api = services["api"]
+    assert "volumes" in api
+    volume_strings = [str(v) for v in api["volumes"]]
+    assert any("/var/lib/agentops/curated-memory" in v for v in volume_strings)
+
+
+def test_compose_declares_curated_memory_volume():
+    compose = _compose()
+    assert "volumes" in compose
+    assert "agentops-curated-memory" in compose["volumes"]
