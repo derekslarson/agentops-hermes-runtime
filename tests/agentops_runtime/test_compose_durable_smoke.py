@@ -46,6 +46,17 @@ def _stop_server(server: compose_services._Server, thread: threading.Thread) -> 
     server.server_close()
 
 
+def _close_backend_resources(server: compose_services._Server) -> None:
+    """Close SQLite connections held by injected test backends between fixture uses."""
+    for value in vars(server).values():
+        conn = getattr(value, "_conn", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 # ---------------------------------------------------------------------------
 # fixtures: two real SQLite-backed servers (api + local-secrets)
 # ---------------------------------------------------------------------------
@@ -56,6 +67,7 @@ def _two_servers(tmp_path):
     from agentops_runtime.compose_services import (
         _make_artifact_backend,
         _make_conversation_router_backend,
+        _make_cron_backend,
         _make_curated_memory_backend,
         _make_memory_backend,
         _make_queue_backend,
@@ -74,6 +86,7 @@ def _two_servers(tmp_path):
     deep_mem_db = str(tmp_path / "deep_memory.db")
     artifact_root = str(tmp_path / "artifacts")
     skill_db = str(tmp_path / "skills.db")
+    cron_db = str(tmp_path / "cron.db")
 
     api_server, api_thread, api_base = _start_server(
         "api",
@@ -85,6 +98,7 @@ def _two_servers(tmp_path):
         memory_backend=_make_memory_backend({"AGENTOPS_DEEP_MEMORY_DB_URL": "sqlite:///" + deep_mem_db}),
         artifact_backend=_make_artifact_backend({"AGENTOPS_ARTIFACT_ROOT": artifact_root}),
         skill_backend=_make_skill_backend({"AGENTOPS_SKILL_DB_PATH": skill_db}),
+        cron_backend=_make_cron_backend({"AGENTOPS_CRON_DB_PATH": cron_db}),
     )
     secret_server, secret_thread, secret_base = _start_server(
         "local-secrets",
@@ -98,6 +112,8 @@ def _two_servers(tmp_path):
     try:
         yield environ
     finally:
+        _close_backend_resources(api_server)
+        _close_backend_resources(secret_server)
         _stop_server(api_server, api_thread)
         _stop_server(secret_server, secret_thread)
 
@@ -327,6 +343,7 @@ def test_run_durable_smoke_none_environ_threads_process_env_to_scale_step(monkey
         "_step_native_state_continuity",
         "_step_artifact_roundtrip",
         "_step_skill_roundtrip",
+        "_step_scheduler_claim_once",
     ):
         monkeypatch.setattr(
             compose_durable_smoke,
@@ -1166,3 +1183,377 @@ def test_skill_roundtrip_fails_when_tenant_b_can_see_skill():
     step = _step_skill_roundtrip(FakeRegistry())
     assert step["ok"] is False
     assert step["tenant_b_isolated"] is False
+
+
+# ---------------------------------------------------------------------------
+# scheduler_claim_once step
+# ---------------------------------------------------------------------------
+
+
+def test_scheduler_claim_once_step_in_steps_list(_two_servers):
+    result = run_durable_smoke(environ=_two_servers)
+    names = {s["step"] for s in result["steps"]}
+    assert "scheduler_claim_once" in names
+
+
+def test_scheduler_claim_once_step_passes(_two_servers):
+    result = run_durable_smoke(environ=_two_servers)
+    step = next(s for s in result["steps"] if s["step"] == "scheduler_claim_once")
+    assert step["ok"] is True
+
+
+def test_scheduler_claim_once_reports_booleans(_two_servers):
+    result = run_durable_smoke(environ=_two_servers)
+    step = next(s for s in result["steps"] if s["step"] == "scheduler_claim_once")
+    assert step.get("claimed_once") is True
+    assert step.get("watchdog_claimed") is True
+    assert step.get("no_extra_claims") is True
+    assert step.get("completion_recorded") is True
+    assert step.get("history_recorded") is True
+    assert step.get("tenant_b_isolated") is True
+
+
+def test_scheduler_claim_once_report_contains_no_cron_sentinels(_two_servers):
+    result = run_durable_smoke(environ=_two_servers)
+    text = json.dumps(result)
+    for sentinel in (
+        "smoke-cron-builder",
+        "smoke-cron-watchdog",
+        "smoke-cron-sched",
+        "*/5 * * * *",
+        "9999999999",
+        "10000000000",
+    ):
+        assert sentinel not in text, f"cron sentinel {sentinel!r} leaked into report"
+
+
+def test_scheduler_claim_once_fails_when_watchdog_starved():
+    from agentops_runtime.compose_durable_smoke import _step_scheduler_claim_once
+
+    claim_calls: list[str] = []
+
+    class FakeCronA:
+        _created = 0
+
+        def create(self, ctx, job):
+            self.__class__._created += 1
+            return f"fake-job-{self.__class__._created}"
+
+        def claim_due(self, ctx, *, owner, now, lease_seconds=60.0, draining=False, limit=None):
+            claim_calls.append(owner)
+            if len(claim_calls) == 1:
+                return [{"id": "fake-builder"}]
+            return []
+
+        def complete_run(self, ctx, job_id, *, owner, **kwargs):
+            return {"status": "success"}
+
+        def run_history(self, ctx, job_id):
+            return [{"status": "success"}]
+
+        def remove(self, ctx, job_id):
+            pass
+
+    class FakeCronB:
+        def claim_due(self, ctx, *, owner, now, lease_seconds=60.0, draining=False, limit=None):
+            return []
+
+        def run_history(self, ctx, job_id):
+            return []
+
+    class FakeRegistry:
+        def get(self, cap, ctx):
+            if cap.value != "cron":
+                raise AssertionError(cap)
+            if "smoke-tenant-b" in ctx.org_id:
+                return FakeCronB()
+            return FakeCronA()
+
+    step = _step_scheduler_claim_once(FakeRegistry())
+    assert step["ok"] is False
+    assert step["watchdog_claimed"] is False
+
+
+def test_scheduler_claim_once_fails_when_history_not_recorded():
+    from agentops_runtime.compose_durable_smoke import _step_scheduler_claim_once
+
+    claim_calls: list[int] = []
+
+    class FakeCronA:
+        _created = 0
+
+        def create(self, ctx, job):
+            self.__class__._created += 1
+            return f"fake-job-{self.__class__._created}"
+
+        def claim_due(self, ctx, *, owner, now, lease_seconds=60.0, draining=False, limit=None):
+            call_n = len(claim_calls) + 1
+            claim_calls.append(call_n)
+            if call_n == 1:
+                return [{"id": "fake-builder"}]
+            if call_n == 2:
+                return [{"id": "fake-watchdog"}]
+            return []
+
+        def complete_run(self, ctx, job_id, *, owner, **kwargs):
+            return {"status": "success"}
+
+        def run_history(self, ctx, job_id):
+            return []
+
+        def remove(self, ctx, job_id):
+            pass
+
+    class FakeCronB:
+        def claim_due(self, ctx, *, owner, now, lease_seconds=60.0, draining=False, limit=None):
+            return []
+
+        def run_history(self, ctx, job_id):
+            return []
+
+    class FakeRegistry:
+        def get(self, cap, ctx):
+            if cap.value != "cron":
+                raise AssertionError(cap)
+            if "smoke-tenant-b" in ctx.org_id:
+                return FakeCronB()
+            return FakeCronA()
+
+    step = _step_scheduler_claim_once(FakeRegistry())
+    assert step["ok"] is False
+    assert step["history_recorded"] is False
+
+
+def test_scheduler_claim_once_fails_when_complete_run_raises_even_if_history_exists():
+    from agentops_runtime.compose_durable_smoke import _step_scheduler_claim_once
+
+    claim_calls: list[int] = []
+
+    class FakeCronA:
+        _created = 0
+
+        def create(self, ctx, job):
+            self.__class__._created += 1
+            return f"fake-job-{self.__class__._created}"
+
+        def claim_due(self, ctx, *, owner, now, lease_seconds=60.0, draining=False, limit=None):
+            call_n = len(claim_calls) + 1
+            claim_calls.append(call_n)
+            if call_n == 1:
+                return [{"id": "fake-job-1"}]
+            if call_n == 2:
+                return [{"id": "fake-job-2"}]
+            return []
+
+        def complete_run(self, ctx, job_id, *, owner, **kwargs):
+            raise RuntimeError("completion failed")
+
+        def run_history(self, ctx, job_id):
+            return [{"status": "stale-success"}]
+
+        def remove(self, ctx, job_id):
+            pass
+
+    class FakeCronB:
+        def claim_due(self, ctx, *, owner, now, lease_seconds=60.0, draining=False, limit=None):
+            return []
+
+        def run_history(self, ctx, job_id):
+            return []
+
+    class FakeRegistry:
+        def get(self, cap, ctx):
+            if cap.value != "cron":
+                raise AssertionError(cap)
+            if "smoke-tenant-b" in ctx.org_id:
+                return FakeCronB()
+            return FakeCronA()
+
+    step = _step_scheduler_claim_once(FakeRegistry())
+    assert step["ok"] is False
+    assert step["completion_recorded"] is False
+
+
+def test_scheduler_claim_once_fails_when_tenant_b_can_claim_tenant_a_due_job():
+    from agentops_runtime.compose_durable_smoke import _step_scheduler_claim_once
+
+    tenant_a_claim_calls: list[int] = []
+
+    class FakeCronA:
+        _created = 0
+
+        def create(self, ctx, job):
+            self.__class__._created += 1
+            return f"fake-job-{self.__class__._created}"
+
+        def claim_due(self, ctx, *, owner, now, lease_seconds=60.0, draining=False, limit=None):
+            call_n = len(tenant_a_claim_calls) + 1
+            tenant_a_claim_calls.append(call_n)
+            if call_n == 1:
+                return [{"id": "fake-job-1"}]
+            if call_n == 2:
+                return [{"id": "fake-job-2"}]
+            return []
+
+        def complete_run(self, ctx, job_id, *, owner, **kwargs):
+            return {"status": "success"}
+
+        def run_history(self, ctx, job_id):
+            return [{"status": "success"}]
+
+        def remove(self, ctx, job_id):
+            pass
+
+    class FakeCronB:
+        def claim_due(self, ctx, *, owner, now, lease_seconds=60.0, draining=False, limit=None):
+            # Simulate a backend that ignores tenant scope for still-due jobs.
+            # The smoke must check tenant B before tenant A consumes all due work.
+            if not tenant_a_claim_calls:
+                return [{"id": "fake-job-1"}]
+            return []
+
+        def run_history(self, ctx, job_id):
+            return []
+
+    class FakeRegistry:
+        def get(self, cap, ctx):
+            if cap.value != "cron":
+                raise AssertionError(cap)
+            if "smoke-tenant-b" in ctx.org_id:
+                return FakeCronB()
+            return FakeCronA()
+
+    step = _step_scheduler_claim_once(FakeRegistry())
+    assert step["ok"] is False
+    assert step["tenant_b_isolated"] is False
+
+
+def test_scheduler_claim_once_fails_when_tenant_b_can_see_history():
+    from agentops_runtime.compose_durable_smoke import _step_scheduler_claim_once
+
+    claim_calls: list[int] = []
+
+    class FakeCronA:
+        _created = 0
+
+        def create(self, ctx, job):
+            self.__class__._created += 1
+            return f"fake-job-{self.__class__._created}"
+
+        def claim_due(self, ctx, *, owner, now, lease_seconds=60.0, draining=False, limit=None):
+            call_n = len(claim_calls) + 1
+            claim_calls.append(call_n)
+            if call_n == 1:
+                return [{"id": "fake-builder"}]
+            if call_n == 2:
+                return [{"id": "fake-watchdog"}]
+            return []
+
+        def complete_run(self, ctx, job_id, *, owner, **kwargs):
+            return {"status": "success"}
+
+        def run_history(self, ctx, job_id):
+            return [{"status": "success"}]
+
+        def remove(self, ctx, job_id):
+            pass
+
+    class FakeCronB:
+        def claim_due(self, ctx, *, owner, now, lease_seconds=60.0, draining=False, limit=None):
+            return []
+
+        def run_history(self, ctx, job_id):
+            return [{"status": "b-leaked"}]
+
+    class FakeRegistry:
+        def get(self, cap, ctx):
+            if cap.value != "cron":
+                raise AssertionError(cap)
+            if "smoke-tenant-b" in ctx.org_id:
+                return FakeCronB()
+            return FakeCronA()
+
+    step = _step_scheduler_claim_once(FakeRegistry())
+    assert step["ok"] is False
+    assert step["tenant_b_isolated"] is False
+
+
+def test_scheduler_claim_once_fails_when_duplicate_claim_allowed():
+    from agentops_runtime.compose_durable_smoke import _step_scheduler_claim_once
+
+    class FakeCronA:
+        _created = 0
+
+        def create(self, ctx, job):
+            self.__class__._created += 1
+            return f"fake-job-{self.__class__._created}"
+
+        def claim_due(self, ctx, *, owner, now, lease_seconds=60.0, draining=False, limit=None):
+            return [{"id": "fake-builder"}]
+
+        def complete_run(self, ctx, job_id, *, owner, **kwargs):
+            return {"status": "success"}
+
+        def run_history(self, ctx, job_id):
+            return [{"status": "success"}]
+
+        def remove(self, ctx, job_id):
+            pass
+
+    class FakeCronB:
+        def claim_due(self, ctx, *, owner, now, lease_seconds=60.0, draining=False, limit=None):
+            return []
+
+        def run_history(self, ctx, job_id):
+            return []
+
+    class FakeRegistry:
+        def get(self, cap, ctx):
+            if cap.value != "cron":
+                raise AssertionError(cap)
+            if "smoke-tenant-b" in ctx.org_id:
+                return FakeCronB()
+            return FakeCronA()
+
+    step = _step_scheduler_claim_once(FakeRegistry())
+    assert step["ok"] is False
+    assert step["watchdog_claimed"] is False
+    assert step["no_extra_claims"] is False
+
+
+def test_scheduler_claim_once_cleans_up_created_jobs_on_failure():
+    from agentops_runtime.compose_durable_smoke import _step_scheduler_claim_once
+
+    removed: list[str] = []
+
+    class FakeCronA:
+        _created = 0
+
+        def create(self, ctx, job):
+            self.__class__._created += 1
+            return f"fake-job-{self.__class__._created}"
+
+        def claim_due(self, ctx, *, owner, now, lease_seconds=60.0, draining=False, limit=None):
+            raise RuntimeError("forced failure after durable create")
+
+        def remove(self, ctx, job_id):
+            removed.append(job_id)
+
+    class FakeCronB:
+        def claim_due(self, ctx, *, owner, now, lease_seconds=60.0, draining=False, limit=None):
+            return []
+
+    class FakeRegistry:
+        def get(self, cap, ctx):
+            if cap.value != "cron":
+                raise AssertionError(cap)
+            if "smoke-tenant-b" in ctx.org_id:
+                return FakeCronB()
+            return FakeCronA()
+
+    try:
+        _step_scheduler_claim_once(FakeRegistry())
+    except RuntimeError:
+        pass
+
+    assert removed == ["fake-job-1"]

@@ -1,10 +1,10 @@
-"""M12B compose durable smoke — exercises WORKER_REGISTRY, QUEUE, CONVERSATION_ROUTER, SECRET, MEMORY, SESSION, DEEP_MEMORY, ARTIFACT, SKILL via HTTP adapters.
+"""M12B compose durable smoke — exercises WORKER_REGISTRY, QUEUE, CONVERSATION_ROUTER, SECRET, MEMORY, SESSION, DEEP_MEMORY, ARTIFACT, SKILL, and CRON via HTTP adapters.
 
 Run against a live Compose stack (or a test harness with in-process SQLite servers)::
 
     python -m agentops_runtime.compose_durable_smoke
 
-The module probes eight durable-backend slices:
+The module probes durable-backend slices:
 - ``worker_fleet``           register/list two workers via WorkerRegistry
 - ``queue_tenant_isolation`` tenant A enqueue/claim/ack; tenant B cannot claim tenant A's item
 - ``conversation_routing``   resolve-conversation idempotency, route_turn, find_active_run
@@ -15,6 +15,8 @@ The module probes eight durable-backend slices:
                                + LocalFileArtifactBackend; tenant B cannot get or list tenant A's ref
 - ``skill_roundtrip``        project-scope skill create (approval gate), peer visibility, and
                                tenant B isolation via HttpSkillBackend + SQLiteScopedSkillStore
+- ``scheduler_claim_once``   cron claim-once, watchdog fairness, run history, and tenant isolation
+                               via HttpCronBackend + SQLiteCronBackend
 - ``worker_fleet_scale``     optional live scaled-worker proof when AGENTOPS_SMOKE_EXPECTED_WORKERS
                                is set by the Compose smoke script
 
@@ -55,6 +57,17 @@ _SKILL_NAME = "smoke-skill-roundtrip"
 _SKILL_CONTENT = "smoke-skill-content-sentinel"
 _SKILL_DESCRIPTION = "smoke-skill-description-sentinel"
 _SKILL_CATEGORY = "smoke-skill-category-sentinel"
+
+# Scheduler claim-once scope labels — never leaked to the report.
+_CRON_BUILDER_JOB_NAME = "smoke-cron-builder"
+_CRON_WATCHDOG_JOB_NAME = "smoke-cron-watchdog"
+_CRON_SCHEDULER_OWNER_1 = "smoke-cron-sched-1"
+_CRON_SCHEDULER_OWNER_2 = "smoke-cron-sched-2"
+_CRON_SCHEDULER_OWNER_3 = "smoke-cron-sched-3"
+_CRON_SCHEDULER_OWNER_B = "smoke-cron-sched-b"
+# Far-future deterministic timestamps; wall-clock schedulers cannot race these.
+_CRON_FUTURE_TS = 9_999_999_999.0
+_CRON_CLAIM_NOW = _CRON_FUTURE_TS + 1.0
 
 # Reserved fleet/infrastructure scope — never collides with tenant scopes.
 _FLEET_ORG_ID = "__fleet__"
@@ -507,6 +520,118 @@ def _step_skill_roundtrip(registry: RuntimeBackendRegistry) -> dict[str, Any]:
     }
 
 
+def _step_scheduler_claim_once(registry: RuntimeBackendRegistry) -> dict[str, Any]:
+    """Prove native cron claim/lease/history end-to-end with two-tenant isolation.
+
+    Creates two due jobs for tenant A, proves fair claim-once semantics across two
+    scheduler owners, completes one job and verifies durable run history, then
+    proves tenant B is isolated from both claims and history reads.
+    """
+    ctx_a = _ctx(_SCOPE_A)
+    ctx_b = _ctx(_SCOPE_B)
+    cron_a = registry.get(BackendCapability.CRON, ctx_a)
+    cron_b = registry.get(BackendCapability.CRON, ctx_b)
+    created_job_ids: list[str] = []
+
+    def _claimed_id(claim: Any) -> str:
+        if not isinstance(claim, dict):
+            return ""
+        return str(claim.get("id") or claim.get("job_id") or "")
+
+    try:
+        builder_id = cron_a.create(ctx_a, {
+            "name": _CRON_BUILDER_JOB_NAME,
+            "schedule": "*/5 * * * *",
+            "prompt": _CRON_BUILDER_JOB_NAME,
+            "next_run_at": _CRON_FUTURE_TS,
+        })
+        created_job_ids.append(str(builder_id))
+
+        b_pre_claims = cron_b.claim_due(
+            ctx_b, owner=_CRON_SCHEDULER_OWNER_B, now=_CRON_CLAIM_NOW, limit=1
+        )
+        tenant_b_claim_isolated = len(b_pre_claims) == 0
+
+        owner1_claims = cron_a.claim_due(
+            ctx_a, owner=_CRON_SCHEDULER_OWNER_1, now=_CRON_CLAIM_NOW, limit=1
+        )
+        claimed_job_id = _claimed_id(owner1_claims[0]) if owner1_claims else ""
+        claimed_once = len(owner1_claims) == 1 and claimed_job_id == str(builder_id)
+
+        # Create the unrelated due watchdog after the builder lease is held so
+        # the smoke proves owner 2 cannot reclaim the builder while still being
+        # able to claim a different due job, without depending on backend order.
+        watchdog_id = cron_a.create(ctx_a, {
+            "name": _CRON_WATCHDOG_JOB_NAME,
+            "schedule": "*/5 * * * *",
+            "prompt": _CRON_WATCHDOG_JOB_NAME,
+            "next_run_at": _CRON_FUTURE_TS,
+        })
+        created_job_ids.append(str(watchdog_id))
+
+        owner2_claims = cron_a.claim_due(
+            ctx_a, owner=_CRON_SCHEDULER_OWNER_2, now=_CRON_CLAIM_NOW, limit=1
+        )
+        owner2_job_id = _claimed_id(owner2_claims[0]) if owner2_claims else ""
+        watchdog_claimed = (
+            len(owner2_claims) == 1
+            and owner2_job_id == str(watchdog_id)
+            and owner2_job_id != claimed_job_id
+        )
+
+        third_claims = cron_a.claim_due(
+            ctx_a, owner=_CRON_SCHEDULER_OWNER_3, now=_CRON_CLAIM_NOW
+        )
+        no_extra_claims = len(third_claims) == 0
+
+        history_recorded = False
+        completion_recorded = False
+        b_history: list[Any] = []
+        if claimed_job_id:
+            try:
+                cron_a.complete_run(
+                    ctx_a,
+                    claimed_job_id,
+                    owner=_CRON_SCHEDULER_OWNER_1,
+                    now=_CRON_CLAIM_NOW + 1.0,
+                    next_run_at=_CRON_CLAIM_NOW + 3600.0,
+                )
+                completion_recorded = True
+            except Exception:
+                pass
+            history_a = cron_a.run_history(ctx_a, claimed_job_id)
+            history_recorded = len(history_a) > 0
+            b_history = cron_b.run_history(ctx_b, claimed_job_id)
+
+        b_claims = cron_b.claim_due(ctx_b, owner=_CRON_SCHEDULER_OWNER_B, now=_CRON_CLAIM_NOW)
+        tenant_b_isolated = tenant_b_claim_isolated and len(b_claims) == 0 and len(b_history) == 0
+
+        ok = (
+            claimed_once
+            and watchdog_claimed
+            and no_extra_claims
+            and completion_recorded
+            and history_recorded
+            and tenant_b_isolated
+        )
+        return {
+            "step": "scheduler_claim_once",
+            "ok": ok,
+            "claimed_once": claimed_once,
+            "watchdog_claimed": watchdog_claimed,
+            "no_extra_claims": no_extra_claims,
+            "completion_recorded": completion_recorded,
+            "history_recorded": history_recorded,
+            "tenant_b_isolated": tenant_b_isolated,
+        }
+    finally:
+        for jid in created_job_ids:
+            try:
+                cron_a.remove(ctx_a, jid)
+            except Exception:
+                pass
+
+
 def run_durable_smoke(*, environ: dict[str, str] | None = None) -> dict[str, Any]:
     """Run all durable smoke steps and return a sanitized, JSON-safe report dict."""
     try:
@@ -532,6 +657,7 @@ def run_durable_smoke(*, environ: dict[str, str] | None = None) -> dict[str, Any
         _step_native_state_continuity,
         _step_artifact_roundtrip,
         _step_skill_roundtrip,
+        _step_scheduler_claim_once,
         _scale_step,
     ):
         try:
