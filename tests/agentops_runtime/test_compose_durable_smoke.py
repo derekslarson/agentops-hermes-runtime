@@ -68,6 +68,7 @@ def _two_servers(tmp_path):
         _make_audit_backend,
         _make_artifact_backend,
         _make_conversation_router_backend,
+        _make_credential_resolver,
         _make_cron_backend,
         _make_curated_memory_backend,
         _make_delivery_backend,
@@ -106,6 +107,7 @@ def _two_servers(tmp_path):
         skill_backend=_make_skill_backend({"AGENTOPS_SKILL_DB_PATH": skill_db}),
         cron_backend=_make_cron_backend({"AGENTOPS_CRON_DB_PATH": cron_db}),
         delivery_backend=delivery_backend,
+        credential_backend=_make_credential_resolver({}),
     )
     secret_server, secret_thread, secret_base = _start_server(
         "local-secrets",
@@ -151,7 +153,14 @@ def test_run_durable_smoke_all_steps_pass(_two_servers):
 def test_run_durable_smoke_step_names_present(_two_servers):
     result = run_durable_smoke(environ=_two_servers)
     names = {s["step"] for s in result["steps"]}
-    assert {"worker_fleet", "queue_tenant_isolation", "conversation_routing", "secret_roundtrip"}.issubset(names)
+    expected_steps = {
+        "worker_fleet",
+        "queue_tenant_isolation",
+        "conversation_routing",
+        "secret_roundtrip",
+        "credential_resolution",
+    }
+    assert expected_steps.issubset(names)
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +357,7 @@ def test_run_durable_smoke_none_environ_threads_process_env_to_scale_step(monkey
         "_step_queue_tenant_isolation",
         "_step_conversation_routing",
         "_step_secret_roundtrip",
+        "_step_credential_resolution",
         "_step_native_state_continuity",
         "_step_artifact_roundtrip",
         "_step_audit_roundtrip",
@@ -1815,3 +1825,275 @@ def test_platform_restart_resume_step_is_repeat_safe_with_same_durable_backends(
     assert second_step["ok"] is True
     assert second_step.get("routing_ok") is True
     assert second_step.get("session_resumed") is True
+
+
+# ---------------------------------------------------------------------------
+# credential_resolution step
+# ---------------------------------------------------------------------------
+
+
+def test_credential_resolution_step_reports_booleans_and_excludes_sentinels():
+    from agentops_runtime.compose_durable_smoke import _step_credential_resolution
+    import hashlib
+
+    stores: dict[str, dict[str, str]] = {}
+
+    class FakeResolverTenantScoped:
+        def resolve(self, context, ref):
+            if context is None:
+                return None
+            digest = hashlib.sha256((context.org_id + ref).encode()).hexdigest()
+            return f"cred-{digest[:32]}"
+
+    class FakeSecretStore:
+        def put_secret(self, ctx, ref, value):
+            stores.setdefault(ctx.org_id, {})[ref] = value
+
+        def get_secret(self, ctx, ref):
+            return stores.setdefault(ctx.org_id, {}).get(ref)
+
+    class FakeRegistry:
+        def get(self, cap, ctx):
+            if cap.value == "credential":
+                return FakeResolverTenantScoped()
+            if cap.value == "secret":
+                return FakeSecretStore()
+            raise AssertionError(cap)
+
+    step = _step_credential_resolution(FakeRegistry())
+    assert step["ok"] is True
+    assert step.get("resolve_ok") is True
+    assert step.get("run_invariant_ok") is True
+    assert step.get("null_fail_closed") is True
+    assert step.get("tenant_b_distinct") is True
+    assert step.get("composition_ok") is True
+    assert step.get("secret_run_invariant_ok") is True
+    assert step.get("secret_isolated") is True
+    assert step.get("synthetic") is True
+
+    text = json.dumps(step)
+    for sentinel in (
+        "smoke-credential-ref",
+        "smoke-credential-secret-sentinel",
+    ):
+        assert sentinel not in text, f"credential sentinel {sentinel!r} leaked into report"
+    # Check no resolved cred-... secret ref appears in the JSON values.
+    import re
+
+    assert not re.search(r'"cred-[0-9a-f]{32}"', text), "resolved credential ref leaked into report"
+
+
+# ---------------------------------------------------------------------------
+# credential_resolution: fake registry fail-open regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_credential_resolution_fails_when_resolver_ignores_tenant_scope():
+    """Resolver that returns the same secret_ref for all tenants must cause tenant_b_distinct=False."""
+    from agentops_runtime.compose_durable_smoke import _step_credential_resolution
+
+    stores: dict[str, dict] = {}
+
+    class FakeResolverUnscoped:
+        def resolve(self, context, ref):
+            if context is None:
+                return None
+            return "cred-fixed-for-all-tenants-0000000000"
+
+    class FakeSecretStore:
+        def __init__(self, scope):
+            self._data = stores.setdefault(scope, {})
+
+        def put_secret(self, ctx, ref, value):
+            self._data[ref] = value
+
+        def get_secret(self, ctx, ref):
+            return self._data.get(ref)
+
+    class FakeRegistry:
+        def get(self, cap, ctx):
+            if cap.value == "credential":
+                return FakeResolverUnscoped()
+            if cap.value == "secret":
+                return FakeSecretStore(ctx.org_id)
+            raise AssertionError(cap)
+
+    step = _step_credential_resolution(FakeRegistry())
+    assert step["ok"] is False
+    assert step["tenant_b_distinct"] is False
+
+
+def test_credential_resolution_fails_when_tenant_b_resolves_empty_ref():
+    """Tenant B must resolve a usable non-empty distinct binding, not an empty ref."""
+    from agentops_runtime.compose_durable_smoke import _step_credential_resolution
+
+    stores: dict[str, dict] = {}
+
+    class FakeResolverTenantBEmpty:
+        def resolve(self, context, ref):
+            if context is None:
+                return None
+            if context.org_id == "org-smoke-tenant-b":
+                return ""
+            return "cred-tenant-a-000000000000000000000"
+
+    class FakeSecretStore:
+        def __init__(self, scope):
+            self._data = stores.setdefault(scope, {})
+
+        def put_secret(self, ctx, ref, value):
+            self._data[ref] = value
+
+        def get_secret(self, ctx, ref):
+            return self._data.get(ref)
+
+    class FakeRegistry:
+        def get(self, cap, ctx):
+            if cap.value == "credential":
+                return FakeResolverTenantBEmpty()
+            if cap.value == "secret":
+                return FakeSecretStore(ctx.org_id)
+            raise AssertionError(cap)
+
+    step = _step_credential_resolution(FakeRegistry())
+    assert step["ok"] is False
+    assert step["tenant_b_distinct"] is False
+
+
+def test_credential_resolution_fails_when_secret_store_leaks_cross_tenant():
+    """Secret store that ignores tenant scope allows B to read A's secret, causing secret_isolated=False."""
+    from agentops_runtime.compose_durable_smoke import _step_credential_resolution
+    import hashlib
+
+    shared_store: dict[str, str] = {}
+
+    class FakeResolverTenantScoped:
+        def resolve(self, context, ref):
+            if context is None:
+                return None
+            digest = hashlib.sha256((context.org_id + ref).encode()).hexdigest()
+            return f"cred-{digest[:32]}"
+
+    class FakeSecretStoreLeak:
+        def put_secret(self, ctx, ref, value):
+            shared_store[ref] = value
+
+        def get_secret(self, ctx, ref):
+            return shared_store.get(ref)
+
+    class FakeRegistry:
+        def get(self, cap, ctx):
+            if cap.value == "credential":
+                return FakeResolverTenantScoped()
+            if cap.value == "secret":
+                return FakeSecretStoreLeak()
+            raise AssertionError(cap)
+
+    step = _step_credential_resolution(FakeRegistry())
+    assert step["ok"] is False
+    assert step["secret_isolated"] is False
+
+
+def test_credential_resolution_fails_when_secret_store_includes_run_id():
+    """Resolved ref must remain usable through SECRET across same-tenant run/conversation changes."""
+    from agentops_runtime.compose_durable_smoke import _step_credential_resolution
+    import hashlib
+
+    stores: dict[tuple[str, str], dict] = {}
+
+    class FakeResolverTenantScoped:
+        def resolve(self, context, ref):
+            if context is None:
+                return None
+            digest = hashlib.sha256((context.org_id + ref).encode()).hexdigest()
+            return f"cred-{digest[:32]}"
+
+    class FakeSecretStoreRunScoped:
+        def put_secret(self, ctx, ref, value):
+            stores.setdefault((ctx.org_id, ctx.run_id), {})[ref] = value
+
+        def get_secret(self, ctx, ref):
+            return stores.setdefault((ctx.org_id, ctx.run_id), {}).get(ref)
+
+    class FakeRegistry:
+        def get(self, cap, ctx):
+            if cap.value == "credential":
+                return FakeResolverTenantScoped()
+            if cap.value == "secret":
+                return FakeSecretStoreRunScoped()
+            raise AssertionError(cap)
+
+    step = _step_credential_resolution(FakeRegistry())
+    assert step["ok"] is False
+    assert step["secret_run_invariant_ok"] is False
+
+
+def test_credential_resolution_fails_when_null_context_resolves():
+    """Resolver that returns a ref for null context must cause null_fail_closed=False."""
+    from agentops_runtime.compose_durable_smoke import _step_credential_resolution
+
+    stores: dict[str, dict] = {}
+
+    class FakeResolverNullUnsafe:
+        def resolve(self, context, ref):
+            return f"cred-{hash(ref):032x}"[:36]
+
+    class FakeSecretStore:
+        def __init__(self, scope):
+            self._data = stores.setdefault(scope, {})
+
+        def put_secret(self, ctx, ref, value):
+            self._data[ref] = value
+
+        def get_secret(self, ctx, ref):
+            return self._data.get(ref)
+
+    class FakeRegistry:
+        def get(self, cap, ctx):
+            if cap.value == "credential":
+                return FakeResolverNullUnsafe()
+            if cap.value == "secret":
+                return FakeSecretStore(ctx.org_id)
+            raise AssertionError(cap)
+
+    step = _step_credential_resolution(FakeRegistry())
+    assert step["ok"] is False
+    assert step["null_fail_closed"] is False
+
+
+def test_credential_resolution_fails_when_resolver_includes_run_id():
+    """Resolver that hashes run_id causes run_invariant_ok=False because alt-run context yields a different ref."""
+    from agentops_runtime.compose_durable_smoke import _step_credential_resolution
+    import hashlib
+
+    stores: dict[str, dict] = {}
+
+    class FakeResolverRunSensitive:
+        def resolve(self, context, ref):
+            if context is None:
+                return None
+            run_id = getattr(context, "run_id", "") or ""
+            digest = hashlib.sha256((context.org_id + run_id + ref).encode()).hexdigest()
+            return f"cred-{digest[:32]}"
+
+    class FakeSecretStore:
+        def __init__(self, scope):
+            self._data = stores.setdefault(scope, {})
+
+        def put_secret(self, ctx, ref, value):
+            self._data[ref] = value
+
+        def get_secret(self, ctx, ref):
+            return self._data.get(ref)
+
+    class FakeRegistry:
+        def get(self, cap, ctx):
+            if cap.value == "credential":
+                return FakeResolverRunSensitive()
+            if cap.value == "secret":
+                return FakeSecretStore(ctx.org_id)
+            raise AssertionError(cap)
+
+    step = _step_credential_resolution(FakeRegistry())
+    assert step["ok"] is False
+    assert step["run_invariant_ok"] is False

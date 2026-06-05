@@ -1,4 +1,4 @@
-"""M12B compose durable smoke — exercises WORKER_REGISTRY, QUEUE, CONVERSATION_ROUTER, SECRET, MEMORY, SESSION, DEEP_MEMORY, ARTIFACT, AUDIT, DELIVERY, SKILL, and CRON via HTTP adapters.
+"""M12B compose durable smoke — exercises WORKER_REGISTRY, QUEUE, CONVERSATION_ROUTER, SECRET, CREDENTIAL, MEMORY, SESSION, DEEP_MEMORY, ARTIFACT, AUDIT, DELIVERY, SKILL, and CRON via HTTP adapters.
 
 Run against a live Compose stack (or a test harness with in-process SQLite servers)::
 
@@ -9,6 +9,12 @@ The module probes durable-backend slices:
 - ``queue_tenant_isolation`` tenant A enqueue/claim/ack; tenant B cannot claim tenant A's item
 - ``conversation_routing``   resolve-conversation idempotency, route_turn, find_active_run
 - ``secret_roundtrip``       put/get sentinel; cross-tenant get is isolated
+- ``credential_resolution``  resolve a smoke credential ref through BackendCapability.CREDENTIAL;
+                               prove run-invariant binding (excludes run_id/conversation_id),
+                               null-context fail-closed, tenant-B distinct binding, and secret
+                               composition via BackendCapability.SECRET that remains readable from
+                               the same tenant under a distinct run/conversation context; synthetic because the
+                               Compose server uses a deterministic resolver placeholder
 - ``native_state_continuity`` curated memory write/read, session create/append/read, deep-memory
                                upsert/get — all three surfaces isolated between tenant A and B
 - ``artifact_roundtrip``     put/get/list a durable artifact via HttpArtifactBackend + API server
@@ -30,7 +36,8 @@ The module probes durable-backend slices:
 Only sanitized, JSON-safe data is reported: step names, booleans, and integer counts.
 No raw IDs, tenant IDs, secret values, URLs, local paths, artifact refs, artifact bytes,
 audit event payloads, delivery refs, delivery message contents, skill names, skill content,
-skill descriptions, skill categories, policy strings, or backend error text is emitted.
+skill descriptions, skill categories, policy strings, credential refs, resolved secret refs,
+or backend error text is emitted.
 """
 
 from __future__ import annotations
@@ -78,6 +85,10 @@ _SKILL_NAME = "smoke-skill-roundtrip"
 _SKILL_CONTENT = "smoke-skill-content-sentinel"
 _SKILL_DESCRIPTION = "smoke-skill-description-sentinel"
 _SKILL_CATEGORY = "smoke-skill-category-sentinel"
+
+# Credential resolution scope labels — never leaked to the report.
+_CRED_REF = "smoke-credential-ref"
+_CRED_SECRET_VALUE = "smoke-credential-secret-sentinel"
 
 # Scheduler claim-once scope labels — never leaked to the report.
 _CRON_BUILDER_JOB_NAME = "smoke-cron-builder"
@@ -335,6 +346,91 @@ def _step_secret_roundtrip(registry: RuntimeBackendRegistry) -> dict[str, Any]:
         "put_ok": put_ok,
         "get_ok": get_ok,
         "cross_tenant_isolated": cross_tenant_isolated,
+    }
+
+
+def _cred_ctx_alt(scope_label: str) -> RuntimeContext:
+    """Same tenant scope as _ctx but with a distinct run_id and conversation_id."""
+    base = _ctx(scope_label)
+    return RuntimeContext(
+        mode=base.mode,
+        org_id=base.org_id,
+        workspace_id=base.workspace_id,
+        workspace_type=base.workspace_type,
+        user_id=base.user_id,
+        conversation_id="smoke-conv-cred-alt",
+        agent_profile_id=base.agent_profile_id,
+        project_id=base.project_id,
+        permissions_ref=base.permissions_ref,
+        run_id=f"run-{scope_label}-cred-alt",
+        run_type=base.run_type,
+        backend_profile=base.backend_profile,
+        delivery_ref=base.delivery_ref,
+    )
+
+
+def _step_credential_resolution(registry: RuntimeBackendRegistry) -> dict[str, Any]:
+    """Prove BackendCapability.CREDENTIAL resolves stable opaque refs and composes with BackendCapability.SECRET.
+
+    Synthetic: the Compose server uses a deterministic resolver placeholder; live
+    provider-bootstrap parity is not claimed.
+    """
+    ctx_a = _ctx(_SCOPE_A)
+    ctx_a_alt = _cred_ctx_alt(_SCOPE_A)
+    ctx_b = _ctx(_SCOPE_B)
+
+    resolver_a = registry.get(BackendCapability.CREDENTIAL, ctx_a)
+    resolver_b = registry.get(BackendCapability.CREDENTIAL, ctx_b)
+    secret_a = registry.get(BackendCapability.SECRET, ctx_a)
+    secret_a_alt = registry.get(BackendCapability.SECRET, ctx_a_alt)
+    secret_b = registry.get(BackendCapability.SECRET, ctx_b)
+
+    secret_ref_a = resolver_a.resolve(ctx_a, _CRED_REF)
+    resolve_ok = isinstance(secret_ref_a, str) and bool(secret_ref_a)
+
+    secret_ref_a_alt = resolver_a.resolve(ctx_a_alt, _CRED_REF)
+    run_invariant_ok = resolve_ok and secret_ref_a == secret_ref_a_alt
+
+    null_result = resolver_a.resolve(None, _CRED_REF)
+    null_fail_closed = null_result is None
+
+    secret_ref_b = resolver_b.resolve(ctx_b, _CRED_REF)
+    tenant_b_distinct = isinstance(secret_ref_b, str) and bool(secret_ref_b) and secret_ref_b != secret_ref_a
+
+    composition_ok = False
+    secret_run_invariant_ok = False
+    secret_isolated = False
+    if resolve_ok:
+        secret_a.put_secret(ctx_a, secret_ref_a, _CRED_SECRET_VALUE)
+        retrieved = secret_a.get_secret(ctx_a, secret_ref_a)
+        retrieved_alt = secret_a_alt.get_secret(ctx_a_alt, secret_ref_a)
+        composition_ok = retrieved == _CRED_SECRET_VALUE
+        secret_run_invariant_ok = retrieved_alt == _CRED_SECRET_VALUE
+
+        b_via_a_ref = secret_b.get_secret(ctx_b, secret_ref_a)
+        b_via_b_ref = secret_b.get_secret(ctx_b, secret_ref_b) if isinstance(secret_ref_b, str) else None
+        secret_isolated = b_via_a_ref is None and b_via_b_ref is None
+
+    ok = (
+        resolve_ok
+        and run_invariant_ok
+        and null_fail_closed
+        and tenant_b_distinct
+        and composition_ok
+        and secret_run_invariant_ok
+        and secret_isolated
+    )
+    return {
+        "step": "credential_resolution",
+        "ok": ok,
+        "resolve_ok": resolve_ok,
+        "run_invariant_ok": run_invariant_ok,
+        "null_fail_closed": null_fail_closed,
+        "tenant_b_distinct": tenant_b_distinct,
+        "composition_ok": composition_ok,
+        "secret_run_invariant_ok": secret_run_invariant_ok,
+        "secret_isolated": secret_isolated,
+        "synthetic": True,
     }
 
 
@@ -953,6 +1049,7 @@ def run_durable_smoke(*, environ: dict[str, str] | None = None) -> dict[str, Any
         _step_queue_tenant_isolation,
         _step_conversation_routing,
         _step_secret_roundtrip,
+        _step_credential_resolution,
         _step_native_state_continuity,
         _step_artifact_roundtrip,
         _step_audit_roundtrip,
