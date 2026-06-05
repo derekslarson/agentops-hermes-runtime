@@ -352,6 +352,7 @@ def test_run_durable_smoke_none_environ_threads_process_env_to_scale_step(monkey
         "_step_artifact_roundtrip",
         "_step_audit_roundtrip",
         "_step_delivery_dispatch",
+        "_step_platform_restart_resume",
         "_step_skill_roundtrip",
         "_step_scheduler_claim_once",
     ):
@@ -1754,3 +1755,63 @@ def test_scheduler_claim_once_cleans_up_created_jobs_on_failure():
         pass
 
     assert removed == ["fake-job-1"]
+
+
+# ---------------------------------------------------------------------------
+# Platform restart/resume durable smoke step
+# ---------------------------------------------------------------------------
+
+
+def test_platform_restart_resume_step_in_steps_list(_two_servers):
+    result = run_durable_smoke(environ=_two_servers)
+    names = {s["step"] for s in result["steps"]}
+    assert "platform_restart_resume" in names
+
+
+def test_platform_restart_resume_step_passes_with_live_http_servers(_two_servers):
+    result = run_durable_smoke(environ=_two_servers)
+    step = next(s for s in result["steps"] if s["step"] == "platform_restart_resume")
+    assert step["ok"] is True
+
+
+def test_platform_restart_resume_reports_routing_restart_session_and_dispatch(_two_servers):
+    result = run_durable_smoke(environ=_two_servers)
+    step = next(s for s in result["steps"] if s["step"] == "platform_restart_resume")
+    assert step.get("routing_ok") is True
+    assert step.get("restart_ok") is True
+    assert step.get("session_resumed") is True
+    assert step.get("dispatch_ok") is True
+
+
+def test_platform_restart_resume_report_contains_no_platform_ids_or_transcript_text(_two_servers):
+    result = run_durable_smoke(environ=_two_servers)
+    step = next(s for s in result["steps"] if s["step"] == "platform_restart_resume")
+    text = json.dumps(result)
+    for sentinel in (
+        "smoke-platform-restart-conv",
+        "smoke-restart-session-sentinel",
+        "smoke-platform-restart-dispatch",
+        "T_restart_a",
+        "T_restart_b",
+        "C_restart",
+        "U_restart",
+        "U_restart_b",
+        "org-smoke-platform-restart-a",
+        "org-smoke-platform-restart-b",
+        "proj-smoke-platform-restart-a",
+        "proj-smoke-platform-restart-b",
+    ):
+        assert sentinel not in text, f"platform restart sentinel {sentinel!r} leaked into report"
+
+
+def test_platform_restart_resume_step_is_repeat_safe_with_same_durable_backends(_two_servers):
+    first = run_durable_smoke(environ=_two_servers)
+    second = run_durable_smoke(environ=_two_servers)
+
+    first_step = next(s for s in first["steps"] if s["step"] == "platform_restart_resume")
+    second_step = next(s for s in second["steps"] if s["step"] == "platform_restart_resume")
+
+    assert first_step["ok"] is True
+    assert second_step["ok"] is True
+    assert second_step.get("routing_ok") is True
+    assert second_step.get("session_resumed") is True

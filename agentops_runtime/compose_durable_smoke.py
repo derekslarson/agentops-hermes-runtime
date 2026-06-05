@@ -17,6 +17,9 @@ The module probes durable-backend slices:
                                audit readback, and prove tenant B count isolation
 - ``delivery_dispatch``      dispatch two outbound messages through the native delivery adapter;
                                persistence is asserted by tests through the injected backend
+- ``platform_restart_resume`` synthetic Slack-shaped platform dispatch through two fresh local
+                               supervisors over durable Compose HTTP backends, proving restart/resume
+                               transcript continuity without live container restart claims
 - ``skill_roundtrip``        project-scope skill create (approval gate), peer visibility, and
                                tenant B isolation via HttpSkillBackend + SQLiteScopedSkillStore
 - ``scheduler_claim_once``   cron claim-once, watchdog fairness, run history, and tenant isolation
@@ -35,12 +38,14 @@ from __future__ import annotations
 import json
 import os
 import sys
-import uuid
 from typing import Any
+from uuid import uuid4
 
 from agent.runtime_backends import BackendCapability, RuntimeBackendRegistry
 from agent.runtime_context import RuntimeContext
+from agent.runtime_supervisor import LocalRunSupervisor
 from agentops_runtime.compose_backends import configure_compose_runtime_backends
+from agentops_runtime.slack_runtime import SlackDeliveryBackend, build_slack_runtime_context, run_slack_turn
 
 _COMPOSE_PROFILE = "compose-self-hosted"
 
@@ -62,6 +67,11 @@ _AUDIT_CONVERSATION_ID = "smoke-conv-audit"
 _AUDIT_EVENT_SENTINEL = "smoke-audit-event-sentinel"
 _DELIVERY_CONVERSATION_ID = "smoke-conv-delivery"
 _DELIVERY_MESSAGE_SENTINEL = "smoke-delivery-message-sentinel"
+
+# Platform restart/resume scope labels — never leaked to the report.
+_PLATFORM_RESTART_THREAD = "smoke-platform-restart-conv"
+_PLATFORM_RESTART_TEXT = "smoke-restart-session-sentinel"
+_PLATFORM_RESTART_REPLY = "smoke-platform-restart-dispatch"
 
 # Skill roundtrip scope labels — never leaked to the report.
 _SKILL_NAME = "smoke-skill-roundtrip"
@@ -454,7 +464,7 @@ def _delivery_ctx(scope: str) -> RuntimeContext:
 
 def _step_audit_roundtrip(registry: RuntimeBackendRegistry) -> dict[str, Any]:
     """Record and count tenant-scoped audit events without exposing event payloads."""
-    run_suffix = uuid.uuid4().hex
+    run_suffix = uuid4().hex
     ctx_a = _audit_ctx(_SCOPE_A, run_suffix)
     ctx_b = _audit_ctx(_SCOPE_B, run_suffix)
     backend_a = registry.get(BackendCapability.AUDIT, ctx_a)
@@ -525,12 +535,170 @@ def _step_delivery_dispatch(registry: RuntimeBackendRegistry) -> dict[str, Any]:
             "dispatched": dispatched,
             "read_isolation_applicable": False,
         }
-
     return {
         "step": "delivery_dispatch",
         "ok": dispatched == 2,
         "dispatched": dispatched,
         "read_isolation_applicable": False,
+    }
+
+
+def _slack_event(
+    *,
+    team: str = "T_restart_a",
+    channel: str = "C_restart",
+    user: str = "U_restart",
+    ts: str,
+    thread_ts: str = _PLATFORM_RESTART_THREAD,
+) -> dict[str, str]:
+    """Return a Slack-shaped event used only inside the sanitized smoke step."""
+
+    return {
+        "team": team,
+        "channel": channel,
+        "user": user,
+        "thread_ts": thread_ts,
+        "ts": ts,
+    }
+
+
+def _platform_restart_config(scope: str) -> dict[str, dict[str, Any]]:
+    return {
+        "agentops": {
+            "enabled": True,
+            "org_id": f"org-smoke-platform-restart-{scope}",
+            "project_id": f"proj-smoke-platform-restart-{scope}",
+            "agent_profile_id": "smoke-platform-agent",
+            "permissions_ref": "smoke-platform-perms",
+            "backend_profile": _COMPOSE_PROFILE,
+        }
+    }
+
+
+def _step_platform_restart_resume(registry: RuntimeBackendRegistry) -> dict[str, Any]:
+    """Synthetic Slack platform restart/resume proof over durable Compose HTTP backends.
+
+    This step intentionally does not claim live container restart coverage. It
+    drives Slack-shaped turns through the native Slack runtime helper, uses two
+    fresh ``LocalRunSupervisor`` instances to simulate worker restart, and
+    verifies durable router/session continuity without exposing platform IDs,
+    run/session IDs, transcript text, URLs, paths, delivery refs, or backend
+    errors in the report.
+    """
+
+    config = _platform_restart_config("a")
+    thread_ts = f"{_PLATFORM_RESTART_THREAD}-{uuid4().hex}"
+    first_event = _slack_event(ts="1.000100", thread_ts=thread_ts)
+    followup_event = _slack_event(ts="1.000200", thread_ts=thread_ts)
+    context = build_slack_runtime_context(first_event, config=config)
+    followup_context = build_slack_runtime_context(followup_event, config=config)
+    b_context = build_slack_runtime_context(
+        _slack_event(team="T_restart_b", user="U_restart_b", ts="1.000300", thread_ts=thread_ts),
+        config=_platform_restart_config("b"),
+    )
+    if context is None or followup_context is None or b_context is None:
+        return {
+            "step": "platform_restart_resume",
+            "ok": False,
+            "routing_ok": False,
+            "restart_ok": False,
+            "session_resumed": False,
+            "dispatch_ok": False,
+            "synthetic": True,
+        }
+
+    sent: list[tuple[Any, ...]] = []
+
+    def _recording_sender(channel: str, text: str, reply_to: Any = None, metadata: Any = None) -> None:
+        sent.append((channel, text, reply_to, metadata))
+
+    delivery = SlackDeliveryBackend(_recording_sender)
+    first_worker = LocalRunSupervisor(worker_id="platform-restart-worker-a", max_concurrent_runs=1, registry=registry)
+    second_worker: LocalRunSupervisor | None = None
+    second_handler_saw_prior = False
+
+    def _first_handler(transcript: list[Any]) -> dict[str, Any]:
+        return {"role": "assistant", "content": _PLATFORM_RESTART_REPLY}
+
+    def _second_handler(transcript: list[Any]) -> dict[str, Any]:
+        nonlocal second_handler_saw_prior
+        contents = [str(item.get("content") or "") for item in transcript if isinstance(item, dict)]
+        second_handler_saw_prior = _PLATFORM_RESTART_TEXT in contents and _PLATFORM_RESTART_REPLY in contents
+        return {"role": "assistant", "content": _PLATFORM_RESTART_REPLY}
+
+    try:
+        first = run_slack_turn(
+            first_event,
+            context=context,
+            text=_PLATFORM_RESTART_TEXT,
+            handler=_first_handler,
+            supervisor=first_worker,
+            registry=registry,
+            delivery=delivery,
+            result_timeout=10.0,
+        )
+        first_worker.shutdown()
+        second_worker = LocalRunSupervisor(worker_id="platform-restart-worker-b", max_concurrent_runs=1, registry=registry)
+        followup = run_slack_turn(
+            followup_event,
+            context=followup_context,
+            text=_PLATFORM_RESTART_TEXT,
+            handler=_second_handler,
+            supervisor=second_worker,
+            registry=registry,
+            delivery=delivery,
+            result_timeout=10.0,
+        )
+
+        sessions_a = registry.get(BackendCapability.SESSION, context)
+        sessions_b = registry.get(BackendCapability.SESSION, b_context)
+        transcript_a = sessions_a.read_messages(context)
+        transcript_b = sessions_b.read_messages(b_context)
+        search_b = sessions_b.search(b_context, _PLATFORM_RESTART_TEXT)
+    except Exception:
+        return {
+            "step": "platform_restart_resume",
+            "ok": False,
+            "routing_ok": False,
+            "restart_ok": False,
+            "session_resumed": False,
+            "dispatch_ok": False,
+            "synthetic": True,
+        }
+    finally:
+        first_worker.shutdown()
+        if second_worker is not None:
+            second_worker.shutdown()
+
+    first_ok = first.run.error is None and bool(first.run.value)
+    followup_ok = followup.run.error is None and bool(followup.run.value)
+    routing_ok = (
+        first.route.routed_to_active_run is False
+        and followup.route.routed_to_active_run is True
+        and bool(first.route.run_id)
+        and first.route.run_id == followup.route.run_id
+    )
+    transcript_count = len(transcript_a)
+    session_resumed = second_handler_saw_prior and transcript_count >= 4 and len(transcript_b) == 0 and len(search_b) == 0
+    dispatch_same_thread = (
+        len(sent) == 2
+        and all(item[0] == context.external_channel_id for item in sent)
+        and all(isinstance(item[3], dict) and item[3].get("thread_ts") == context.external_thread_id for item in sent)
+    )
+    dispatch_ok = dispatch_same_thread and len(first.delivered) == 1 and len(followup.delivered) == 1
+    restart_ok = first_ok and followup_ok and session_resumed
+    ok = routing_ok and restart_ok and dispatch_ok
+    return {
+        "step": "platform_restart_resume",
+        "ok": ok,
+        "routing_ok": routing_ok,
+        "restart_ok": restart_ok,
+        "session_resumed": session_resumed,
+        "dispatch_ok": dispatch_ok,
+        "tenant_b_isolated": len(transcript_b) == 0 and len(search_b) == 0,
+        "transcript_count": transcript_count,
+        "dispatch_count": len(sent),
+        "synthetic": True,
     }
 
 
@@ -789,6 +957,7 @@ def run_durable_smoke(*, environ: dict[str, str] | None = None) -> dict[str, Any
         _step_artifact_roundtrip,
         _step_audit_roundtrip,
         _step_delivery_dispatch,
+        _step_platform_restart_resume,
         _step_skill_roundtrip,
         _step_scheduler_claim_once,
         _scale_step,

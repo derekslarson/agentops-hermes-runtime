@@ -32,7 +32,8 @@ closed) if any service is unreachable, returns a non-200 status, or reports
 `docker compose --profile smoke run --rm durable-smoke` (durable backend
 parity: worker_fleet, queue tenant isolation, conversation routing, secret
 roundtrip, native state continuity, artifact/audit roundtrips,
-delivery dispatch, skill roundtrip, scheduler claim-once, and optional current-run `worker_fleet_scale`),
+delivery dispatch, synthetic platform restart/resume, skill roundtrip, scheduler claim-once,
+and optional current-run `worker_fleet_scale`),
 and tears the stack down with `docker compose down --remove-orphans`.
 If Docker is already running and you want to keep the stack up after the check,
 run those commands manually.
