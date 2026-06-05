@@ -26,23 +26,29 @@ closed) if any service is unreachable, returns a non-200 status, or reports
 ```
 
 `smoke.sh` starts the stack with `docker compose up --build -d`, runs
-`docker compose --profile smoke run --rm smoke`, and then tears the stack down
-with `docker compose down --remove-orphans`. If Docker is already running and
-you want to keep the stack up after the check, run those commands manually.
+`docker compose --profile smoke run --rm smoke` (health-only), then runs
+`docker compose --profile smoke run --rm durable-smoke` (durable backend
+parity: worker_fleet, queue tenant isolation, conversation routing, and secret
+roundtrip), and tears the stack down with `docker compose down --remove-orphans`.
+If Docker is already running and you want to keep the stack up after the check,
+run those commands manually.
 
-The `smoke` one-shot service runs inside the Compose network, so it reaches
-`worker` and `scheduler` by their service DNS names even though those services
-publish no host ports. The same check can also be run manually from the API
-container:
+The `smoke` and `durable-smoke` one-shot services run inside the Compose
+network, so they reach all services by their DNS names even though those
+services publish no host ports. The health smoke can also be run manually
+from the API container:
 
 ```bash
 docker compose exec api \
   python -m agentops_runtime.compose_health_smoke
 ```
 
-Service URLs default to the in-network Compose names and can be overridden via
-`AGENTOPS_API_URL`, `AGENTOPS_WORKER_URL`, `AGENTOPS_SCHEDULER_URL`, and
-`AGENTOPS_SECRET_STORE_URL` to run the same check from a sidecar or the host.
+The durable smoke (`python -m agentops_runtime.compose_durable_smoke`) can
+be run from the API container or any container with access to `AGENTOPS_API_URL`
+and `AGENTOPS_SECRET_STORE_URL`. Service URLs default to the in-network Compose
+names and can be overridden via `AGENTOPS_API_URL`, `AGENTOPS_WORKER_URL`,
+`AGENTOPS_SCHEDULER_URL`, and `AGENTOPS_SECRET_STORE_URL` to run the same
+check from a sidecar or the host.
 
 ## Scale workers
 
@@ -70,4 +76,4 @@ This slice provides the Compose topology, backend wiring, distributed-semantics 
 - `minio` artifact store
 - `local-secrets` development secret-store surface
 
-The only remaining M12 closure step is to capture a live green `docker compose up` health transcript plus a passing `python -m agentops_runtime.compose_health_smoke` run on a host with Docker daemon access.
+The remaining M12 closure evidence is a live green `docker compose up` transcript on a host with Docker daemon access showing both the health smoke (`python -m agentops_runtime.compose_health_smoke`) and durable control-plane smoke (`python -m agentops_runtime.compose_durable_smoke`) passing against the running stack.

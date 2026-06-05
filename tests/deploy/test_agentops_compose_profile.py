@@ -501,3 +501,42 @@ def test_scheduler_does_not_have_delivery_db_path_env():
     assert "AGENTOPS_DELIVERY_DB_PATH" not in scheduler_env
     volume_strings = [str(v) for v in services["scheduler"].get("volumes", [])]
     assert not any("agentops-delivery" in v or "/var/lib/agentops/delivery" in v for v in volume_strings)
+
+
+# ---------------------------------------------------------------------------
+# M12B: durable-smoke one-shot service
+# ---------------------------------------------------------------------------
+
+
+def test_compose_profile_includes_durable_smoke_service():
+    services = _compose()["services"]
+    assert "durable-smoke" in services
+    durable_smoke = services["durable-smoke"]
+    assert durable_smoke["profiles"] == ["smoke"]
+    assert durable_smoke["command"] == ["python", "-m", "agentops_runtime.compose_durable_smoke"]
+    assert "container_name" not in durable_smoke
+
+
+def test_durable_smoke_depends_on_api_and_local_secrets():
+    services = _compose()["services"]
+    durable_smoke = services["durable-smoke"]
+    assert durable_smoke["depends_on"]["api"]["condition"] == "service_healthy"
+    assert durable_smoke["depends_on"]["local-secrets"]["condition"] == "service_healthy"
+
+
+def test_durable_smoke_environment_has_api_and_secret_urls():
+    services = _compose()["services"]
+    env = "\n".join(services["durable-smoke"]["environment"])
+    assert "AGENTOPS_API_URL=http://api:8710" in env
+    assert "AGENTOPS_SECRET_STORE_URL=http://local-secrets:8713" in env
+
+
+def test_smoke_sh_includes_durable_smoke_run():
+    script = SMOKE_SCRIPT.read_text(encoding="utf-8")
+    assert "durable-smoke" in script
+
+
+def test_readme_documents_durable_smoke_command():
+    readme_text = README.read_text(encoding="utf-8")
+    assert "durable-smoke" in readme_text
+    assert "compose_durable_smoke" in readme_text

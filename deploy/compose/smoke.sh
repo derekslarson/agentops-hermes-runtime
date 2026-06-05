@@ -20,3 +20,4 @@ trap cleanup EXIT
 
 docker compose up --build -d
 docker compose --profile smoke run --rm smoke
+docker compose --profile smoke run --rm durable-smoke
