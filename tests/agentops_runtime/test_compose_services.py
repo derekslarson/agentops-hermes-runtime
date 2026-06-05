@@ -3259,3 +3259,262 @@ def test_api_conversations_resolve_auth_before_backend(monkeypatch):
         server.shutdown()
         thread.join(timeout=5)
         server.server_close()
+
+
+# ---------------------------------------------------------------------------
+# M12B: Worker-registry dispatch and backend (workers_api)
+# ---------------------------------------------------------------------------
+
+
+def test_make_worker_registry_backend_fails_closed_when_blank():
+    with pytest.raises(ValueError, match="AGENTOPS_WORKER_REGISTRY_DB_PATH"):
+        compose_services._make_worker_registry_backend({})
+
+
+def test_make_worker_registry_backend_fails_closed_on_whitespace():
+    with pytest.raises(ValueError, match="AGENTOPS_WORKER_REGISTRY_DB_PATH"):
+        compose_services._make_worker_registry_backend({"AGENTOPS_WORKER_REGISTRY_DB_PATH": "   "})
+
+
+def test_make_worker_registry_backend_fails_closed_on_memory():
+    with pytest.raises(ValueError, match=":memory:"):
+        compose_services._make_worker_registry_backend({"AGENTOPS_WORKER_REGISTRY_DB_PATH": ":memory:"})
+
+
+def test_make_worker_registry_backend_fails_closed_on_relative_path():
+    with pytest.raises(ValueError, match="absolute"):
+        compose_services._make_worker_registry_backend({"AGENTOPS_WORKER_REGISTRY_DB_PATH": "relative/path.db"})
+
+
+def test_make_worker_registry_backend_accepts_absolute_path(tmp_path):
+    from agentops_runtime.workers_api import SQLiteWorkerRegistryBackend
+
+    db_path = str(tmp_path / "workers.db")
+    backend = compose_services._make_worker_registry_backend({
+        "AGENTOPS_WORKER_REGISTRY_DB_PATH": db_path,
+    })
+    assert isinstance(backend, SQLiteWorkerRegistryBackend)
+
+
+class _RecordingWorkerRegistryBackend:
+    def __init__(self):
+        self.registered_workers = []
+
+    def register(self, scope, worker, **kw):
+        self.registered_workers.append(worker)
+        return "worker-test-id"
+
+    def heartbeat(self, scope, worker_id, **kw):
+        pass
+
+    def mark_draining(self, scope, worker_id):
+        pass
+
+    def recover_expired(self, scope, **kw):
+        return []
+
+    def list_workers(self, scope):
+        return [{"worker_id": "worker-test-id", "worker": {}, "draining": False}]
+
+
+def _make_api_server_with_worker_backend():
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    setattr(server, "worker_registry_backend", _RecordingWorkerRegistryBackend())
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread, f"http://127.0.0.1:{server.server_port}"
+
+
+def test_api_service_routes_workers_register():
+    server, thread, base = _make_api_server_with_worker_backend()
+    try:
+        status, payload = _post_json_response(
+            f"{base}/workers/register",
+            {"context": _CONTEXT, "worker": {"id": "w-1"}},
+        )
+        assert status == 200
+        assert "worker_id" in payload
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_api_service_routes_workers_list():
+    server, thread, base = _make_api_server_with_worker_backend()
+    try:
+        status, payload = _post_json_response(
+            f"{base}/workers/list",
+            {"context": _CONTEXT},
+        )
+        assert status == 200
+        assert "workers" in payload
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_api_service_routes_workers_recover_expired():
+    server, thread, base = _make_api_server_with_worker_backend()
+    try:
+        status, payload = _post_json_response(
+            f"{base}/workers/recover-expired",
+            {"context": _CONTEXT},
+        )
+        assert status == 200
+        assert "recovered" in payload
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_api_service_routes_workers_heartbeat():
+    server, thread, base = _make_api_server_with_worker_backend()
+    try:
+        status, payload = _post_json_response(
+            f"{base}/workers/worker-test-id/heartbeat",
+            {"context": _CONTEXT, "slots": {"task_count": 1}},
+        )
+        assert status == 200
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_api_service_routes_workers_drain():
+    server, thread, base = _make_api_server_with_worker_backend()
+    try:
+        status, payload = _post_json_response(
+            f"{base}/workers/worker-test-id/drain",
+            {"context": _CONTEXT},
+        )
+        assert status == 200
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+@pytest.mark.parametrize("service_name", ["worker", "scheduler", "local-secrets"])
+def test_non_api_services_return_404_for_workers_register(service_name):
+    server, thread = _make_non_api_server(service_name)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({"context": _CONTEXT, "worker": {"id": "w-1"}}).encode()
+        status = _http_post(f"{base}/workers/register", body)
+        assert status == 404, f"{service_name} should return 404 for POST /workers/register"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+@pytest.mark.parametrize("service_name", ["worker", "scheduler", "local-secrets"])
+def test_non_api_services_return_404_for_workers_list(service_name):
+    server, thread = _make_non_api_server(service_name)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({"context": _CONTEXT}).encode()
+        status = _http_post(f"{base}/workers/list", body)
+        assert status == 404, f"{service_name} should return 404 for POST /workers/list"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_api_workers_register_auth_before_backend(monkeypatch):
+    backend_constructed = []
+
+    def _raise_backend():
+        backend_constructed.append(True)
+        raise ValueError("LEAKSENTINEL-backend-secret")
+
+    monkeypatch.setattr(compose_services, "_get_or_create_worker_registry_backend", _raise_backend)
+
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "api"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({"context": _CONTEXT, "worker": {"id": "w-1"}}).encode()
+        req = urllib.request.Request(f"{base}/workers/register", data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Content-Length", str(len(body)))
+        req.add_header("Authorization", "Bearer wrong-token")
+
+        monkeypatch.setenv("AGENTOPS_RUNTIME_TOKEN", "real-token")
+
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                status = r.status
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+        assert status == 401
+        assert not backend_constructed, "backend must not be constructed before auth check"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_workers_log_message_redacts_worker_id_in_heartbeat():
+    rendered = compose_services._sanitize_log_message(
+        '"POST /workers/LEAKSENTINEL-worker-id/heartbeat HTTP/1.1" 200 -'
+    )
+    assert "LEAKSENTINEL-worker-id" not in rendered
+    assert "/workers" in rendered
+    assert "<redacted>" in rendered
+
+
+def test_workers_log_message_redacts_worker_id_in_drain():
+    rendered = compose_services._sanitize_log_message(
+        '"POST /workers/LEAKSENTINEL-worker-id/drain HTTP/1.1" 200 -'
+    )
+    assert "LEAKSENTINEL-worker-id" not in rendered
+    assert "/workers" in rendered
+    assert "<redacted>" in rendered
+
+
+def test_workers_log_message_keeps_static_collection_routes():
+    for route in ("/workers/register", "/workers/recover-expired", "/workers/list"):
+        rendered = compose_services._sanitize_log_message(
+            f'"POST {route} HTTP/1.1" 200 -'
+        )
+        assert route in rendered
+
+
+def test_workers_log_message_redacts_query_string_on_static_routes():
+    rendered = compose_services._sanitize_log_message(
+        '"POST /workers/register?LEAKSENTINEL=val HTTP/1.1" 200 -'
+    )
+    assert "LEAKSENTINEL" not in rendered
+    assert "/workers/register" in rendered
+
+
+def test_workers_log_message_redacts_encoded_slash():
+    rendered = compose_services._sanitize_log_message(
+        '"POST /workers%2FLEAKSENTINEL/heartbeat HTTP/1.1" 200 -'
+    )
+    assert "LEAKSENTINEL" not in rendered
+    assert "<redacted>" in rendered
+
+
+def test_workers_log_message_redacts_prefix_lookalike():
+    rendered = compose_services._sanitize_log_message(
+        '"POST /workers2LEAKSENTINEL/register HTTP/1.1" 200 -'
+    )
+    assert "LEAKSENTINEL" not in rendered
+
+
+def test_workers_log_message_redacts_unknown_action():
+    rendered = compose_services._sanitize_log_message(
+        '"POST /workers/LEAKSENTINEL-action HTTP/1.1" 200 -'
+    )
+    assert "LEAKSENTINEL-action" not in rendered
+    assert "<redacted>" in rendered

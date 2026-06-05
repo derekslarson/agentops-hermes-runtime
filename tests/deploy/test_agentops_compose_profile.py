@@ -423,3 +423,40 @@ def test_scheduler_does_not_have_conversation_router_db_path_env():
     services = _compose()["services"]
     scheduler_env = "\n".join(services["scheduler"]["environment"])
     assert "AGENTOPS_CONVERSATION_ROUTER_DB_PATH" not in scheduler_env
+
+
+# ---------------------------------------------------------------------------
+# M12B: Worker-registry volume and env (api service only)
+# ---------------------------------------------------------------------------
+
+
+def test_api_service_has_worker_registry_db_path_env():
+    services = _compose()["services"]
+    api_env = "\n".join(services["api"]["environment"])
+    assert "AGENTOPS_WORKER_REGISTRY_DB_PATH=/var/lib/agentops/worker-registry/workers.db" in api_env
+
+
+def test_api_service_mounts_worker_registry_volume():
+    services = _compose()["services"]
+    api = services["api"]
+    assert "volumes" in api
+    volume_strings = [str(v) for v in api["volumes"]]
+    assert any("/var/lib/agentops/worker-registry" in v for v in volume_strings)
+
+
+def test_compose_declares_worker_registry_volume():
+    compose = _compose()
+    assert "volumes" in compose
+    assert "agentops-worker-registry" in compose["volumes"]
+
+
+def test_worker_does_not_have_worker_registry_db_path_env():
+    services = _compose()["services"]
+    worker_env = "\n".join(services["worker"]["environment"])
+    assert "AGENTOPS_WORKER_REGISTRY_DB_PATH" not in worker_env
+
+
+def test_scheduler_does_not_have_worker_registry_db_path_env():
+    services = _compose()["services"]
+    scheduler_env = "\n".join(services["scheduler"]["environment"])
+    assert "AGENTOPS_WORKER_REGISTRY_DB_PATH" not in scheduler_env

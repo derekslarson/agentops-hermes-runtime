@@ -23,6 +23,7 @@ services:
       - AGENTOPS_RUN_LEASE_DB_PATH=/var/lib/agentops/run-leases/run-leases.db
       - AGENTOPS_CRON_DB_PATH=/var/lib/agentops/cron/cron.db
       - AGENTOPS_CONVERSATION_ROUTER_DB_PATH=/var/lib/agentops/conversations/conversations.db
+      - AGENTOPS_WORKER_REGISTRY_DB_PATH=/var/lib/agentops/worker-registry/workers.db
       - AGENTOPS_SECRET_STORE_URL=http://local-secrets:8713
       - AGENTOPS_API_URL=http://api:8710
     volumes:
@@ -34,6 +35,7 @@ services:
       - agentops-run-leases:/var/lib/agentops/run-leases
       - agentops-cron:/var/lib/agentops/cron
       - agentops-conversations:/var/lib/agentops/conversations
+      - agentops-worker-registry:/var/lib/agentops/worker-registry
     depends_on:
       postgres:
         condition: service_healthy
@@ -206,3 +208,4 @@ volumes:
   agentops-cron:
   agentops-secrets:
   agentops-conversations:
+  agentops-worker-registry:
