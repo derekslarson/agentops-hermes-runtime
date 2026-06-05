@@ -1441,3 +1441,249 @@ def test_sessions_log_message_keeps_static_path_segments_unredacted():
         '"POST /sessions/turn-lock/claim HTTP/1.1" 200 -'
     )
     assert "/sessions/turn-lock/claim" in rendered
+
+
+# ---------------------------------------------------------------------------
+# M12B: Secrets endpoint routing and backend
+# ---------------------------------------------------------------------------
+
+
+class _FakeSecretBackend:
+    def __init__(self):
+        self._store: dict = {}
+
+    def get(self, scope, ref):
+        return self._store.get((scope, ref))
+
+    def put(self, scope, ref, value):
+        self._store[(scope, ref)] = value
+
+
+_SECRET_CONTEXT_CS = {
+    "mode": "agentops",
+    "org_id": "org-test",
+    "workspace_id": "ws-test",
+    "workspace_type": "team",
+    "user_id": "user-test",
+    "project_id": "project-test",
+    "agent_profile_id": "agent-profile-test",
+    "permissions_ref": "permissions-test",
+    "backend_profile": "compose-self-hosted",
+}
+
+
+@pytest.fixture
+def _local_secrets_server():
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "local-secrets"
+    server.secret_backend = _FakeSecretBackend()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        yield base
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_local_secrets_routes_secrets_put(_local_secrets_server):
+    body = json.dumps({
+        "context": _SECRET_CONTEXT_CS,
+        "ref": "routing-test",
+        "value": "routing-value",
+    }).encode()
+    req = urllib.request.Request(f"{_local_secrets_server}/secrets/put", data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Content-Length", str(len(body)))
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            status = r.status
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+    assert status == 200
+
+
+def test_local_secrets_routes_secrets_get(_local_secrets_server):
+    body = json.dumps({"context": _SECRET_CONTEXT_CS, "ref": "routing-test"}).encode()
+    req = urllib.request.Request(f"{_local_secrets_server}/secrets/get", data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Content-Length", str(len(body)))
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            status = r.status
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+    assert status == 200
+
+
+@pytest.mark.parametrize("service_name", ["api", "worker", "scheduler"])
+def test_non_local_secrets_services_return_404_for_secrets_put(service_name):
+    server, thread = _make_non_api_server(service_name)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({
+            "context": _SECRET_CONTEXT_CS,
+            "ref": "x",
+            "value": "v",
+        }).encode()
+        status = _http_post(f"{base}/secrets/put", body)
+        assert status == 404, f"{service_name} should return 404 for POST /secrets/put"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+@pytest.mark.parametrize("service_name", ["api", "worker", "scheduler"])
+def test_non_local_secrets_services_return_404_for_secrets_get(service_name):
+    server, thread = _make_non_api_server(service_name)
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({"context": _SECRET_CONTEXT_CS, "ref": "x"}).encode()
+        status = _http_post(f"{base}/secrets/get", body)
+        assert status == 404, f"{service_name} should return 404 for POST /secrets/get"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_secret_dispatch_returns_401_before_backend_setup(monkeypatch):
+    calls = []
+
+    def _raise():
+        calls.append("called")
+        raise ValueError("LEAKSENTINEL secret backend failure password=x")
+
+    monkeypatch.setenv("AGENTOPS_RUNTIME_TOKEN", "expected-token")
+    monkeypatch.setattr(compose_services, "_get_or_create_secret_backend", _raise)
+
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "local-secrets"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({"context": _SECRET_CONTEXT_CS, "ref": "x", "value": "v"}).encode()
+        req = urllib.request.Request(f"{base}/secrets/put", data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Content-Length", str(len(body)))
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                status = r.status
+                response_body = r.read()
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            response_body = exc.read()
+        assert status == 401
+        assert calls == []
+        assert "LEAKSENTINEL" not in response_body.decode("utf-8")
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_secret_dispatch_returns_503_on_backend_failure(monkeypatch):
+    def _raise():
+        raise ValueError("LEAKSENTINEL secret backend failure password=x")
+
+    monkeypatch.setattr(compose_services, "_get_or_create_secret_backend", _raise)
+
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "local-secrets"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        body = json.dumps({"context": _SECRET_CONTEXT_CS, "ref": "x", "value": "v"}).encode()
+        req = urllib.request.Request(f"{base}/secrets/put", data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Content-Length", str(len(body)))
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                status = r.status
+                response_body = r.read()
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            response_body = exc.read()
+        assert status == 503
+        assert "LEAKSENTINEL" not in response_body.decode("utf-8")
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_secret_dispatch_rejects_oversized_body_before_backend_setup(monkeypatch):
+    calls = []
+
+    def _raise():
+        calls.append("called")
+        raise ValueError("LEAKSENTINEL secret backend failure password=x")
+
+    monkeypatch.setattr(compose_services, "_get_or_create_secret_backend", _raise)
+
+    server = compose_services._Server(("127.0.0.1", 0), compose_services._Handler)
+    server.service_name = "local-secrets"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with socket.create_connection(("127.0.0.1", server.server_port), timeout=5) as sock:
+            request = (
+                "POST /secrets/put HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{server.server_port}\r\n"
+                "Content-Type: application/json\r\n"
+                f"Content-Length: {compose_services._MAX_SECRET_REQUEST_BODY_BYTES + 1}\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+            ).encode("ascii")
+            sock.sendall(request)
+            response_body = sock.recv(4096).decode("utf-8", errors="replace")
+        assert "413" in response_body
+        assert calls == []
+        assert "LEAKSENTINEL" not in response_body
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_make_secret_backend_fails_closed_when_unconfigured():
+    with pytest.raises(ValueError, match="AGENTOPS_SECRET_STORE_PATH"):
+        compose_services._make_secret_backend({})
+
+
+def test_make_secret_backend_returns_backend_with_valid_path(tmp_path):
+    from agentops_runtime.secrets_api import SQLiteSecretStore
+
+    db_path = str(tmp_path / "secrets.db")
+    backend = compose_services._make_secret_backend({"AGENTOPS_SECRET_STORE_PATH": db_path})
+    assert isinstance(backend, SQLiteSecretStore)
+
+
+def test_get_or_create_secret_backend_fails_closed_when_unconfigured(monkeypatch):
+    monkeypatch.setattr(compose_services, "_secret_backend_instance", None)
+    monkeypatch.setattr(compose_services.os, "environ", {})
+    with pytest.raises(ValueError, match="AGENTOPS_SECRET_STORE_PATH"):
+        compose_services._get_or_create_secret_backend()
+
+
+def test_secrets_log_message_redacts_query_values():
+    rendered = compose_services._sanitize_log_message(
+        '"POST /secrets/get?debug=LEAKSENTINEL HTTP/1.1" 400 -'
+    )
+    assert "LEAKSENTINEL" not in rendered
+    assert "/secrets/get" in rendered
+    assert "<redacted>" in rendered
+
+
+def test_secrets_log_message_redacts_ref_path_and_query_values():
+    rendered = compose_services._sanitize_log_message(
+        '"POST /secrets/REFLEAKSENTINEL?debug=QUERYLEAKSENTINEL HTTP/1.1" 404 -'
+    )
+    assert "REFLEAKSENTINEL" not in rendered
+    assert "QUERYLEAKSENTINEL" not in rendered
+    assert "/secrets/<redacted>" in rendered

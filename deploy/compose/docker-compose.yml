@@ -150,6 +150,9 @@ services:
       - AGENTOPS_ARTIFACT_ENDPOINT=http://minio:9000
       - AGENTOPS_SECRET_STORE_URL=http://local-secrets:8713
       - AGENTOPS_API_URL=http://api:8710
+      - AGENTOPS_SECRET_STORE_PATH=/var/lib/agentops/secrets/secrets.db
+    volumes:
+      - agentops-secrets:/var/lib/agentops/secrets
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8713/healthz', timeout=2).read()"]
       interval: 10s
@@ -184,3 +187,4 @@ volumes:
   agentops-minio:
   agentops-artifacts:
   agentops-sessions:
+  agentops-secrets:

@@ -28,6 +28,7 @@ from agentops_runtime.compose_backends import (
 
 _MAX_SESSION_REQUEST_BODY_BYTES = 1_048_576
 _MAX_CREDENTIAL_REQUEST_BODY_BYTES = 1_048_576
+_MAX_SECRET_REQUEST_BODY_BYTES = 1_048_576
 
 _SERVICE_PORTS = {
     "api": 8710,
@@ -154,6 +155,12 @@ class _Handler(BaseHTTPRequestHandler):
                 self.send_error(404)
                 return
             self._dispatch_credentials("POST", parsed)
+            return
+        if parsed.path in ("/secrets/get", "/secrets/put"):
+            if self.server.service_name != "local-secrets":  # type: ignore[attr-defined]
+                self.send_error(404)
+                return
+            self._dispatch_secrets("POST", parsed)
             return
         self.send_error(404)
 
@@ -408,6 +415,63 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _dispatch_secrets(self, method: str, parsed: urllib.parse.ParseResult) -> None:
+        from agentops_runtime.secrets_api import handle_secret_request
+
+        token = os.getenv("AGENTOPS_RUNTIME_TOKEN") or None
+        auth_header = self.headers.get("Authorization")
+        if token and auth_header != f"Bearer {token}":
+            error_body = json.dumps({"error": "unauthorized"}).encode("utf-8")
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(error_body)))
+            self.end_headers()
+            self.wfile.write(error_body)
+            return
+
+        body_bytes = b""
+        if method == "POST":
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+            except ValueError:
+                self._send_json_error(400, "invalid content length")
+                return
+            if length < 0:
+                self._send_json_error(400, "invalid content length")
+                return
+            if length > _MAX_SECRET_REQUEST_BODY_BYTES:
+                self._send_json_error(413, "request body too large")
+                return
+            body_bytes = self.rfile.read(length)
+
+        try:
+            backend = getattr(self.server, "secret_backend", None) or _get_or_create_secret_backend()
+        except Exception:
+            error_body = json.dumps({"error": "secret store unavailable"}).encode("utf-8")
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(error_body)))
+            self.end_headers()
+            self.wfile.write(error_body)
+            return
+
+        status, response = handle_secret_request(
+            method=method,
+            path=parsed.path,
+            query_string=parsed.query,
+            body_bytes=body_bytes,
+            auth_header=auth_header,
+            token=token,
+            backend=backend,
+        )
+
+        body = json.dumps(response).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _send_json_error(self, status: int, message: str) -> None:
         body = json.dumps({"error": message}).encode("utf-8")
         self.send_response(status)
@@ -428,6 +492,7 @@ class _Server(ThreadingHTTPServer):
     audit_backend: Any = None
     session_backend: Any = None
     credential_backend: Any = None
+    secret_backend: Any = None
 
 
 _memory_backend_lock = threading.Lock()
@@ -445,6 +510,9 @@ _session_backend_instance: Any = None
 _credential_resolver_lock = threading.Lock()
 _credential_resolver_instance: Any = None
 
+_secret_backend_lock = threading.Lock()
+_secret_backend_instance: Any = None
+
 _SESSION_STATIC_PATH_SEGMENTS = frozenset({
     "create", "append", "messages", "search", "turn-lock",
 })
@@ -454,6 +522,10 @@ def _sanitize_log_message(message: str) -> str:
     """Redact sensitive path segments and query strings from access logs."""
 
     def _redact_artifact_path(match: re.Match[str]) -> str:
+        query = "?<redacted>" if match.group(2) else ""
+        return f"{match.group(1)}/<redacted>{query}"
+
+    def _redact_secret_path(match: re.Match[str]) -> str:
         query = "?<redacted>" if match.group(2) else ""
         return f"{match.group(1)}/<redacted>{query}"
 
@@ -467,12 +539,17 @@ def _sanitize_log_message(message: str) -> str:
 
     message = re.sub(r"(/artifacts)/[^\s?\"]+(\?[^\s\"]+)?", _redact_artifact_path, message)
     message = re.sub(
+        r"(/secrets)/(?!get(?:[?\s\"]|$)|put(?:[?\s\"]|$))[^\s?\"]+(\?[^\s\"]+)?",
+        _redact_secret_path,
+        message,
+    )
+    message = re.sub(
         r"(/sessions)/([^/\s?\"]+)(/[^\s?\"]*)?(\?[^\s\"]+)?",
         _redact_session_id_path,
         message,
     )
     return re.sub(
-        r"(/(?:memory/records|artifacts|audit|sessions|credentials)[^\s?\"]*)\?[^\s]+",
+        r"(/(?:memory/records|artifacts|audit|sessions|credentials|secrets)[^\s?\"]*)\?[^\s]+",
         r"\1?<redacted>",
         message,
     )
@@ -602,6 +679,26 @@ def _get_or_create_credential_resolver() -> Any:
         if _credential_resolver_instance is None:
             _credential_resolver_instance = _make_credential_resolver(dict(os.environ))
         return _credential_resolver_instance
+
+
+def _make_secret_backend(environ: dict[str, str]) -> Any:
+    db_path = environ.get("AGENTOPS_SECRET_STORE_PATH", "").strip()
+    if not db_path:
+        raise ValueError(
+            "compose secret store requires AGENTOPS_SECRET_STORE_PATH; "
+            "no local fallback is provided for compose/cloud profiles"
+        )
+    from agentops_runtime.secrets_api import SQLiteSecretStore
+
+    return SQLiteSecretStore(db_path)
+
+
+def _get_or_create_secret_backend() -> Any:
+    global _secret_backend_instance
+    with _secret_backend_lock:
+        if _secret_backend_instance is None:
+            _secret_backend_instance = _make_secret_backend(dict(os.environ))
+        return _secret_backend_instance
 
 
 class _DeterministicCredentialResolver:

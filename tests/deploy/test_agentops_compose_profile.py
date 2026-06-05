@@ -212,3 +212,28 @@ def test_compose_declares_sessions_volume():
     compose = _compose()
     assert "volumes" in compose
     assert "agentops-sessions" in compose["volumes"]
+
+
+# ---------------------------------------------------------------------------
+# M12B: Secret store volume and env (local-secrets service)
+# ---------------------------------------------------------------------------
+
+
+def test_local_secrets_service_has_secret_store_path_env():
+    services = _compose()["services"]
+    ls_env = "\n".join(services["local-secrets"]["environment"])
+    assert "AGENTOPS_SECRET_STORE_PATH=" in ls_env
+
+
+def test_local_secrets_service_mounts_secrets_volume():
+    services = _compose()["services"]
+    ls = services["local-secrets"]
+    assert "volumes" in ls
+    volume_strings = [str(v) for v in ls["volumes"]]
+    assert any("agentops-secrets" in v for v in volume_strings)
+
+
+def test_compose_declares_secrets_volume():
+    compose = _compose()
+    assert "volumes" in compose
+    assert "agentops-secrets" in compose["volumes"]
